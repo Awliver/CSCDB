@@ -1,0 +1,107 @@
+# ============================================
+# Build artifacts
+# ============================================
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+Makefile
+compile_commands.json
+
+# ============================================
+# Compiled objects & binaries
+# ============================================
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# ============================================
+# Database runtime artifacts
+# ============================================
+*.db
+*.log
+output.txt
+**/db_files/
+**/test_db/
+**/*_test_db/
+**/checkpoint_test/
+
+# ============================================
+# IDE / Editor
+# ============================================
+.vscode/
+.idea/
+*.iml
+.cache/
+*.user
+*.swp
+*.swo
+*~
+.cproject
+.project
+.settings/
+.vs/
+
+# ============================================
+# OS files
+# ============================================
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ============================================
+# Temp & backup
+# ============================================
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+
+# ============================================
+# Local config / secrets
+# ============================================
+.env
+.env.local
+.env.*.local
+local_config/
+secrets/
+*.token
+
+# ============================================
+# Profiling / coverage
+# ============================================
+*.gcov
+*.gcno
+*.gcda
+*.prof
+gmon.out
+callgrind.out.*
+massif.out.*
+perf.data*
+*.dSYM/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.pyc
+*.pyo
+
+# ============================================
+# notes
+# ============================================
+scratch/
+notes/personal/
