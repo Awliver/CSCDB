@@ -85,7 +85,34 @@ void SmManager::drop_db(const std::string& db_name) {
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
 void SmManager::open_db(const std::string& db_name) {
-    
+    // 检查数据库目录是否存在
+    if (!is_dir(db_name)) {
+        throw DatabaseNotFoundError(db_name);
+    }
+    // 进入目录
+    if (chdir(db_name.c_str()) < 0) {
+        throw UnixError();
+    }
+    // 从 db.meta 反序列化加载元数据到内存
+    //    DbMeta 重载了 operator>>，会自动读取所有 TabMeta
+    std::ifstream ifs(DB_META_NAME);
+    ifs >> db_;
+    ifs.close();
+
+    // 遍历所有表，打开数据文件并加入 fhs_
+    for (auto& entry : db_.tabs_) {
+        const std::string& tab_name = entry.first;
+        TabMeta& tab = entry.second;
+        // RmManager::open_file 返回 unique_ptr<RmFileHandle>
+        // 构造时会从磁盘读 RmFileHdr 到内存
+        fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+
+        // 打开该表上的所有索引
+        for (auto& index : tab.indexes) {
+            std::string index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+        }
+    }
 }
 
 /**
@@ -101,12 +128,38 @@ void SmManager::flush_meta() {
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db() {
-    
+    // 内存里的db_ 元数据到db.meta
+    flush_meta();
+
+    // 关闭所有表文件
+    //    rm_manager_->close_file ：
+    //      a. 把 file_hdr 写回磁盘第 0 页
+    //      b. flush_all_pages 把缓冲池中该 fd 的所有脏页刷盘
+    //      c. close fd
+    for (auto& entry : fhs_) {
+        rm_manager_->close_file(entry.second.get());
+    }
+    fhs_.clear();
+
+    // 关闭所有索引文件
+    for (auto& entry : ihs_) {
+        ix_manager_->close_index(entry.second.get());
+    }
+    ihs_.clear();
+
+    // 重置内存中的元数据，防止下次 open_db 时残留旧数据
+    db_.name_.clear();
+    db_.tabs_.clear();
+
+    // 回到数据库目录的上层
+    if (chdir("..") < 0) {
+        throw UnixError();
+    }
 }
 
 /**
  * @description: 显示所有的表,通过测试需要将其结果写入到output.txt,详情看题目文档
- * @param {Context*} context 
+ * @param {Context*} context
  */
 void SmManager::show_tables(Context* context) {
     std::fstream outfile;
@@ -128,7 +181,7 @@ void SmManager::show_tables(Context* context) {
 /**
  * @description: 显示表的元数据
  * @param {string&} tab_name 表名称
- * @param {Context*} context 
+ * @param {Context*} context
  */
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
@@ -152,7 +205,7 @@ void SmManager::desc_table(const std::string& tab_name, Context* context) {
  * @description: 创建表
  * @param {string&} tab_name 表的名称
  * @param {vector<ColDef>&} col_defs 表的字段
- * @param {Context*} context 
+ * @param {Context*} context
  */
 void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
     if (db_.is_table(tab_name)) {
@@ -188,7 +241,32 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
  * @param {Context*} context
  */
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
-    
+    // 检查表是否存在
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+
+    // 删除该表上的所有索引
+    //    注意：复制一份 indexes 再遍历，避免 drop_index 修改 tab.indexes 时迭代器失效
+    TabMeta& tab = db_.tabs_[tab_name];
+    auto indexes_copy = tab.indexes;
+    for (auto& index : indexes_copy) {
+        drop_index(tab_name, index.cols, context);
+    }
+
+    // 关闭表文件句柄
+    //    先 close 再 destroy_file，否则 destroy_file 会抛出 FileNotClosedError
+    rm_manager_->close_file(fhs_[tab_name].get());
+    fhs_.erase(tab_name);
+
+    // 删除磁盘上的表文件
+    rm_manager_->destroy_file(tab_name);
+
+    // 从内存元数据中移除
+    db_.tabs_.erase(tab_name);
+
+    // 新元数据到 db.meta
+    flush_meta();
 }
 
 /**
@@ -198,7 +276,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+
 }
 
 /**
@@ -208,7 +286,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+
 }
 
 /**
@@ -218,5 +296,5 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
-    
+
 }

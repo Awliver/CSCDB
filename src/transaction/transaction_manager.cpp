@@ -27,8 +27,21 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     // 3. 把开始事务加入到全局事务表中
     // 4. 返回当前事务指针
     // 如果需要支持MVCC请在上述过程中添加代码
-    
-    return nullptr;
+
+    std::scoped_lock<std::mutex> lock(latch_);
+    // 传入为空则创建新事务对象
+    if (txn == nullptr) {
+        txn_id_t new_id = next_txn_id_++;
+        txn = new Transaction(new_id);
+        txn->set_start_ts(next_timestamp_++);
+    }
+
+    // 加入全局事务表
+    txn_map[txn->get_transaction_id()] = txn;
+
+    // 题10实现WAL后写BEGIN日志记录
+
+    return txn;
 }
 
 /**
@@ -45,6 +58,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
 
+    if (txn == nullptr) return;
+
+    txn->set_state(TransactionState::COMMITTED);
 }
 
 /**
@@ -60,5 +76,8 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
-    
+
+    if (txn == nullptr) return;
+    // 只标记状态
+    txn->set_state(TransactionState::ABORTED);
 }
