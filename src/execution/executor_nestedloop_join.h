@@ -26,7 +26,10 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     // 优化：缓存当前对的左右记录，避免对子 Next() 二次调用
     std::unique_ptr<RmRecord> cur_left_;
-    std::unique_ptr<RmRecord> cur_right_;
+
+    // 优化：内表物化
+    std::vector<std::unique_ptr<RmRecord>> right_buf_;
+    size_t right_idx_ = 0;
 
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
@@ -45,7 +48,14 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         fed_conds_ = std::move(conds);
     }
 
-
+    void buffer_right() {
+        right_buf_.clear();
+        right_->beginTuple();
+        while (!right_->is_end()) {
+            right_buf_.push_back(right_->Next());
+            right_->nextTuple();
+        }
+    }
 
     /**
      * 按类型/操作符比较两段字节数据
@@ -135,23 +145,20 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     void find_next_match() {
         while (!isend) {
-            if (right_->is_end()) {
+            if (right_idx_ >= right_buf_.size()) {
                 left_->nextTuple();
                 if (left_->is_end()) {
                     isend = true;
                     return;
                 }
-                right_->beginTuple();
-                cur_left_ = left_->Next();   // 外层推进，刷新左缓存
+                right_idx_ = 0;
+                cur_left_ = left_->Next();
                 continue;
             }
-
-            cur_right_ = right_->Next();
-            if (eval_join_conds(cur_left_.get(), cur_right_.get())) {
+            if (eval_join_conds(cur_left_.get(), right_buf_[right_idx_].get())) {
                 return;
             }
-
-            right_->nextTuple();
+            right_idx_++;
         }
     }
 
@@ -161,15 +168,20 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             isend = true;
             return;
         }
-        right_->beginTuple();
+        buffer_right();                   // 一次性物化内表
+        if (right_buf_.empty()) {
+            isend = true;
+            return;
+        }
+        right_idx_ = 0;
         isend = false;
-        cur_left_ = left_->Next();   // 取首个外层记录
+        cur_left_ = left_->Next();
         find_next_match();
     }
 
     void nextTuple() override {
         if (isend) return;
-        right_->nextTuple();
+        right_idx_++;
         find_next_match();
     }
 
@@ -178,7 +190,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> Next() override {
         auto joined = std::make_unique<RmRecord>(len_);
         memcpy(joined->data, cur_left_->data, left_->tupleLen());
-        memcpy(joined->data + left_->tupleLen(), cur_right_->data, right_->tupleLen());
+        memcpy(joined->data + left_->tupleLen(), right_buf_[right_idx_]->data, right_->tupleLen());
         return joined;
     }
 
