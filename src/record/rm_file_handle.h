@@ -50,6 +50,12 @@ class RmFileHandle {
     BufferPoolManager *buffer_pool_manager_;
     int fd_;        // 打开文件后产生的文件句柄
     RmFileHdr file_hdr_;    // 文件头，维护当前表文件的元数据
+    // 优化：insert 顺序写页缓存
+    int cached_insert_page_no_ = -1;
+    Page *cached_insert_page_ = nullptr;
+    RmPageHdr *cached_insert_hdr_ = nullptr;
+    char *cached_insert_bitmap_ = nullptr;
+    char *cached_insert_slots_ = nullptr;
 
    public:
     RmFileHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd)
@@ -85,6 +91,12 @@ class RmFileHandle {
     RmPageHandle create_new_page_handle();
 
     RmPageHandle fetch_page_handle(int page_no) const;
+
+    ~RmFileHandle() {
+        if (cached_insert_page_) {
+            buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
+        }
+    }
 
    private:
     RmPageHandle create_page_handle();

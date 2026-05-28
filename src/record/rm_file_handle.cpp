@@ -41,28 +41,49 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
  * @param {Context*} context
  * @return {Rid} 插入的记录的记录号（位置）
  */
-Rid RmFileHandle::insert_record(char* buf, Context* context) {
-    // 找一个有空闲槽的页句柄
-    RmPageHandle page_handle = create_page_handle();
+Rid RmFileHandle::insert_record(char *buf, Context *context) {
+    // Step 1：决定写入页 —— 优先用缓存
+    bool use_cache = (cached_insert_page_no_ != -1 &&
+                      cached_insert_hdr_->num_records < file_hdr_.num_records_per_page);
 
-    // 找页内第一个空 slot
-    int slot_no = Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page);
-    // create_page_handle 保证返回的页有空闲，所以这里 slot_no 必小于 num_records_per_page
-
-    // 写入数据
-    memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
-    Bitmap::set(page_handle.bitmap, slot_no);
-    page_handle.page_hdr->num_records++;
-
-    // 若页已满，则从空闲链表上删去
-    int page_no = page_handle.page->get_page_id().page_no;
-    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page) {
-        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    if (!use_cache) {
+        // 释放过期缓存（page 已满或第一次插入）
+        if (cached_insert_page_) {
+            buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
+            cached_insert_page_ = nullptr;
+            cached_insert_page_no_ = -1;
+        }
+        // 找新的可写页
+        RmPageHandle ph = (file_hdr_.first_free_page_no == RM_NO_PAGE)
+                              ? create_new_page_handle()
+                              : fetch_page_handle(file_hdr_.first_free_page_no);
+        cached_insert_page_ = ph.page;
+        cached_insert_page_no_ = ph.page->get_page_id().page_no;
+        cached_insert_hdr_ = ph.page_hdr;
+        cached_insert_bitmap_ = ph.bitmap;
+        cached_insert_slots_ = ph.slots;
     }
 
-    // 释放页
-     buffer_pool_manager_->unpin_page({fd_, page_no}, true);
-    return Rid{page_no, slot_no};
+    // Step 2：bitmap 找空 slot
+    int slot_no = Bitmap::first_bit(false, cached_insert_bitmap_, file_hdr_.num_records_per_page);
+
+    // Step 3：写入
+    char *slot = cached_insert_slots_ + slot_no * file_hdr_.record_size;
+    memcpy(slot, buf, file_hdr_.record_size);
+    Bitmap::set(cached_insert_bitmap_, slot_no);
+    cached_insert_hdr_->num_records++;
+
+    Rid rid{cached_insert_page_no_, slot_no};
+
+    // Step 4：页满，推进 first_free_page + 释放缓存（让下次 insert 重选页）
+    if (cached_insert_hdr_->num_records == file_hdr_.num_records_per_page) {
+        file_hdr_.first_free_page_no = cached_insert_hdr_->next_free_page_no;
+        buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
+        cached_insert_page_ = nullptr;
+        cached_insert_page_no_ = -1;
+    }
+
+    return rid;
 }
 
 /**
