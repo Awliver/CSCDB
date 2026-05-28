@@ -24,9 +24,19 @@ class IxScan : public RecScan {
     Iid end_;  // 初始为upper
     BufferPoolManager *bpm_;
 
+    // 优化：跨 next()/rid() 缓存当前 leaf 节点，仅切叶时 fetch+new
+    mutable int cached_page_no_ = -1;
+    mutable IxNodeHandle *cached_node_ = nullptr;
+    mutable int cached_size_ = 0;
+
+    void release_cached() const;
+    void ensure_cached(int page_no) const;
+
    public:
     IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
         : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {}
+
+    ~IxScan() override { release_cached(); }
 
     void next() override;
 

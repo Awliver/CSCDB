@@ -45,6 +45,20 @@ class IndexScanExecutor : public AbstractExecutor {
     char *cached_table_slots_ = nullptr;
     int table_record_size_ = 0;
 
+    // 题3 批 11：预编译条件 + 跳过冗余检查
+    struct CompiledCond {
+        int lhs_offset;
+        int lhs_len;
+        ColType lhs_type;
+        CompOp op;
+        bool is_rhs_val;
+        const char *rhs_val_data;
+        int rhs_offset;
+    };
+    std::vector<CompiledCond> compiled_;
+    bool need_eval_ = true;             // false = 所有 cond 都被 index range 吸收，跳过 eval
+    bool need_prefix_check_ = true;     // false = hi 是精确的（EQ 全匹配 或 range 上界），EQ 前缀检查冗余
+
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
                     Context *context) {
@@ -194,10 +208,15 @@ class IndexScanExecutor : public AbstractExecutor {
     void position_to_match() {
         while (!range_exhausted_ && !scan_->is_end()) {
             rid_ = scan_->rid();
+
+            // Fast path：range 已精确，且无残余 cond，直接返回匹配
+            if (!need_eval_ && !need_prefix_check_) {
+                return;
+            }
+
             const char *slot = get_table_slot(rid_);  // 0-alloc 直接读 slot
 
-            // EQ 前缀已经被超出 → 早期终止
-            if (eq_match_count_ > 0) {
+            if (need_prefix_check_) {
                 int offset = 0;
                 bool match = true;
                 for (int i = 0; i < eq_match_count_; i++) {
@@ -214,9 +233,13 @@ class IndexScanExecutor : public AbstractExecutor {
                 }
             }
 
-            // 在 slot 上直接 eval_conds，避免 alloc + memcpy
-            if (eval_conds_on_slot(slot)) return;
-            scan_->next();
+            if (need_eval_) {
+                if (!eval_compiled(slot)) {
+                    scan_->next();
+                    continue;
+                }
+            }
+            return;
         }
     }
 
@@ -245,11 +268,50 @@ class IndexScanExecutor : public AbstractExecutor {
         return true;
     }
 
+    void compile_conds() {
+        compiled_.clear();
+        compiled_.reserve(fed_conds_.size());
+        for (const auto &cond : fed_conds_) {
+            auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+                return c.name == cond.lhs_col.col_name;
+            });
+            if (lhs_it == cols_.end()) continue;
+            CompiledCond cc;
+            cc.lhs_offset = lhs_it->offset;
+            cc.lhs_len = lhs_it->len;
+            cc.lhs_type = lhs_it->type;
+            cc.op = cond.op;
+            cc.is_rhs_val = cond.is_rhs_val;
+            if (cond.is_rhs_val) {
+                cc.rhs_val_data = cond.rhs_val.raw->data;
+                cc.rhs_offset = -1;
+            } else {
+                auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+                    return c.name == cond.rhs_col.col_name;
+                });
+                if (rhs_it == cols_.end()) continue;
+                cc.rhs_val_data = nullptr;
+                cc.rhs_offset = rhs_it->offset;
+            }
+            compiled_.push_back(cc);
+        }
+    }
+
+    bool eval_compiled(const char *slot) const {
+        for (const auto &cc : compiled_) {
+            const char *lhs = slot + cc.lhs_offset;
+            const char *rhs = cc.is_rhs_val ? cc.rhs_val_data : slot + cc.rhs_offset;
+            if (!cmp_bytes(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)) return false;
+        }
+        return true;
+    }
+
     void beginTuple() override {
         auto ih = sm_manager_->ihs_.at(
             sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
 
         analyze_conditions();
+        compile_conds();
         range_exhausted_ = false;
 
         // 构造 start_key / end_key：默认 EQ 前缀 + 零填充
@@ -302,12 +364,36 @@ class IndexScanExecutor : public AbstractExecutor {
 
         // 计算 hi
         Iid hi;
+        bool full_eq = (eq_match_count_ == (int)index_meta_.cols.size());
         if (has_upper) {
             hi = upper_inclusive ? ih->upper_bound(end_key.data()) : ih->lower_bound(end_key.data());
+        } else if (full_eq) {
+            // 全 EQ：精确末尾 = upper_bound(prefix)（唯一索引下仅 1 条）
+            hi = ih->upper_bound(start_key.data());
         } else {
-            // 没显式上界：靠 eq_prefix_matches 早期终止或扫到 leaf_end
+            // 部分 EQ 或纯前缀：靠 eq_prefix_matches 早期终止或扫到 leaf_end
             hi = ih->leaf_end();
         }
+
+        // 决定是否需要逐行 eval
+        //   - 所有 cond 都被 EQ 前缀 + range 上下界吸收时，无需再 eval
+        int absorbed = eq_match_count_;
+        if (eq_match_count_ < (int)index_meta_.cols.size()) {
+            const auto &range_col = index_meta_.cols[eq_match_count_];
+            for (const auto &cond : fed_conds_) {
+                if (!cond.is_rhs_val) continue;
+                if (cond.lhs_col.tab_name != tab_name_) continue;
+                if (cond.lhs_col.col_name != range_col.name) continue;
+                if (cond.op == OP_GT || cond.op == OP_GE ||
+                    cond.op == OP_LT || cond.op == OP_LE) {
+                    absorbed++;
+                }
+            }
+        }
+        need_eval_ = (absorbed != (int)fed_conds_.size());
+
+        // hi 精确（range 上界 / 全 EQ）时，EQ 前缀检查冗余
+        need_prefix_check_ = (eq_match_count_ > 0) && !(has_upper || full_eq);
 
         scan_ = std::make_unique<IxScan>(ih, lo, hi, sm_manager_->get_bpm());
         position_to_match();
