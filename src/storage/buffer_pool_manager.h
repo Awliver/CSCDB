@@ -76,6 +76,8 @@ class BufferPoolManager {
 
     void flush_all_pages(int fd);
 
+    void delete_all_pages(int fd);  // 清空 BPM 中该 fd 的所有页（防 fd 重用 → 脏数据）
+
    private:
     bool find_victim_page(frame_id_t* frame_id);
 

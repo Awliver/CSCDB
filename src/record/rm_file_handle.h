@@ -41,8 +41,8 @@ struct RmPageHandle {
 };
 
 /* 每个RmFileHandle对应一个表的数据文件，里面有多个page，每个page的数据封装在RmPageHandle中 */
-class RmFileHandle {      
-    friend class RmScan;    
+class RmFileHandle {
+    friend class RmScan;
     friend class RmManager;
 
    private:
@@ -68,6 +68,7 @@ class RmFileHandle {
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
     }
 
+    RmFileHdr& get_file_hdr_mut() { return file_hdr_; }
     RmFileHdr get_file_hdr() { return file_hdr_; }
     int GetFd() { return fd_; }
 

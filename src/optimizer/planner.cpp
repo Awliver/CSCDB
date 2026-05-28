@@ -22,16 +22,53 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
+// 最左匹配规则：对表上每条索引按 cols 顺序贪心匹配前缀。
+// 列要么能找到 OP_EQ 条件（继续匹配后续列），要么找到 OP_LT/GT/LE/GE 条件（匹配此列后停止）。
+// 跨多条索引时选匹配前缀最长的。
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
     index_col_names.clear();
-    for(auto& cond: curr_conds) {
-        if(cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
-            index_col_names.push_back(cond.lhs_col.col_name);
-    }
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    if(tab.is_index(index_col_names)) return true;
-    return false;
+
+    int best_match_len = 0;
+    const IndexMeta* best_index = nullptr;
+
+    for (auto& index : tab.indexes) {
+        int match_len = 0;
+        for (auto& idx_col : index.cols) {
+            bool found_eq = false;
+            bool found_range = false;
+            for (auto& cond : curr_conds) {
+                if (!cond.is_rhs_val) continue;
+                if (cond.lhs_col.tab_name != tab_name) continue;
+                if (cond.lhs_col.col_name != idx_col.name) continue;
+                if (cond.op == OP_EQ) { found_eq = true; break; }
+                if (cond.op == OP_LT || cond.op == OP_GT || cond.op == OP_LE || cond.op == OP_GE) {
+                    found_range = true;
+                    // 不 break——继续看有没有同列的 OP_EQ（优先 EQ）
+                }
+            }
+            if (found_eq) {
+                match_len++;
+            } else if (found_range) {
+                match_len++;
+                break;  // 范围列匹配后停止——后续列即使匹配也无序
+            } else {
+                break;  // 该列没有可用条件
+            }
+        }
+        if (match_len > best_match_len) {
+            best_match_len = match_len;
+            best_index = &index;
+        }
+    }
+
+    if (best_match_len == 0) return false;
+    // 输出整条索引的全部 col_names（让 get_index_meta 能完整命中）
+    // IndexScanExecutor 自己再分析 fed_conds_ 决定能用几列做 key
+    for (auto& col : best_index->cols) {
+        index_col_names.push_back(col.name);
+    }
+    return true;
 }
 
 /**

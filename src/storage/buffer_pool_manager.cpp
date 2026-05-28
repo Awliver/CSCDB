@@ -163,3 +163,27 @@ void BufferPoolManager::flush_all_pages(int fd) {
         pages_[frame_id].is_dirty_ = false;
     }
 }
+
+/**
+ * 清空 BPM 中给定 fd 的所有页。脏页先刷盘，然后把 frame 释放回 free_list_。
+ * 用途：drop 文件前清掉 BPM 缓存，避免 fd 被 OS 重用时新文件读到旧 fd 的脏数据。
+ */
+void BufferPoolManager::delete_all_pages(int fd) {
+    std::scoped_lock lock{latch_};
+    for (auto it = page_table_.begin(); it != page_table_.end(); ) {
+        const PageId& pid = it->first;
+        if (pid.fd != fd) { ++it; continue; }
+        frame_id_t frame_id = it->second;
+        Page& page = pages_[frame_id];
+        if (page.is_dirty_) {
+            disk_manager_->write_page(pid.fd, pid.page_no, page.data_, PAGE_SIZE);
+        }
+        // 重置帧元数据
+        page.id_ = PageId{-1, INVALID_PAGE_ID};
+        page.is_dirty_ = false;
+        page.pin_count_ = 0;
+        replacer_->pin(frame_id);   // 从 LRU 中移除（防止 victim 选中它）
+        free_list_.push_back(frame_id);
+        it = page_table_.erase(it);
+    }
+}

@@ -162,6 +162,8 @@ class IxManager {
         disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
         // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
         buffer_pool_manager_->flush_all_pages(ih->fd_);
+        // 清空 BPM 中此 fd 的所有页，避免 fd 被 OS 重用时读到旧 fd 的脏数据
+        buffer_pool_manager_->delete_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
     }
 };

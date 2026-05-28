@@ -23,6 +23,13 @@ class DeleteExecutor : public AbstractExecutor {
     std::vector<Rid> rids_;         // 需要删除的记录的位置
     std::string tab_name_;          // 表名称
     SmManager *sm_manager_;
+    // 优化 5：跨 rid 复用 page handle
+    int cached_page_no_ = -1;
+    Page *cached_page_ = nullptr;
+    RmPageHdr *cached_page_hdr_ = nullptr;
+    char *cached_bitmap_ = nullptr;
+    char *cached_slots_ = nullptr;     // 题3：读旧记录构造索引 key
+    int record_size_ = 0;
 
    public:
     DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
@@ -34,6 +41,30 @@ class DeleteExecutor : public AbstractExecutor {
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        record_size_ = fh_->get_file_hdr().record_size;
+    }
+
+    void release_cached_page() {
+        if (cached_page_) {
+            sm_manager_->get_bpm()->unpin_page(cached_page_->get_page_id(), true);
+            cached_page_ = nullptr;
+            cached_page_no_ = -1;
+            cached_page_hdr_ = nullptr;
+            cached_bitmap_ = nullptr;
+            cached_slots_ = nullptr;
+        }
+    }
+
+    void cache_page(int page_no) {
+        if (page_no != cached_page_no_) {
+            release_cached_page();
+            RmPageHandle handle = fh_->fetch_page_handle(page_no);
+            cached_page_ = handle.page;
+            cached_page_no_ = page_no;
+            cached_page_hdr_ = handle.page_hdr;
+            cached_bitmap_ = handle.bitmap;
+            cached_slots_ = handle.slots;
+        }
     }
 
     /**
@@ -41,12 +72,39 @@ class DeleteExecutor : public AbstractExecutor {
      *               题3实现后还需要同步删除索引项
      */
     std::unique_ptr<RmRecord> Next() override {
+        auto &file_hdr = fh_->get_file_hdr_mut();
+        int num_per_page = file_hdr.num_records_per_page;
         for (const auto &rid : rids_) {
-            fh_->delete_record(rid, context_);
+            cache_page(rid.page_no);
+            char *slot = cached_slots_ + rid.slot_no * record_size_;
+
+            // 题3：删数据前，先把这条记录从所有索引里删除
+            for (auto &index : tab_.indexes) {
+                std::vector<char> key(index.col_tot_len);
+                int offset = 0;
+                for (auto &idx_col : index.cols) {
+                    memcpy(key.data() + offset, slot + idx_col.offset, idx_col.len);
+                    offset += idx_col.len;
+                }
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
+            }
+
+            // 删数据：bitmap + 计数 + free-list 维护
+            bool was_full = cached_page_hdr_->num_records == num_per_page;
+            Bitmap::reset(cached_bitmap_, rid.slot_no);
+            cached_page_hdr_->num_records--;
+            if (was_full) {
+                cached_page_hdr_->next_free_page_no = file_hdr.first_free_page_no;
+                file_hdr.first_free_page_no = rid.page_no;
+            }
         }
+        release_cached_page();
         return nullptr;
     }
 
     Rid &rid() override { return _abstract_rid; }
 
+    ~DeleteExecutor() override { release_cached_page(); }
 };

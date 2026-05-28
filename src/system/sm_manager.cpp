@@ -276,7 +276,51 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    // 1. 检查表存在
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta& tab = db_.tabs_[tab_name];
 
+    // 2. 解析列并构造 IndexMeta
+    IndexMeta index;
+    index.tab_name = tab_name;
+    index.col_num = col_names.size();
+    index.col_tot_len = 0;
+    for (auto& col_name : col_names) {
+        auto col_it = tab.get_col(col_name);  // 列不存在则抛 ColumnNotFoundError
+        index.cols.push_back(*col_it);
+        index.col_tot_len += col_it->len;
+    }
+
+    // 3. 重复索引检测
+    if (ix_manager_->exists(tab_name, index.cols)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+
+    // 4. 创建索引文件 + 打开
+    ix_manager_->create_index(tab_name, index.cols);
+    auto ih = ix_manager_->open_index(tab_name, index.cols);
+
+    // 5. 把表里现有所有记录都插到索引里（唯一索引：重复 key 会被 insert_entry 内部 ignored）
+    auto fh = fhs_[tab_name].get();
+    for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+        auto rec = fh->get_record(scan.rid(), context);
+        char* key = new char[index.col_tot_len];
+        int offset = 0;
+        for (auto& col : index.cols) {
+            memcpy(key + offset, rec->data + col.offset, col.len);
+            offset += col.len;
+        }
+        ih->insert_entry(key, scan.rid(), context ? context->txn_ : nullptr);
+        delete[] key;
+    }
+
+    // 6. 注册到 ihs_ + IndexMeta 加入 tab + 持久化
+    std::string index_name = ix_manager_->get_index_name(tab_name, index.cols);
+    ihs_.emplace(index_name, std::move(ih));
+    tab.indexes.push_back(index);
+    flush_meta();
 }
 
 /**
@@ -286,7 +330,30 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    // 1. 检查表存在
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta& tab = db_.tabs_[tab_name];
 
+    // 2. 找到 IndexMeta（get_index_meta 找不到会抛 IndexNotFoundError）
+    auto index_it = tab.get_index_meta(col_names);
+    auto cols = index_it->cols;
+    std::string index_name = ix_manager_->get_index_name(tab_name, cols);
+
+    // 3. 关闭索引文件 + 从 ihs_ 移除
+    auto ih_it = ihs_.find(index_name);
+    if (ih_it != ihs_.end()) {
+        ix_manager_->close_index(ih_it->second.get());
+        ihs_.erase(ih_it);
+    }
+
+    // 4. 删除索引文件
+    ix_manager_->destroy_index(tab_name, cols);
+
+    // 5. 从 TabMeta 移除并持久化
+    tab.indexes.erase(index_it);
+    flush_meta();
 }
 
 /**
@@ -296,5 +363,9 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
-
+    // 用 ColMeta 直接调用——drop_table 走的这个重载（避免拼装 col_names）
+    std::vector<std::string> col_names;
+    col_names.reserve(cols.size());
+    for (auto& c : cols) col_names.push_back(c.name);
+    drop_index(tab_name, col_names, context);
 }

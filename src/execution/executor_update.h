@@ -70,11 +70,62 @@ class UpdateExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> Next() override {
         for (const auto &rid : rids_) {
             char *slot = get_slot_ptr(rid);
+
+            // 题3：先识别 SET 受影响的索引列；保存旧记录用于构造旧 key
+            std::vector<char> old_data;
+            bool need_index_sync = !tab_.indexes.empty();
+            if (need_index_sync) {
+                old_data.assign(slot, slot + record_size_);
+            }
+
+            // 第一遍：在改 slot 之前，把所有"受影响索引"的旧 key 删掉
+            for (auto &index : tab_.indexes) {
+                bool touches = false;
+                for (auto &idx_col : index.cols) {
+                    for (auto &sc : set_clauses_) {
+                        if (sc.lhs.col_name == idx_col.name) { touches = true; break; }
+                    }
+                    if (touches) break;
+                }
+                if (!touches) continue;
+                std::vector<char> old_key(index.col_tot_len);
+                int offset = 0;
+                for (auto &idx_col : index.cols) {
+                    memcpy(old_key.data() + offset, old_data.data() + idx_col.offset, idx_col.len);
+                    offset += idx_col.len;
+                }
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->delete_entry(old_key.data(), context_ ? context_->txn_ : nullptr);
+            }
+
+            // 应用 SET 子句到 slot（原地写）
             for (const auto &set : set_clauses_) {
                 auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                            [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                 if (col_it == tab_.cols.end()) continue;
                 memcpy(slot + col_it->offset, set.rhs.raw->data, col_it->len);
+            }
+
+            // 第二遍：把新 key 插回受影响的索引
+            for (auto &index : tab_.indexes) {
+                bool touches = false;
+                for (auto &idx_col : index.cols) {
+                    for (auto &sc : set_clauses_) {
+                        if (sc.lhs.col_name == idx_col.name) { touches = true; break; }
+                    }
+                    if (touches) break;
+                }
+                if (!touches) continue;
+                std::vector<char> new_key(index.col_tot_len);
+                int offset = 0;
+                for (auto &idx_col : index.cols) {
+                    memcpy(new_key.data() + offset, slot + idx_col.offset, idx_col.len);
+                    offset += idx_col.len;
+                }
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->insert_entry(new_key.data(), rid, context_ ? context_->txn_ : nullptr);
             }
         }
         release_cached_page();
