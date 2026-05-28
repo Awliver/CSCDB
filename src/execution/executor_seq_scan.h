@@ -43,6 +43,11 @@ class SeqScanExecutor : public AbstractExecutor {
     };
     std::vector<CompiledCond> compiled_;
 
+    // 优化 2：跨记录复用 page handle
+    int cached_page_no_ = -1;
+    Page *cached_page_ = nullptr;
+    char *cached_slots_ = nullptr;
+
     SmManager *sm_manager_;
 
    public:
@@ -106,10 +111,16 @@ class SeqScanExecutor : public AbstractExecutor {
     void position_to_next_match() {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            cur_rec_ = fh_->get_record(rid_, context_);
-            if (eval_compiled(cur_rec_->data)) return;
+            char *slot = get_slot_ptr(rid_);
+            if (eval_compiled(slot)) {
+                // 仅匹配时才分配并复制到cur_rec_
+                cur_rec_ = std::make_unique<RmRecord>(len_);
+                memcpy(cur_rec_->data, slot, len_);
+                return;
+            }
             scan_->next();
         }
+        release_cached_page();
     }
 
 
@@ -145,6 +156,26 @@ class SeqScanExecutor : public AbstractExecutor {
         return false;
     }
 
+    void release_cached_page() {
+        if (cached_page_) {
+            sm_manager_->get_bpm()->unpin_page(cached_page_->get_page_id(), false);
+            cached_page_ = nullptr;
+            cached_page_no_ = -1;
+            cached_slots_ = nullptr;
+        }
+    }
+
+    char *get_slot_ptr(const Rid &rid) {
+        if (rid.page_no != cached_page_no_) {
+            release_cached_page();
+            RmPageHandle handle = fh_->fetch_page_handle(rid.page_no);
+            cached_page_ = handle.page;
+            cached_page_no_ = rid.page_no;
+            cached_slots_ = handle.slots;
+        }
+        return cached_slots_ + rid.slot_no * (int)len_;
+    }
+
 
     void beginTuple() override {
         scan_ = std::make_unique<RmScan>(fh_);
@@ -168,4 +199,6 @@ class SeqScanExecutor : public AbstractExecutor {
     size_t tupleLen() const override { return len_; }
 
     Rid &rid() override { return rid_; }
+
+    ~SeqScanExecutor() override { release_cached_page(); }
 };
