@@ -19,7 +19,6 @@ RmScan::RmScan(const RmFileHandle *file_handle) : file_handle_(file_handle) {
     rid_.page_no = RM_FIRST_RECORD_PAGE;
     rid_.slot_no = -1;
     next();
-
 }
 
 /**

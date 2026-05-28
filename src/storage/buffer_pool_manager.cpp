@@ -31,11 +31,16 @@ bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
  * @param {frame_id_t} new_frame_id 新的帧frame_id
  */
 void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id) {
-    if (page->is_dirty_) {
-        disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
+    if (page->is_dirty_)
+    {
+        disk_manager_->write_page(page->id_.fd, page->id_.page_no,
+                                  page->data_, PAGE_SIZE);
         page->is_dirty_ = false;
     }
-    page_table_.erase(page->id_);
+    if (page->id_.page_no != INVALID_PAGE_ID)
+    {
+        page_table_.erase(page->id_);
+    }
     page_table_[new_page_id] = new_frame_id;
     page->id_ = new_page_id;
     page->reset_memory();
@@ -53,8 +58,11 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     auto it = page_table_.find(page_id);
     if (it != page_table_.end()) {
         frame_id_t frame_id = it->second;
+        if (pages_[frame_id].pin_count_ == 0)
+        {
+            replacer_->pin(frame_id);
+        }
         pages_[frame_id].pin_count_++;
-        replacer_->pin(frame_id);
         return &pages_[frame_id];
     }
     frame_id_t frame_id;

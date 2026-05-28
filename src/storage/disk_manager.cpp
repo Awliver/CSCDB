@@ -28,11 +28,9 @@ DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
     off_t pos = static_cast<off_t>(page_no) * PAGE_SIZE;
-    if (lseek(fd, pos, SEEK_SET) == -1) {
-        throw InternalError("DiskManager::write_page Error");
-    }
-    ssize_t bytes_written = write(fd, offset, num_bytes);
-    if (bytes_written != num_bytes) {
+    ssize_t bytes_written = pwrite(fd, offset, num_bytes, pos);
+    if (bytes_written != num_bytes)
+    {
         throw InternalError("DiskManager::write_page Error");
     }
 }
@@ -46,11 +44,9 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int 
  */
 void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_bytes) {
     off_t pos = static_cast<off_t>(page_no) * PAGE_SIZE;
-    if (lseek(fd, pos, SEEK_SET) == -1) {
-        throw InternalError("DiskManager::read_page Error");
-    }
-    ssize_t bytes_read = read(fd, offset, num_bytes);
-    if (bytes_read != num_bytes) {
+    ssize_t bytes_read = pread(fd, offset, num_bytes, pos);
+    if (bytes_read != num_bytes)
+    {
         throw InternalError("DiskManager::read_page Error");
     }
 }
