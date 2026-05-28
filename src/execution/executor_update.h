@@ -24,6 +24,11 @@ class UpdateExecutor : public AbstractExecutor {
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager *sm_manager_;
+    // 优化 4：跨 rid 复用 page handle，直接写 slot
+    int cached_page_no_ = -1;
+    Page *cached_page_ = nullptr;
+    char *cached_slots_ = nullptr;
+    int record_size_ = 0;
 
    public:
     UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
@@ -36,42 +41,47 @@ class UpdateExecutor : public AbstractExecutor {
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        record_size_ = fh_->get_file_hdr().record_size;
+    }
+
+    void release_cached_page() {
+        if (cached_page_) {
+            sm_manager_->get_bpm()->unpin_page(cached_page_->get_page_id(), true);
+            cached_page_ = nullptr;
+            cached_page_no_ = -1;
+            cached_slots_ = nullptr;
+        }
+    }
+
+    char *get_slot_ptr(const Rid &rid) {
+        if (rid.page_no != cached_page_no_) {
+            release_cached_page();
+            RmPageHandle handle = fh_->fetch_page_handle(rid.page_no);
+            cached_page_ = handle.page;
+            cached_page_no_ = rid.page_no;
+            cached_slots_ = handle.slots;
+        }
+        return cached_slots_ + rid.slot_no * record_size_;
     }
 
     /**
      * @description: 遍历所有匹配的 rid，对每条记录应用 SET 修改后写回
      */
     std::unique_ptr<RmRecord> Next() override {
-        int record_size = fh_->get_file_hdr().record_size;
-
         for (const auto &rid : rids_) {
-            // 读出旧记录
-            auto old_rec = fh_->get_record(rid, context_);
-
-            // 构造新记录
-            RmRecord new_rec(record_size);
-            memcpy(new_rec.data, old_rec->data, record_size);
-
+            char *slot = get_slot_ptr(rid);
             for (const auto &set : set_clauses_) {
-                // 查找该列在 tab_ 中的元数据
                 auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
-                                           [&](const ColMeta &c) {
-                                               return c.name == set.lhs.col_name;
-                                           });
-                if (col_it == tab_.cols.end()) continue;  // analyze 应已校验
-
-                // 把 SET 值拷贝到对应字段位置
-                memcpy(new_rec.data + col_it->offset,
-                       set.rhs.raw->data,
-                       col_it->len);
+                                           [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                if (col_it == tab_.cols.end()) continue;
+                memcpy(slot + col_it->offset, set.rhs.raw->data, col_it->len);
             }
-
-            // 写回磁盘
-            fh_->update_record(rid, new_rec.data, context_);
         }
-
+        release_cached_page();
         return nullptr;
     }
 
     Rid &rid() override { return _abstract_rid; }
+
+    ~UpdateExecutor() override { release_cached_page(); }
 };
