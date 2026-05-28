@@ -345,6 +345,13 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     std::string index_name = ix_manager_->get_index_name(tab_name, index.cols);
     ihs_.emplace(index_name, std::move(ih));
     tab.indexes.push_back(index);
+
+    // 标记涉及的表列为"有索引"（desc 输出 YES）
+    for (auto& idx_col : index.cols) {
+        auto col_it = tab.get_col(idx_col.name);
+        col_it->index = true;
+    }
+
     flush_meta();
 }
 
@@ -376,8 +383,18 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     // 4. 删除索引文件
     ix_manager_->destroy_index(tab_name, cols);
 
-    // 5. 从 TabMeta 移除并持久化
+    // 5. 从 TabMeta 移除
     tab.indexes.erase(index_it);
+
+    // 重算每列是否还被其他索引引用，更新 col.index
+    for (auto& col : tab.cols) col.index = false;
+    for (auto& idx : tab.indexes) {
+        for (auto& idx_col : idx.cols) {
+            auto col_it = tab.get_col(idx_col.name);
+            col_it->index = true;
+        }
+    }
+
     flush_meta();
 }
 
