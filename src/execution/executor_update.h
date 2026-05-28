@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <fstream>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -76,6 +77,53 @@ class UpdateExecutor : public AbstractExecutor {
             bool need_index_sync = !tab_.indexes.empty();
             if (need_index_sync) {
                 old_data.assign(slot, slot + record_size_);
+            }
+
+            // 题3 测试点 3：先模拟应用 SET 到 new_data，检查唯一索引违反
+            if (need_index_sync) {
+                std::vector<char> new_data = old_data;  // 拷贝
+                for (const auto &set : set_clauses_) {
+                    auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                               [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                    if (col_it == tab_.cols.end()) continue;
+                    memcpy(new_data.data() + col_it->offset, set.rhs.raw->data, col_it->len);
+                }
+                bool violated = false;
+                for (auto &index : tab_.indexes) {
+                    // 检查新 key 是否会与已有键冲突（且不是自己）
+                    bool touches = false;
+                    for (auto &idx_col : index.cols) {
+                        for (auto &sc : set_clauses_) {
+                            if (sc.lhs.col_name == idx_col.name) { touches = true; break; }
+                        }
+                        if (touches) break;
+                    }
+                    if (!touches) continue;
+
+                    std::vector<char> new_key(index.col_tot_len);
+                    int offset = 0;
+                    for (auto &idx_col : index.cols) {
+                        memcpy(new_key.data() + offset, new_data.data() + idx_col.offset, idx_col.len);
+                        offset += idx_col.len;
+                    }
+                    auto ih = sm_manager_->ihs_.at(
+                        sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                    std::vector<Rid> found;
+                    if (ih->get_value(new_key.data(), &found, context_ ? context_->txn_ : nullptr)) {
+                        // 已存在——若不是自己，违反唯一性
+                        if (found[0].page_no != rid.page_no || found[0].slot_no != rid.slot_no) {
+                            violated = true;
+                            break;
+                        }
+                    }
+                }
+                if (violated) {
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                    continue;  // 跳过这条 rid 的更新
+                }
             }
 
             // 第一遍：在改 slot 之前，把所有"受影响索引"的旧 key 删掉

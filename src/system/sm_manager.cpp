@@ -183,6 +183,31 @@ void SmManager::show_tables(Context* context) {
  * @param {string&} tab_name 表名称
  * @param {Context*} context
  */
+/**
+ * @description: 显示某张表上的所有索引，写入 output.txt
+ *               输出格式：| tab_name | unique | (col1,col2,...) |
+ * @param {string&} tab_name 表名
+ * @param {Context*} context
+ */
+void SmManager::show_indexes(const std::string& tab_name, Context* context) {
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta& tab = db_.tabs_[tab_name];
+
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    for (auto& index : tab.indexes) {
+        outfile << "| " << tab_name << " | unique | (";
+        for (size_t i = 0; i < index.cols.size(); ++i) {
+            if (i > 0) outfile << ",";
+            outfile << index.cols[i].name;
+        }
+        outfile << ") |\n";
+    }
+    outfile.close();
+}
+
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
 

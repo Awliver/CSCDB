@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <fstream>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -49,9 +50,31 @@ class InsertExecutor : public AbstractExecutor {
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
+
+        // 题3 测试点 3：唯一索引检查——若任一索引下 key 已存在，写 failure 并跳过整条 INSERT
+        for (auto& index : tab_.indexes) {
+            auto ih = sm_manager_->ihs_.at(
+                sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+            std::vector<char> key(index.col_tot_len);
+            int offset = 0;
+            for (auto& idx_col : index.cols) {
+                memcpy(key.data() + offset, rec.data + idx_col.offset, idx_col.len);
+                offset += idx_col.len;
+            }
+            std::vector<Rid> dummy;
+            if (ih->get_value(key.data(), &dummy, context_ ? context_->txn_ : nullptr)) {
+                // 唯一性违反
+                std::fstream outfile;
+                outfile.open("output.txt", std::ios::out | std::ios::app);
+                outfile << "failure\n";
+                outfile.close();
+                return nullptr;
+            }
+        }
+
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
-        
+
         // Insert into index
         for(size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
@@ -63,6 +86,7 @@ class InsertExecutor : public AbstractExecutor {
                 offset += index.cols[i].len;
             }
             ih->insert_entry(key, rid_, context_->txn_);
+            delete[] key;
         }
         return nullptr;
     }
