@@ -23,11 +23,6 @@ class DeleteExecutor : public AbstractExecutor {
     std::vector<Rid> rids_;         // 需要删除的记录的位置
     std::string tab_name_;          // 表名称
     SmManager *sm_manager_;
-    // 优化 5：跨 rid 复用 page handle
-    int cached_page_no_ = -1;
-    Page *cached_page_ = nullptr;
-    RmPageHdr *cached_page_hdr_ = nullptr;
-    char *cached_bitmap_ = nullptr;
 
    public:
     DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
@@ -41,50 +36,17 @@ class DeleteExecutor : public AbstractExecutor {
         context_ = context;
     }
 
-    void release_cached_page() {
-        if (cached_page_) {
-            sm_manager_->get_bpm()->unpin_page(cached_page_->get_page_id(), true);
-            cached_page_ = nullptr;
-            cached_page_no_ = -1;
-            cached_page_hdr_ = nullptr;
-            cached_bitmap_ = nullptr;
-        }
-    }
-
-    void cache_page(int page_no) {
-        if (page_no != cached_page_no_) {
-            release_cached_page();
-            RmPageHandle handle = fh_->fetch_page_handle(page_no);
-            cached_page_ = handle.page;
-            cached_page_no_ = page_no;
-            cached_page_hdr_ = handle.page_hdr;
-            cached_bitmap_ = handle.bitmap;
-        }
-    }
-
     /**
      * @description: 遍历所有匹配的rid，逐条调用RmFileHandle::delete_record
      *               题3实现后还需要同步删除索引项
      */
     std::unique_ptr<RmRecord> Next() override {
-        auto &file_hdr = fh_->get_file_hdr_mut();
-        int num_per_page = file_hdr.num_records_per_page;
         for (const auto &rid : rids_) {
-            cache_page(rid.page_no);
-            bool was_full = cached_page_hdr_->num_records == num_per_page;
-            Bitmap::reset(cached_bitmap_, rid.slot_no);
-            cached_page_hdr_->num_records--;
-            if (was_full) {
-                // 满→不满，加入空闲链表头部
-                cached_page_hdr_->next_free_page_no = file_hdr.first_free_page_no;
-                file_hdr.first_free_page_no = rid.page_no;
-            }
+            fh_->delete_record(rid, context_);
         }
-        release_cached_page();
         return nullptr;
     }
 
     Rid &rid() override { return _abstract_rid; }
 
-    ~DeleteExecutor() override { release_cached_page(); }
 };
