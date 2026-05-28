@@ -37,8 +37,39 @@ class UpdateExecutor : public AbstractExecutor {
         rids_ = rids;
         context_ = context;
     }
+
+    /**
+     * @description: 遍历所有匹配的 rid，对每条记录应用 SET 修改后写回
+     */
     std::unique_ptr<RmRecord> Next() override {
-        
+        int record_size = fh_->get_file_hdr().record_size;
+
+        for (const auto &rid : rids_) {
+            // 读出旧记录
+            auto old_rec = fh_->get_record(rid, context_);
+
+            // 构造新记录
+            RmRecord new_rec(record_size);
+            memcpy(new_rec.data, old_rec->data, record_size);
+
+            for (const auto &set : set_clauses_) {
+                // 查找该列在 tab_ 中的元数据
+                auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                           [&](const ColMeta &c) {
+                                               return c.name == set.lhs.col_name;
+                                           });
+                if (col_it == tab_.cols.end()) continue;  // analyze 应已校验
+
+                // 把 SET 值拷贝到对应字段位置
+                memcpy(new_rec.data + col_it->offset,
+                       set.rhs.raw->data,
+                       col_it->len);
+            }
+
+            // 写回磁盘
+            fh_->update_record(rid, new_rec.data, context_);
+        }
+
         return nullptr;
     }
 

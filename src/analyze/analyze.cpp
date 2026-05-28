@@ -47,8 +47,35 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause(query->tables, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
-        /** TODO: */
+} else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
+    // 处理 SET 子句
+    TabMeta& tab_meta = sm_manager_->db_.get_table(x->tab_name);
+    for (auto& sv_set : x->set_clauses) {
+        SetClause set;
+        set.lhs.tab_name = x->tab_name;
+        set.lhs.col_name = sv_set->col_name;
+        set.rhs = convert_sv_value(sv_set->val);
+
+        // 查找该列元数据，若不存在抛 ColumnNotFoundError
+        auto col_it = tab_meta.get_col(sv_set->col_name);
+
+        // 类型提升
+        if (col_it->type == TYPE_FLOAT && set.rhs.type == TYPE_INT) {
+            set.rhs.set_float(static_cast<float>(set.rhs.int_val));
+        }
+        if (col_it->type != set.rhs.type) {
+            throw IncompatibleTypeError(coltype2str(col_it->type),
+                                        coltype2str(set.rhs.type));
+        }
+
+        // 初始化字节存储
+        set.rhs.init_raw(col_it->len);
+        query->set_clauses.push_back(set);
+    }
+
+    // 处理 WHERE 条件
+    get_clause(x->conds, query->conds);
+    check_clause({x->tab_name}, query->conds);
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         //处理where条件

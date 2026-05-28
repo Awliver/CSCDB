@@ -36,9 +36,17 @@ class DeleteExecutor : public AbstractExecutor {
         context_ = context;
     }
 
+    /**
+     * @description: 遍历所有匹配的rid，逐条调用RmFileHandle::delete_record
+     *               题3实现后还需要同步删除索引项
+     */
     std::unique_ptr<RmRecord> Next() override {
+        for (const auto &rid : rids_) {
+            fh_->delete_record(rid, context_);
+        }
         return nullptr;
     }
 
     Rid &rid() override { return _abstract_rid; }
+
 };
