@@ -28,6 +28,21 @@ class SeqScanExecutor : public AbstractExecutor {
     Rid rid_;
     std::unique_ptr<RecScan> scan_;     // table_iterator
 
+    // 优化：缓存当前记录，Next() 接 move 出去
+    std::unique_ptr<RmRecord> cur_rec_;
+
+    // 优化：条件预编译（offset/len/type），避免每行 find_if
+    struct CompiledCond {
+        int lhs_offset;
+        int lhs_len;
+        ColType lhs_type;
+        CompOp op;
+        bool is_rhs_val;
+        const char *rhs_val_data;
+        int rhs_offset;
+    };
+    std::vector<CompiledCond> compiled_;
+
     SmManager *sm_manager_;
 
    public:
@@ -43,7 +58,60 @@ class SeqScanExecutor : public AbstractExecutor {
         context_ = context;
 
         fed_conds_ = conds_;
+        compile_conds();
     }
+
+     void compile_conds() {
+        compiled_.clear();
+        compiled_.reserve(fed_conds_.size());
+        for (const auto &cond : fed_conds_) {
+            auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+                return c.name == cond.lhs_col.col_name &&
+                       (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
+            });
+            if (lhs_it == cols_.end()) continue;
+            CompiledCond cc;
+            cc.lhs_offset = lhs_it->offset;
+            cc.lhs_len = lhs_it->len;
+            cc.lhs_type = lhs_it->type;
+            cc.op = cond.op;
+            cc.is_rhs_val = cond.is_rhs_val;
+            if (cond.is_rhs_val) {
+                cc.rhs_val_data = cond.rhs_val.raw->data;
+                cc.rhs_offset = -1;
+            } else {
+                auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+                    return c.name == cond.rhs_col.col_name &&
+                           (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
+                });
+                if (rhs_it == cols_.end()) continue;
+                cc.rhs_val_data = nullptr;
+                cc.rhs_offset = rhs_it->offset;
+            }
+            compiled_.push_back(cc);
+        }
+    }
+
+    bool eval_compiled(const char *data) const {
+        for (const auto &cc : compiled_) {
+            const char *lhs = data + cc.lhs_offset;
+            const char *rhs = cc.is_rhs_val ? cc.rhs_val_data : data + cc.rhs_offset;
+            if (!compare_value(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void position_to_next_match() {
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            cur_rec_ = fh_->get_record(rid_, context_);
+            if (eval_compiled(cur_rec_->data)) return;
+            scan_->next();
+        }
+    }
+
 
     /**
      * @description: 按指定类型和操作符比较两段字节数据
@@ -77,64 +145,20 @@ class SeqScanExecutor : public AbstractExecutor {
         return false;
     }
 
-    /**
-     * @description: 判断一条记录是否满足所有 WHERE 条件（AND 关系）
-     */
-    bool eval_conds(const RmRecord *rec) const {
-        for (const auto &cond : conds_) {
-            // 1. 找 lhs 列在 cols_ 里的位置
-            auto lhs_col_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                return c.tab_name == cond.lhs_col.tab_name && c.name == cond.lhs_col.col_name;
-            });
-            if (lhs_col_it == cols_.end()) return false;
-
-            const char *lhs_data = rec->data + lhs_col_it->offset;
-            const char *rhs_data;
-            int len = lhs_col_it->len;
-            ColType type = lhs_col_it->type;
-
-            // 2. 右值：常量 或 另一列
-            if (cond.is_rhs_val) {
-                rhs_data = cond.rhs_val.raw->data;
-            } else {
-                auto rhs_col_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                    return c.tab_name == cond.rhs_col.tab_name && c.name == cond.rhs_col.col_name;
-                });
-                if (rhs_col_it == cols_.end()) return false;
-                rhs_data = rec->data + rhs_col_it->offset;
-            }
-
-            // 3. 比较，任一条件不满足 → false
-            if (!compare_value(lhs_data, rhs_data, len, type, cond.op)) {
-                return false;
-            }
-        }
-        return true;
-    }
 
     void beginTuple() override {
         scan_ = std::make_unique<RmScan>(fh_);
-        while (!scan_->is_end()) {
-            rid_ = scan_->rid();
-            auto rec = fh_->get_record(rid_, context_);
-            if (eval_conds(rec.get())) return;
-            scan_->next();
-        }
+        position_to_next_match();
     }
 
     void nextTuple() override {
         if (scan_->is_end()) return;
         scan_->next();
-        while (!scan_->is_end()) {
-            rid_ = scan_->rid();
-            auto rec = fh_->get_record(rid_, context_);
-            if (eval_conds(rec.get())) return;
-            scan_->next();
-        }
+        position_to_next_match();
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return fh_->get_record(rid_, context_);
+        return std::move(cur_rec_);
     }
 
     bool is_end() const override { return scan_->is_end(); }

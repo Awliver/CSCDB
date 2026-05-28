@@ -24,6 +24,10 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     std::vector<Condition> fed_conds_;          // 连接条件
     bool isend;
 
+    // 优化：缓存当前对的左右记录，避免对子 Next() 二次调用
+    std::unique_ptr<RmRecord> cur_left_;
+    std::unique_ptr<RmRecord> cur_right_;
+
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
                             std::vector<Condition> conds) {
@@ -129,9 +133,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         return true;  // 所有条件满足
     }
 
-    /**
-     * 双层循环定位下一对匹配的 (left_rec, right_rec)
-     */
     void find_next_match() {
         while (!isend) {
             if (right_->is_end()) {
@@ -141,17 +142,15 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                     return;
                 }
                 right_->beginTuple();
+                cur_left_ = left_->Next();   // 外层推进，刷新左缓存
                 continue;
             }
 
-            // 检查当前 (left, right) 对
-            auto left_rec = left_->Next();
-            auto right_rec = right_->Next();
-            if (eval_join_conds(left_rec.get(), right_rec.get())) {
+            cur_right_ = right_->Next();
+            if (eval_join_conds(cur_left_.get(), cur_right_.get())) {
                 return;
             }
 
-            // 不匹配
             right_->nextTuple();
         }
     }
@@ -164,6 +163,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         }
         right_->beginTuple();
         isend = false;
+        cur_left_ = left_->Next();   // 取首个外层记录
         find_next_match();
     }
 
@@ -175,17 +175,13 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     bool is_end() const override { return isend; }
 
-    /**
-     * 返回当前匹配对的拼接记录：[左字节 | 右字节]
-     */
     std::unique_ptr<RmRecord> Next() override {
-        auto left_rec = left_->Next();
-        auto right_rec = right_->Next();
         auto joined = std::make_unique<RmRecord>(len_);
-        memcpy(joined->data, left_rec->data, left_->tupleLen());
-        memcpy(joined->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
+        memcpy(joined->data, cur_left_->data, left_->tupleLen());
+        memcpy(joined->data + left_->tupleLen(), cur_right_->data, right_->tupleLen());
         return joined;
     }
+
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
 

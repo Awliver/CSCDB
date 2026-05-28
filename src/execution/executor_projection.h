@@ -22,6 +22,17 @@ class ProjectionExecutor : public AbstractExecutor {
     size_t len_;                                    // 字段总长度
     std::vector<size_t> sel_idxs_;
 
+    // 优化：预编译投影步骤
+    struct ProjStep {
+        int src_offset;
+        int dst_offset;
+        int len;
+    };
+    std::vector<ProjStep> steps_;
+
+    // 优化：缓存投影后的当前记录
+    std::unique_ptr<RmRecord> cur_rec_;
+
    public:
     ProjectionExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<TabCol> &sel_cols) {
         prev_ = std::move(prev);
@@ -37,28 +48,41 @@ class ProjectionExecutor : public AbstractExecutor {
             cols_.push_back(col);
         }
         len_ = curr_offset;
+                steps_.reserve(sel_idxs_.size());
+        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
+            const auto &src_col = prev_->cols()[sel_idxs_[i]];
+            ProjStep s;
+            s.src_offset = src_col.offset;
+            s.dst_offset = cols_[i].offset;
+            s.len = src_col.len;
+            steps_.push_back(s);
+        }
     }
 
-    void beginTuple() override { prev_->beginTuple(); }
+    void build_cur() {
+        if (prev_->is_end()) {
+            cur_rec_.reset();
+            return;
+        }
+        auto src_rec = prev_->Next();
+        if (!src_rec) {
+            cur_rec_.reset();
+            return;
+        }
+        cur_rec_ = std::make_unique<RmRecord>(len_);
+        for (const auto &s : steps_) {
+            memcpy(cur_rec_->data + s.dst_offset, src_rec->data + s.src_offset, s.len);
+        }
+    }
 
-    void nextTuple() override { prev_->nextTuple(); }
+    void beginTuple() override { prev_->beginTuple(); build_cur(); }
+
+    void nextTuple() override { prev_->nextTuple(); build_cur(); }
 
     bool is_end() const override { return prev_->is_end(); }
 
     std::unique_ptr<RmRecord> Next() override {
-        // 从子节点获取完整记录
-        auto prev_rec = prev_->Next();
-        // 构造投影后的记录
-        auto result = std::make_unique<RmRecord>(len_);
-        const auto &prev_cols = prev_->cols();
-        for (size_t i = 0; i < sel_idxs_.size(); i++) {
-            const auto &src_col = prev_cols[sel_idxs_[i]];
-            const auto &dst_col = cols_[i];
-            memcpy(result->data + dst_col.offset,
-                   prev_rec->data + src_col.offset,
-                   src_col.len);
-        }
-        return result;
+        return std::move(cur_rec_);
     }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
