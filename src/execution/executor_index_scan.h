@@ -10,6 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cfloat>
+#include <climits>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -306,6 +309,32 @@ class IndexScanExecutor : public AbstractExecutor {
         return true;
     }
 
+    /**
+     * 把 index key 中第 from_col 列及之后的所有列填成该列类型的极值。
+     * 多列索引前缀范围查询时，range 列之后的 suffix 列必须填类型极值（而非字节0）
+     * 才能正确界定 B+ 树扫描边界——否则如 (id,name,score) 上 `id>1`，零填充会让
+     * upper_bound([1,0,0]) 落到第一个 id=1 的键（因 name 字节 > 0），错误地把 id=1 扫进来。
+     * want_max=true 填类型最大值（INT_MAX / FLT_MAX / 0xFF），否则填最小值。
+     */
+    void fill_extreme_from(char *key, int from_col, bool want_max) const {
+        int off = 0;
+        for (int i = 0; i < (int)index_meta_.cols.size(); ++i) {
+            const auto &c = index_meta_.cols[i];
+            if (i >= from_col) {
+                if (c.type == TYPE_INT) {
+                    int v = want_max ? INT_MAX : INT_MIN;
+                    memcpy(key + off, &v, sizeof(int));
+                } else if (c.type == TYPE_FLOAT) {
+                    float v = want_max ? FLT_MAX : -FLT_MAX;
+                    memcpy(key + off, &v, sizeof(float));
+                } else {  // TYPE_STRING：按字节比较，0xFF 最大 / 0x00 最小
+                    memset(key + off, want_max ? 0xFF : 0x00, c.len);
+                }
+            }
+            off += c.len;
+        }
+    }
+
     void beginTuple() override {
         auto ih = sm_manager_->ihs_.at(
             sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
@@ -352,21 +381,39 @@ class IndexScanExecutor : public AbstractExecutor {
             }
         }
 
-        // 计算 lo
+        // 计算 lo —— 多列索引前缀范围：range 列之后的 suffix 列需填类型极值
+        //   >=val(含)：suffix 填 min + lower_bound（含 val 的所有后缀）
+        //   >val (排)：suffix 填 max + upper_bound（跳过 val 的所有后缀）
         Iid lo;
         if (has_lower) {
-            lo = lower_inclusive ? ih->lower_bound(start_key.data()) : ih->upper_bound(start_key.data());
+            if (lower_inclusive) {
+                fill_extreme_from(start_key.data(), eq_match_count_ + 1, false);
+                lo = ih->lower_bound(start_key.data());
+            } else {
+                fill_extreme_from(start_key.data(), eq_match_count_ + 1, true);
+                lo = ih->upper_bound(start_key.data());
+            }
         } else if (eq_len > 0) {
+            // 纯 EQ 前缀（无范围）：range 列及之后填 min，取首个匹配前缀的 key
+            fill_extreme_from(start_key.data(), eq_match_count_, false);
             lo = ih->lower_bound(start_key.data());
         } else {
             lo = ih->leaf_begin();
         }
 
         // 计算 hi
+        //   <val (排)：suffix 填 min + lower_bound（停在 val 之前）
+        //   <=val(含)：suffix 填 max + upper_bound（停在 val 的所有后缀之后）
         Iid hi;
         bool full_eq = (eq_match_count_ == (int)index_meta_.cols.size());
         if (has_upper) {
-            hi = upper_inclusive ? ih->upper_bound(end_key.data()) : ih->lower_bound(end_key.data());
+            if (upper_inclusive) {
+                fill_extreme_from(end_key.data(), eq_match_count_ + 1, true);
+                hi = ih->upper_bound(end_key.data());
+            } else {
+                fill_extreme_from(end_key.data(), eq_match_count_ + 1, false);
+                hi = ih->lower_bound(end_key.data());
+            }
         } else if (full_eq) {
             // 全 EQ：精确末尾 = upper_bound(prefix)（唯一索引下仅 1 条）
             hi = ih->upper_bound(start_key.data());
