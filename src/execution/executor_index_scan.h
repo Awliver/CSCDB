@@ -395,6 +395,24 @@ class IndexScanExecutor : public AbstractExecutor {
         // hi 精确（range 上界 / 全 EQ）时，EQ 前缀检查冗余
         need_prefix_check_ = (eq_match_count_ > 0) && !(has_upper || full_eq);
 
+        // 矛盾/空范围保护：显式上下界交叉时（如 w_id > 500 and w_id < 400），
+        // lo 会落在 hi 之后，IxScan 顺序前进永远到不了 end_，会越过树尾导致
+        // 越界读 / ix_scan.cpp 的 assert 崩溃。这里在 key 层面判定空结果，
+        // 直接返回一个空扫描（lo==lo 使 is_end 立即为真）。
+        if (has_lower && has_upper) {
+            int off = 0, kc = 0;
+            for (const auto &col : index_meta_.cols) {
+                kc = ix_compare(start_key.data() + off, end_key.data() + off, col.type, col.len);
+                if (kc != 0) break;
+                off += col.len;
+            }
+            if (kc > 0 || (kc == 0 && !(lower_inclusive && upper_inclusive))) {
+                range_exhausted_ = true;
+                scan_ = std::make_unique<IxScan>(ih, lo, lo, sm_manager_->get_bpm());
+                return;
+            }
+        }
+
         scan_ = std::make_unique<IxScan>(ih, lo, hi, sm_manager_->get_bpm());
         position_to_match();
     }
