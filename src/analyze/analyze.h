@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,12 +29,18 @@ class Query{
     std::vector<Condition> conds;
     // 投影列
     std::vector<TabCol> cols;
-    // 表名
+    // 表名（真实表名，按 FROM/JOIN 出现顺序，用于保持连接顺序）
     std::vector<std::string> tables;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     //insert 的values值
     std::vector<Value> values;
+
+    // 题4：EXPLAIN ANALYZE 支持
+    bool is_explain = false;                       // 是否 EXPLAIN ANALYZE
+    bool select_all = false;                       // 是否 SELECT *（决定 Project 输出 [*]）
+    std::map<std::string, std::string> alias2real; // 别名->真表（含真表->真表，解析列归属用）
+    std::map<std::string, std::string> real2alias; // 真表->显示名（有别名用别名，否则真名），EXPLAIN 输出用
 
     Query(){}
 

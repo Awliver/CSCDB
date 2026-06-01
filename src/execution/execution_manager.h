@@ -27,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 
 class Planner;
+class Query;   // 题4：EXPLAIN ANALYZE 用
 
 class QlManager {
    private:
@@ -44,4 +45,7 @@ class QlManager {
                         Context *context);
 
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
+
+    // 题4：EXPLAIN ANALYZE —— 构建优化后的计划树、执行计数、输出计划树（不输出结果集）
+    void run_explain(std::shared_ptr<Query> query, Context *context);
 };

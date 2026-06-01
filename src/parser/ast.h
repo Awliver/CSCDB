@@ -219,13 +219,28 @@ struct JoinExpr : public TreeNode {
             left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)), type(type_) {}
 };
 
+// 题4：FROM 子句里的一个表引用，带可选别名（如 customers c）
+struct JoinTableRef {
+    std::string tab_name;   // 真实表名
+    std::string alias;      // 别名，无则为空
+};
+
+// 题4：FROM 子句解析结果——表引用列表 + JOIN..ON 收集到的连接条件
+struct FromClause : public TreeNode {
+    std::vector<JoinTableRef> refs;
+    std::vector<std::shared_ptr<BinaryExpr>> join_conds;   // 来自 ON 的条件
+};
+
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Col>> cols;
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
 
-    
+    // 题4：与 tabs 平行的别名（无别名则为空串）；EXPLAIN ANALYZE 标志
+    std::vector<std::string> aliases;
+    bool is_explain = false;
+
     bool has_sort;
     std::shared_ptr<OrderBy> order;
 
@@ -234,7 +249,7 @@ struct SelectStmt : public TreeNode {
                std::vector<std::string> tabs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
                std::shared_ptr<OrderBy> order_) :
-            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)), 
+            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
             order(std::move(order_)) {
                 has_sort = (bool)order;
             }
@@ -259,6 +274,9 @@ struct SemValue {
     std::vector<std::string> sv_strs;
 
     std::shared_ptr<TreeNode> sv_node;
+
+    // 题4：FROM 子句的单个表引用（表名+可选别名）
+    JoinTableRef sv_table_ref;
 
     SvCompOp sv_comp_op;
 

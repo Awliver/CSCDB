@@ -20,13 +20,28 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     std::shared_ptr<Query> query = std::make_shared<Query>();
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
-        // 处理表名
-        query->tables = std::move(x->tabs);
-        /** TODO: 检查表是否存在 */
+        // 处理表名（真实表名，按 FROM/JOIN 顺序）+ 题4 别名映射
+        query->tables = x->tabs;
+        query->is_explain = x->is_explain;
+        for (size_t i = 0; i < x->tabs.size(); ++i) {
+            const std::string &real = x->tabs[i];
+            std::string al = (i < x->aliases.size()) ? x->aliases[i] : "";
+            query->alias2real[real] = real;            // 允许用真表名直接引用
+            if (!al.empty()) {
+                query->alias2real[al] = real;          // 别名 -> 真表
+                query->real2alias[real] = al;          // 真表 -> 别名（显示用）
+            } else {
+                query->real2alias[real] = real;        // 无别名则显示真名
+            }
+        }
+        // 题4：记录是否 SELECT *（Project 输出 [*] 用）
+        query->select_all = x->cols.empty();
 
-        // 处理target list，再target list中添加上表名，例如 a.id
+        // 处理 target list；列的 tab_name 可能是别名，先解析为真表名
         for (auto &sv_sel_col : x->cols) {
-            TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
+            std::string tn = sv_sel_col->tab_name;
+            if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
+            TabCol sel_col = {.tab_name = tn, .col_name = sv_sel_col->col_name};
             query->cols.push_back(sel_col);
         }
 
@@ -44,8 +59,14 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 sel_col = check_column(all_cols, sel_col);  // 列元数据校验
             }
         }
-        //处理where条件
+        //处理where条件（WHERE + JOIN..ON 已并入 x->conds）；条件里别名先解析为真表名
         get_clause(x->conds, query->conds);
+        for (auto &cond : query->conds) {
+            if (!cond.lhs_col.tab_name.empty() && query->alias2real.count(cond.lhs_col.tab_name))
+                cond.lhs_col.tab_name = query->alias2real[cond.lhs_col.tab_name];
+            if (!cond.is_rhs_val && !cond.rhs_col.tab_name.empty() && query->alias2real.count(cond.rhs_col.tab_name))
+                cond.rhs_col.tab_name = query->alias2real[cond.rhs_col.tab_name];
+        }
         check_clause(query->tables, query->conds);
 } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
     // 处理 SET 子句

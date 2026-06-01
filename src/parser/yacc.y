@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ON EXPLAIN ANALYZE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -42,7 +42,9 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
-%type <sv_strs> tableList colNameList
+%type <sv_strs> colNameList
+%type <sv_node> fromClause
+%type <sv_table_ref> tableRef
 %type <sv_col> col
 %type <sv_cols> colList selector
 %type <sv_set_clause> setClause
@@ -158,9 +160,30 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_order_clause
+    |   SELECT selector FROM fromClause optWhereClause opt_order_clause
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6);
+        auto fc = std::dynamic_pointer_cast<FromClause>($4);
+        std::vector<std::string> tabs;
+        std::vector<std::string> aliases;
+        for (auto &r : fc->refs) { tabs.push_back(r.tab_name); aliases.push_back(r.alias); }
+        std::vector<std::shared_ptr<BinaryExpr>> conds = $5;
+        for (auto &c : fc->join_conds) conds.push_back(c);
+        auto s = std::make_shared<SelectStmt>($2, tabs, conds, $6);
+        s->aliases = aliases;
+        $$ = s;
+    }
+    |   EXPLAIN ANALYZE SELECT selector FROM fromClause optWhereClause opt_order_clause
+    {
+        auto fc = std::dynamic_pointer_cast<FromClause>($6);
+        std::vector<std::string> tabs;
+        std::vector<std::string> aliases;
+        for (auto &r : fc->refs) { tabs.push_back(r.tab_name); aliases.push_back(r.alias); }
+        std::vector<std::shared_ptr<BinaryExpr>> conds = $7;
+        for (auto &c : fc->join_conds) conds.push_back(c);
+        auto s = std::make_shared<SelectStmt>($4, tabs, conds, $8);
+        s->aliases = aliases;
+        s->is_explain = true;
+        $$ = s;
     }
     ;
 
@@ -350,18 +373,42 @@ selector:
     |   colList
     ;
 
-tableList:
+fromClause:
+        tableRef
+    {
+        auto fc = std::make_shared<FromClause>();
+        fc->refs.push_back($1);
+        $$ = fc;
+    }
+    |   fromClause ',' tableRef
+    {
+        auto fc = std::dynamic_pointer_cast<FromClause>($1);
+        fc->refs.push_back($3);
+        $$ = fc;
+    }
+    |   fromClause JOIN tableRef ON whereClause
+    {
+        auto fc = std::dynamic_pointer_cast<FromClause>($1);
+        fc->refs.push_back($3);
+        for (auto &c : $5) fc->join_conds.push_back(c);
+        $$ = fc;
+    }
+    |   fromClause JOIN tableRef
+    {
+        auto fc = std::dynamic_pointer_cast<FromClause>($1);
+        fc->refs.push_back($3);
+        $$ = fc;
+    }
+    ;
+
+tableRef:
         tbName
     {
-        $$ = std::vector<std::string>{$1};
+        $$ = JoinTableRef{$1, ""};
     }
-    |   tableList ',' tbName
+    |   tbName IDENTIFIER
     {
-        $$.push_back($3);
-    }
-    |   tableList JOIN tbName
-    {
-        $$.push_back($3);
+        $$ = JoinTableRef{$1, $2};
     }
     ;
 

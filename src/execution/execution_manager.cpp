@@ -19,6 +19,8 @@ See the Mulan PSL v2 for more details. */
 #include "executor_update.h"
 #include "index/ix.h"
 #include "record_printer.h"
+#include "analyze/analyze.h"
+#include "explain_plan.h"
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -210,4 +212,21 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 // 执行DML语句
 void QlManager::run_dml(std::unique_ptr<AbstractExecutor> exec){
     exec->Next();
+}
+
+// 题4：EXPLAIN ANALYZE —— 构建优化后计划树、计数执行、输出计划树（不输出结果集）
+void QlManager::run_explain(std::shared_ptr<Query> query, Context *context) {
+    std::string tree = explain::run(query.get(), sm_manager_, context);
+    // 写 output.txt（评测产物）
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << tree;
+    outfile.close();
+    // 写客户端缓冲（不输出结果集，仅计划树）
+    if (context->data_send_ && context->offset_) {
+        size_t n = tree.size();
+        memcpy(context->data_send_ + *context->offset_, tree.c_str(), n);
+        *context->offset_ += (int)n;
+        context->data_send_[*context->offset_] = '\0';
+    }
 }
