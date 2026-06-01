@@ -182,17 +182,17 @@ struct Builder {
             top = f;
         }
 
-        // 投影下推：仅多表查询、且需要的列是表全列的真子集时插入 Project
-        if (multi_table) {
+        // 投影下推：多表 && 非 SELECT* 时，每个表都加 Project 节点——即使该表的列被全部保留
+        // 也要显式投影。依据题7 departments 示例：dept_id(连接列)+dept_name(输出列)=全部 2 列，
+        // 仍输出 Project(columns=[departments.dept_id, departments.dept_name])。
+        // SELECT* 不下推投影（示例2 各表直接 Scan，无 Project）。
+        if (multi_table && !q->select_all) {
             auto need = needed_cols(t);
-            TabMeta& tm = sm->db_.get_table(t);
-            if (need.size() < tm.cols.size()) {
-                auto p = std::make_shared<ExNode>();
-                p->type = EX_PROJECT; p->proj_cols = need; p->tables = {t};
-                p->schema = top->schema; p->row_size = top->row_size;
-                p->ch = {top};
-                top = p;
-            }
+            auto p = std::make_shared<ExNode>();
+            p->type = EX_PROJECT; p->proj_cols = need; p->tables = {t};
+            p->schema = top->schema; p->row_size = top->row_size;
+            p->ch = {top};
+            top = p;
         }
         return top;
     }
