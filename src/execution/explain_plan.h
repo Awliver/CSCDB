@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -42,6 +43,10 @@ struct ExNode {
     std::vector<std::string> tables;
     // 运行时累计行数
     long long rows = 0;
+    // SCAN 叶节点行缓存：内表会被重扫多次，首次扫入内存后复用，避免反复走缓冲池
+    // （内存 O(单表行数)，非 O(连接乘积），大数据下从 O(乘积)次页面读取降到 O(表大小)次）
+    std::vector<std::vector<char>> cache;
+    bool has_cache = false;
 };
 using NodePtr = std::shared_ptr<ExNode>;
 
@@ -91,48 +96,54 @@ inline bool cond_tables_in(const Condition& c, const std::set<std::string>& s) {
     return true;
 }
 
-// ---------- 计数执行（经典 NLJ：内表按外表行数重扫，逐节点累计 rows）----------
-// 返回该节点本次执行产生的所有行（materialized）。node.rows 累加（不在调用间清零）。
-inline std::vector<std::vector<char>> ex_execute(ExNode* n, SmManager* sm, Context* ctx) {
-    std::vector<std::vector<char>> out;
+// ---------- 计数执行（流式：经典 NLJ 内表按外表行数重扫；逐行回调，不物化整表）----------
+// 对每个输出行调用 emit(row)，row 缓冲仅在回调内有效。node->rows 累加（跨重扫累计）。
+// 改流式的原因：原先返回 vector<vector<char>> 会在大数据多表连接时物化上百万行
+// （O(行数乘积)的内存+memcpy），EXPLAIN ANALYZE 比普通 SELECT 慢数倍、易超时/OOM。
+// 流式只复用一个 comb 缓冲、不存全表，行数语义完全等价，速度接近真实执行。
+inline void ex_stream(ExNode* n, SmManager* sm, Context* ctx,
+                      const std::function<void(const char*)>& emit) {
     if (n->type == EX_SCAN) {
-        auto fh = sm->fhs_.at(n->table).get();
-        int rs = fh->get_file_hdr().record_size;
-        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-            auto rec = fh->get_record(scan.rid(), ctx);
-            out.emplace_back(rec->data, rec->data + rs);
+        if (!n->has_cache) {                       // 首次：扫全表入缓存
+            auto fh = sm->fhs_.at(n->table).get();
+            int rs = fh->get_file_hdr().record_size;
+            for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+                auto rec = fh->get_record(scan.rid(), ctx);
+                n->cache.emplace_back(rec->data, rec->data + rs);
+            }
+            n->has_cache = true;
         }
-        n->rows += (long long)out.size();
+        for (auto& row : n->cache) {               // 重扫：从内存复用
+            n->rows++;
+            emit(row.data());
+        }
     } else if (n->type == EX_FILTER) {
-        auto child = ex_execute(n->ch[0].get(), sm, ctx);
-        for (auto& row : child) {
-            bool ok = true;
-            for (auto& c : n->conds) if (!eval_cond(c, row.data(), n->ch[0]->schema)) { ok=false; break; }
-            if (ok) out.push_back(std::move(row));
-        }
-        n->rows += (long long)out.size();
+        ExNode* ch = n->ch[0].get();
+        ex_stream(ch, sm, ctx, [&](const char* row) {
+            for (auto& c : n->conds) if (!eval_cond(c, row, ch->schema)) return;
+            n->rows++;
+            emit(row);
+        });
     } else if (n->type == EX_PROJECT) {
         // 计数语义下投影不改变行数，也不真正裁列（保留全行供上层 join 匹配）
-        out = ex_execute(n->ch[0].get(), sm, ctx);
-        n->rows += (long long)out.size();
+        ex_stream(n->ch[0].get(), sm, ctx, [&](const char* row) {
+            n->rows++;
+            emit(row);
+        });
     } else { // EX_JOIN
         ExNode* L = n->ch[0].get();
         ExNode* R = n->ch[1].get();
-        auto lrows = ex_execute(L, sm, ctx);          // 左子树执行一次
-        for (auto& lr : lrows) {
-            auto rrows = ex_execute(R, sm, ctx);      // 右子树按左行数重扫（右侧计数累积）
-            for (auto& rr : rrows) {
-                std::vector<char> comb(L->row_size + R->row_size);
-                memcpy(comb.data(), lr.data(), L->row_size);
-                memcpy(comb.data() + L->row_size, rr.data(), R->row_size);
-                bool ok = true;
-                for (auto& c : n->conds) if (!eval_cond(c, comb.data(), n->schema)) { ok=false; break; }
-                if (ok) out.push_back(std::move(comb));
-            }
-        }
-        n->rows += (long long)out.size();
+        std::vector<char> comb(n->row_size);   // 复用：[左行 | 右行]
+        ex_stream(L, sm, ctx, [&](const char* lrow) {       // 左子树执行一次（流式）
+            memcpy(comb.data(), lrow, L->row_size);
+            ex_stream(R, sm, ctx, [&](const char* rrow) {   // 右子树按当前左行重扫
+                memcpy(comb.data() + L->row_size, rrow, R->row_size);
+                for (auto& c : n->conds) if (!eval_cond(c, comb.data(), n->schema)) return;
+                n->rows++;
+                emit(comb.data());
+            });
+        });
     }
-    return out;
 }
 
 // ---------- 计划树构建 ----------
@@ -319,7 +330,7 @@ inline void format_node(Query* q, ExNode* n, int depth, std::string& out) {
 inline std::string run(Query* q, SmManager* sm, Context* ctx) {
     Builder b{sm, q};
     NodePtr root = b.build();
-    ex_execute(root.get(), sm, ctx);
+    ex_stream(root.get(), sm, ctx, [](const char*){});   // 仅累计 rows，丢弃行
     std::string out;
     format_node(q, root.get(), 0, out);
     return out;
