@@ -8,6 +8,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -266,22 +267,23 @@ inline std::string op_str(CompOp op) {
                 case OP_GT:return ">";case OP_LE:return "<=";case OP_GE:return ">=";}
     return "?";
 }
-// 值显示：与原始 SQL 一致——int 直接输出；float 去掉尾随 0（含被提升的整型字面量）
-inline std::string val_str(const Value& v) {
-    if (v.type == TYPE_INT) return std::to_string(v.int_val);
+// 值显示：浮点字面量用 %.6f（与 SELECT 结果浮点格式一致）；整型字面量(含被提升成 float 的)按整数
+inline std::string val_str(const Value& v, bool is_float_lit) {
+    char buf[64];
+    if (v.type == TYPE_INT) {
+        if (is_float_lit) { std::snprintf(buf, sizeof(buf), "%.6f", static_cast<float>(v.int_val)); return buf; }
+        return std::to_string(v.int_val);
+    }
     if (v.type == TYPE_FLOAT) {
-        std::string s = std::to_string(v.float_val);
-        if (s.find('.') != std::string::npos) {
-            s.erase(s.find_last_not_of('0') + 1);
-            if (!s.empty() && s.back()=='.') s.pop_back();
-        }
-        return s;
+        if (!is_float_lit) return std::to_string(static_cast<int>(v.float_val));  // 整型字面量被提升成 float
+        std::snprintf(buf, sizeof(buf), "%.6f", v.float_val);
+        return buf;
     }
     return "'" + v.str_val + "'";   // 字符串字面量
 }
 inline std::string cond_str(Query* q, const Condition& c) {
     std::string s = disp_tab(q, c.lhs_col.tab_name) + "." + c.lhs_col.col_name + op_str(c.op);
-    if (c.is_rhs_val) s += val_str(c.rhs_val);
+    if (c.is_rhs_val) s += val_str(c.rhs_val, c.rhs_is_float_lit);
     else s += disp_tab(q, c.rhs_col.tab_name) + "." + c.rhs_col.col_name;
     return s;
 }

@@ -80,6 +80,7 @@ struct Condition {
     bool is_rhs_val;  // true if right-hand side is a value (not a column)
     TabCol rhs_col;   // right-hand side column
     Value rhs_val;    // right-hand side value
+    bool rhs_is_float_lit = false;  // 原始字面量是否为浮点(类型提升后丢失，EXPLAIN 渲染用)
 };
 
 struct SetClause {
