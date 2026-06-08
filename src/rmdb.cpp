@@ -69,6 +69,17 @@ static bool parse_set_isolation(const char *sql, IsolationLevel *out) {
     return true;
 }
 
+// 题9：判断语句是否为事务块结束语句（commit / rollback / abort），用于结束失败事务块
+static bool is_txn_end_stmt(const char *sql) {
+    std::string w;
+    for (const char *p = sql; *p && w.size() < 12; ++p) {
+        char c = *p;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { if (w.empty()) continue; else break; }
+        w += (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    return w.rfind("commit", 0) == 0 || w.rfind("rollback", 0) == 0 || w.rfind("abort", 0) == 0;
+}
+
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
 void SetTransaction(txn_id_t *txn_id, Context *context, IsolationLevel sess_iso) {
     context->txn_ = txn_manager->get_transaction(*txn_id);
@@ -96,6 +107,8 @@ void *client_handler(void *sock_fd) {
     txn_id_t txn_id = INVALID_TXN_ID;
     // 题9：会话级隔离级别（SET TRANSACTION ISOLATION LEVEL 设置，跨语句保持）
     IsolationLevel sess_iso = IsolationLevel::SERIALIZABLE;
+    // 题9：显式事务因冲突/危险结构被回滚后进入"失败事务块"，其后语句忽略至 commit/rollback/abort
+    bool txn_failed = false;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -134,6 +147,17 @@ void *client_handler(void *sock_fd) {
             if (parse_set_isolation(data_recv, &new_iso)) {
                 sess_iso = new_iso;
                 data_send[0] = '\0';
+                if (write(fd, data_send, 1) == -1) break;
+                continue;
+            }
+        }
+
+        // 题9：失败事务块——显式事务被回滚后，忽略其后语句，直到 commit/rollback/abort 结束该块
+        if (txn_failed) {
+            if (is_txn_end_stmt(data_recv)) {
+                txn_failed = false;   // 结束失败块，下面正常处理（对已回滚事务的提交/回滚为空操作）
+            } else {
+                data_send[0] = '\0';  // 忽略：无输出、不执行、不写 output.txt
                 if (write(fd, data_send, 1) == -1) break;
                 continue;
             }
@@ -178,7 +202,9 @@ void *client_handler(void *sock_fd) {
                     offset = str.length();
 
                     // 回滚事务
+                    bool was_explicit = context->txn_ && context->txn_->get_txn_mode();
                     txn_manager->abort(context->txn_, log_manager.get());
+                    if (was_explicit) txn_failed = true;   // 题9：显式事务回滚 → 进入失败事务块
                     std::cout << e.GetInfo() << std::endl;
 
                     std::fstream outfile;
