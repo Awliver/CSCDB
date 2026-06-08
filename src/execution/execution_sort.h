@@ -31,7 +31,14 @@ class SortExecutor : public AbstractExecutor {
    public:
     SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
         prev_ = std::move(prev);
-        cols_ = prev_->get_col_offset(sel_cols);
+        // 修复：按列名在子算子输出列中解析排序列。原 get_col_offset 走基类默认实现返回空
+        // ColMeta(offset=0)，导致所有 ORDER BY 都按首列排序（首列恰为排序列时才"碰巧"正确）。
+        const auto &pcols = prev_->cols();
+        auto it = std::find_if(pcols.begin(), pcols.end(), [&](const ColMeta &c) {
+            return c.name == sel_cols.col_name &&
+                   (sel_cols.tab_name.empty() || c.tab_name == sel_cols.tab_name);
+        });
+        cols_ = (it != pcols.end()) ? *it : prev_->get_col_offset(sel_cols);
         is_desc_ = is_desc;
         tuple_num = 0;
         used_tuple.clear();
