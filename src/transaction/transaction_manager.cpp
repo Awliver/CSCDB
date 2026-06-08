@@ -154,6 +154,7 @@ void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, c
                                      const char *data, int len) {
     std::scoped_lock<std::mutex> lck(mvcc_latch_);
     mvcc_dirty_.insert(tab);
+    any_mvcc_dirty_.store(true);
     MvccChain &ch = mvcc_store_[tab][mvcc_key(rid)];
     ch.hist.clear();                          // 新插入：无已提交基础版本
     ch.writer = txn->get_transaction_id();
@@ -166,6 +167,7 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
                                     const char *old_data, const char *new_data, int len, bool is_delete) {
     std::scoped_lock<std::mutex> lck(mvcc_latch_);
     mvcc_dirty_.insert(tab);
+    any_mvcc_dirty_.store(true);
     MvccChain &ch = mvcc_store_[tab][mvcc_key(rid)];
     // 写写冲突检测
     if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())

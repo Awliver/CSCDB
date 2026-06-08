@@ -76,7 +76,7 @@ class InsertExecutor : public AbstractExecutor {
         rid_ = fh_->insert_record(rec.data, context_);
 
         // 题9：有活跃显式事务时，登记为未提交插入版本（提交后才对他人可见，回滚则物理删除）
-        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->mvcc_should_version()) {
+        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_)) {
             context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,
                                             (int)fh_->get_file_hdr().record_size);
             // 题9 SER：新插入记录 vs 其他事务谓词读 → rw 反依赖；成 SSI 危险结构则 abort

@@ -73,7 +73,7 @@ class UpdateExecutor : public AbstractExecutor {
             char *slot = get_slot_ptr(rid);
 
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
-            if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->mvcc_should_version()) {
+            if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_)) {
                 std::vector<char> mv_old(slot, slot + record_size_);
                 std::vector<char> mv_new = mv_old;
                 for (const auto &set : set_clauses_) {

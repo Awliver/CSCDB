@@ -165,6 +165,13 @@ public:
         std::scoped_lock<std::mutex> lck(mvcc_latch_);
         return mvcc_dirty_.count(tab) > 0;
     }
+    /* 写是否需维护版本：有活跃显式事务，或该表已被 MVCC 写过(否则脏表上的隐式写会绕过版本链，
+       使后续快照读取到陈旧值)。无任何 MVCC 活动时(批量加载)走快路径，零开销。 */
+    bool needs_versioning(const std::string &tab) {
+        if (active_explicit_count_.load() > 0) return true;
+        if (!any_mvcc_dirty_.load()) return false;
+        return table_is_dirty(tab);
+    }
     /* 读：返回 txn 在其快照下对 (table,rid) 可见的记录字节；不可见/已删返回 false */
     bool mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
                    const char *heap_data, int len, std::string &out);
@@ -200,6 +207,7 @@ private:
 
     /* 题9 MVCC 状态 */
     std::atomic<int> active_explicit_count_{0};   // 活跃显式事务数
+    std::atomic<bool> any_mvcc_dirty_{false};     // 是否曾有任何 MVCC 写（无则全程快路径，零开销）
     std::mutex mvcc_latch_;                       // 保护 mvcc_store_ / mvcc_dirty_
     std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> mvcc_store_;  // table -> ridkey -> 版本链
     std::unordered_set<std::string> mvcc_dirty_;  // 曾被 MVCC 写过的表

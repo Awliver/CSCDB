@@ -75,7 +75,7 @@ class DeleteExecutor : public AbstractExecutor {
         auto &file_hdr = fh_->get_file_hdr_mut();
         int num_per_page = file_hdr.num_records_per_page;
         bool versioning = context_ && context_->txn_mgr_ && context_->txn_ &&
-                          context_->txn_mgr_->mvcc_should_version();
+                          context_->txn_mgr_->needs_versioning(tab_name_);
         for (const auto &rid : rids_) {
             cache_page(rid.page_no);
             char *slot = cached_slots_ + rid.slot_no * record_size_;
