@@ -204,7 +204,13 @@ class SeqScanExecutor : public AbstractExecutor {
                    context_->txn_mgr_->table_is_dirty(tab_name_);
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
-        if (ser_on_) context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);  // 题9 SER 谓词读(含空结果)
+        if (ser_on_) {
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);   // 题9 SER 谓词读(含空结果)
+            // 读侧(谓词)：检测匹配本谓词但快照不可见的他事务写(幻影插入)→ rw 反依赖；成 SSI 危险结构则 abort
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                AbortReason::DEADLOCK_PREVENTION);
+        }
         scan_ = std::make_unique<RmScan>(fh_);
         position_to_next_match();
     }

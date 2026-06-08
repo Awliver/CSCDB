@@ -353,3 +353,34 @@ bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab
             if (ser_add_edge(me, v.writer_txn)) dangerous = true;
     return dangerous;
 }
+
+// 读时(谓词)：扫描本表版本链，找匹配谓词、但本事务快照不可见的他事务写(尤其幻影插入)，
+// 建立 me ->rw writer。补齐 ser_read_check(只查已读 rid) 无法发现的"看不到的新行"。
+bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string &tab,
+                                             const std::vector<Condition> &conds) {
+    txn_id_t me = txn->get_transaction_id();
+    timestamp_t rts = txn->get_read_ts();
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    auto tit = mvcc_store_.find(tab);
+    if (tit == mvcc_store_.end()) return false;
+    bool dangerous = false;
+    for (auto &kv : tit->second) {
+        MvccChain &ch = kv.second;
+        // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
+        if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
+            !ch.writer_data.empty() && ser_.count(ch.writer) && ser_overlap(me, ch.writer) &&
+            ser_record_matches(tab, ch.writer_data.data(), conds)) {
+            if (ser_add_edge(me, ch.writer)) dangerous = true;
+        }
+        // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
+        for (auto &v : ch.hist) {
+            if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
+                v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
+                ser_.count(v.writer_txn) && ser_overlap(me, v.writer_txn) &&
+                ser_record_matches(tab, v.data.data(), conds)) {
+                if (ser_add_edge(me, v.writer_txn)) dangerous = true;
+            }
+        }
+    }
+    return dangerous;
+}

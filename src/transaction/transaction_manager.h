@@ -184,6 +184,8 @@ public:
     bool ser_write_check(Transaction *txn, const std::string &tab, const Rid &rid, const char *data);
     /* 读时：本次读到的记录 vs 其他 SER 事务对它的不可见写 → 建 rw 反依赖；危险结构返回 true */
     bool ser_read_check(Transaction *txn, const std::string &tab, const Rid &rid);
+    /* 读时(谓词)：版本存储中匹配本次谓词、但本事务快照不可见的他事务写(含幻影插入) → rw 反依赖 */
+    bool ser_read_pred_check(Transaction *txn, const std::string &tab, const std::vector<Condition> &conds);
 
 private:
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
