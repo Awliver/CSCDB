@@ -144,6 +144,7 @@ public:
         std::string data;
         timestamp_t commit_ts;
         bool is_deleted;
+        txn_id_t writer_txn = INVALID_TXN_ID;   // 题9 SER：提交该版本的事务（读侧 rw 归因）
     };
     /* 一条逻辑记录 (table,rid) 的版本链：已提交版本(commit_ts 升序) + 至多一个未提交写覆盖 */
     struct MvccChain {
@@ -174,6 +175,16 @@ public:
     bool mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
                     const char *old_data, const char *new_data, int len, bool is_delete);
 
+    /* ------------------------ 题9：SER（SSI 风格可串行化） ------------------------ */
+    bool is_ser(Transaction *txn);
+    /* 记录 SER 事务的一次记录读 / 谓词读（仅 SELECT 调用） */
+    void ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid);
+    void ser_record_pred(Transaction *txn, const std::string &tab, const std::vector<Condition> &conds);
+    /* 写时：被写记录 vs 其他 SER 事务的读 → 建 rw 反依赖；成危险结构返回 true（调用方 abort 本事务） */
+    bool ser_write_check(Transaction *txn, const std::string &tab, const Rid &rid, const char *data);
+    /* 读时：本次读到的记录 vs 其他 SER 事务对它的不可见写 → 建 rw 反依赖；危险结构返回 true */
+    bool ser_read_check(Transaction *txn, const std::string &tab, const Rid &rid);
+
 private:
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
@@ -190,4 +201,22 @@ private:
     std::mutex mvcc_latch_;                       // 保护 mvcc_store_ / mvcc_dirty_
     std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> mvcc_store_;  // table -> ridkey -> 版本链
     std::unordered_set<std::string> mvcc_dirty_;  // 曾被 MVCC 写过的表
+
+    /* 题9 SER (SSI) 状态 —— 复用 mvcc_latch_ 保护 */
+    struct SerInfo {
+        timestamp_t read_ts = 0;
+        timestamp_t commit_ts = 0;     // 0 = 未提交(活跃)
+        bool committed = false;
+        std::vector<std::pair<std::string, int64_t>> read_rids;                   // (table, ridkey)
+        std::vector<std::pair<std::string, std::vector<Condition>>> read_preds;   // (table, 谓词)
+        std::unordered_set<txn_id_t> in_rw;    // X ->rw 本事务
+        std::unordered_set<txn_id_t> out_rw;   // 本事务 ->rw Y
+    };
+    std::unordered_map<txn_id_t, SerInfo> ser_;
+    void ser_begin(txn_id_t id, timestamp_t read_ts);
+    void ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts);
+    bool ser_add_edge(txn_id_t reader, txn_id_t writer);    // 加 rw 边 + 查危险结构(true=危险)
+    bool ser_overlap(txn_id_t a, txn_id_t b);
+    bool ser_dangerous(txn_id_t tin, txn_id_t tpiv, txn_id_t tout);
+    bool ser_record_matches(const std::string &tab, const char *data, const std::vector<Condition> &conds);
 };

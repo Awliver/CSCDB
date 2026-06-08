@@ -87,6 +87,14 @@ class UpdateExecutor : public AbstractExecutor {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
+                // 题9 SER：旧记录 + 新记录 vs 其他事务读 → rw 反依赖；成 SSI 危险结构则 abort
+                if (context_->txn_mgr_->is_ser(context_->txn_)) {
+                    bool d1 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mv_old.data());
+                    bool d2 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mv_new.data());
+                    if (d1 || d2)
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                        AbortReason::DEADLOCK_PREVENTION);
+                }
             }
 
             // 题3：先识别 SET 受影响的索引列；保存旧记录用于构造旧 key

@@ -35,4 +35,5 @@ public:
     char *data_send_;
     int *offset_;
     bool ellipsis_;
+    bool ser_in_select_ = false;   // 题9 SER：当前扫描是否属于 SELECT（仅 SELECT 记录读集）
 };

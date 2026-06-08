@@ -34,6 +34,8 @@ class SeqScanExecutor : public AbstractExecutor {
     // 题9 MVCC：表被事务写过时，逐行按快照重建可见版本
     bool mvcc_on_ = false;
     std::string mvcc_buf_;
+    // 题9 SER：本次为 SER 事务的 SELECT 扫描时，记录记录读/谓词读
+    bool ser_on_ = false;
 
     // 优化：条件预编译（offset/len/type），避免每行 find_if
     struct CompiledCond {
@@ -129,6 +131,13 @@ class SeqScanExecutor : public AbstractExecutor {
                 // 仅匹配时才分配并复制到cur_rec_
                 cur_rec_ = std::make_unique<RmRecord>(len_);
                 memcpy(cur_rec_->data, eval_data, len_);
+                if (ser_on_) {
+                    context_->txn_mgr_->ser_record_read(context_->txn_, tab_name_, rid_);   // 题9 SER 记录读
+                    // 读侧：本次读到的记录若有他事务不可见写 → rw 反依赖；成 SSI 危险结构则 abort
+                    if (context_->txn_mgr_->ser_read_check(context_->txn_, tab_name_, rid_))
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                        AbortReason::DEADLOCK_PREVENTION);
+                }
                 return;
             }
             scan_->next();
@@ -193,6 +202,9 @@ class SeqScanExecutor : public AbstractExecutor {
     void beginTuple() override {
         mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
                    context_->txn_mgr_->table_is_dirty(tab_name_);
+        ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
+                  context_->txn_mgr_->is_ser(context_->txn_);
+        if (ser_on_) context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);  // 题9 SER 谓词读(含空结果)
         scan_ = std::make_unique<RmScan>(fh_);
         position_to_next_match();
     }

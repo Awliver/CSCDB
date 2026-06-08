@@ -87,6 +87,12 @@ class DeleteExecutor : public AbstractExecutor {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
+                // 题9 SER：被删旧记录 vs 其他事务读 → rw 反依赖；成 SSI 危险结构则 abort
+                if (context_->txn_mgr_->is_ser(context_->txn_) &&
+                    context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, slot)) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+                }
                 continue;
             }
 

@@ -152,27 +152,23 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
 }
 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
-void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols, 
+void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                             Context *context) {
+    if (context) context->ser_in_select_ = true;   // 题9 SER：本次扫描属于 SELECT，记录读集
     std::vector<std::string> captions;
     captions.reserve(sel_cols.size());
     for (auto &sel_col : sel_cols) {
         captions.push_back(sel_col.col_name);
     }
 
+    // 记录扫描前客户端缓冲位置：output.txt 写入与客户端完全一致的带框输出
+    int buf_start = context && context->offset_ ? *context->offset_ : 0;
+
     // Print header into buffer
     RecordPrinter rec_printer(sel_cols.size());
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
-    // print header into file
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for(int i = 0; i < captions.size(); ++i) {
-        outfile << " " << captions[i] << " |";
-    }
-    outfile << "\n";
 
     // Print records
     size_t num_rec = 0;
@@ -195,19 +191,20 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
         // print record into buffer
         rec_printer.print_record(columns, context);
-        // print record into file
-        outfile << "|";
-        for(int i = 0; i < columns.size(); ++i) {
-            outfile << " " << columns[i] << " |";
-        }
-        outfile << "\n";
         num_rec++;
     }
-    outfile.close();
-    // Print footer into buffer
+    // Print footer + record count into buffer
     rec_printer.print_separator(context);
-    // Print record count into buffer
     RecordPrinter::print_record_count(num_rec, context);
+
+    // 题9：扫描成功后，把本条 SELECT 的带框输出一次性写入 output.txt（与客户端一致）；
+    // 若 SER 读侧在扫描中途中止则抛出，不会执行到此，output.txt 不产生残缺输出
+    if (context && context->data_send_ && context->offset_ && *context->offset_ > buf_start) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile.write(context->data_send_ + buf_start, *context->offset_ - buf_start);
+        outfile.close();
+    }
 }
 
 // 执行DML语句

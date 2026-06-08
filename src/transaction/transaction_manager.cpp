@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 #include "transaction_manager.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
+#include <algorithm>
+#include <cstring>
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
 
@@ -40,31 +42,35 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn->get_state() == TransactionState::COMMITTED ||
         txn->get_state() == TransactionState::ABORTED) return;
 
+    timestamp_t cts = 0;
     {
         std::scoped_lock<std::mutex> lck(mvcc_latch_);
         auto write_set = txn->get_write_set();
-        if (!write_set->empty()) {
-            timestamp_t cts = ++last_commit_ts_;     // 单调递增提交序
+        // 显式事务即使只读也分配提交序（SER 危险结构判定需提交顺序）
+        if (!write_set->empty() || txn->get_txn_mode()) {
+            cts = ++last_commit_ts_;
             txn->set_commit_ts(cts);
-            for (auto *wr : *write_set) {
-                auto tit = mvcc_store_.find(wr->GetTableName());
-                if (tit == mvcc_store_.end()) continue;
-                auto cit = tit->second.find(mvcc_key(wr->GetRid()));
-                if (cit == tit->second.end()) continue;
-                MvccChain &ch = cit->second;
-                if (ch.writer == txn->get_transaction_id()) {
-                    MvccVer v;
-                    v.commit_ts = cts;
-                    v.is_deleted = ch.writer_del;
-                    if (!ch.writer_del) v.data = ch.writer_data;
-                    ch.hist.push_back(std::move(v));
-                    ch.writer = INVALID_TXN_ID;
-                    ch.writer_data.clear();
-                }
+        }
+        for (auto *wr : *write_set) {
+            auto tit = mvcc_store_.find(wr->GetTableName());
+            if (tit == mvcc_store_.end()) continue;
+            auto cit = tit->second.find(mvcc_key(wr->GetRid()));
+            if (cit == tit->second.end()) continue;
+            MvccChain &ch = cit->second;
+            if (ch.writer == txn->get_transaction_id()) {
+                MvccVer v;
+                v.commit_ts = cts;
+                v.is_deleted = ch.writer_del;
+                v.writer_txn = txn->get_transaction_id();
+                if (!ch.writer_del) v.data = ch.writer_data;
+                ch.hist.push_back(std::move(v));
+                ch.writer = INVALID_TXN_ID;
+                ch.writer_data.clear();
             }
         }
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
+        ser_finish(txn->get_transaction_id(), true, cts);   // 题9 SER：记录提交序，保留信息供并发事务判定
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
@@ -110,6 +116,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         }
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
+        ser_finish(txn->get_transaction_id(), false, 0);   // 题9 SER：回滚视为从未发生，清理读写集与 rw 边
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
@@ -182,4 +189,167 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     if (first_touch)
         txn->append_write_record(new WriteRecord(is_delete ? WType::DELETE_TUPLE : WType::UPDATE_TUPLE, tab, rid));
     return true;
+}
+
+/* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------
+ * 锁约定：ser_record_read/pred、ser_write_check、ser_read_check 自持 mvcc_latch_；
+ * 内部 helper(ser_finish/ser_add_edge/ser_overlap/ser_dangerous/ser_record_matches) 假定调用方已持锁。*/
+
+bool TransactionManager::is_ser(Transaction *txn) {
+    return txn && txn->get_txn_mode() &&
+           txn->get_isolation_level() == IsolationLevel::SERIALIZABLE;
+}
+
+static bool ser_cmp(const char *a, const char *b, int len, ColType type, CompOp op) {
+    int cmp;
+    if (type == TYPE_INT) {
+        int ia = *reinterpret_cast<const int *>(a), ib = *reinterpret_cast<const int *>(b);
+        cmp = (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
+    } else if (type == TYPE_FLOAT) {
+        float fa = *reinterpret_cast<const float *>(a), fb = *reinterpret_cast<const float *>(b);
+        cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
+    } else {
+        cmp = memcmp(a, b, len);
+    }
+    switch (op) {
+        case OP_EQ: return cmp == 0;
+        case OP_NE: return cmp != 0;
+        case OP_LT: return cmp < 0;
+        case OP_GT: return cmp > 0;
+        case OP_LE: return cmp <= 0;
+        case OP_GE: return cmp >= 0;
+    }
+    return false;
+}
+
+bool TransactionManager::ser_record_matches(const std::string &tab, const char *data,
+                                            const std::vector<Condition> &conds) {
+    if (conds.empty()) return true;   // 空谓词(全表扫描)匹配所有记录
+    TabMeta &meta = sm_manager_->db_.get_table(tab);
+    for (const auto &cond : conds) {
+        auto it = std::find_if(meta.cols.begin(), meta.cols.end(), [&](const ColMeta &c) {
+            return c.name == cond.lhs_col.col_name &&
+                   (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
+        });
+        if (it == meta.cols.end()) return false;
+        const char *lhs = data + it->offset;
+        const char *rhs;
+        if (cond.is_rhs_val) {
+            rhs = cond.rhs_val.raw->data;
+        } else {
+            auto rit = std::find_if(meta.cols.begin(), meta.cols.end(),
+                                    [&](const ColMeta &c) { return c.name == cond.rhs_col.col_name; });
+            if (rit == meta.cols.end()) return false;
+            rhs = data + rit->offset;
+        }
+        if (!ser_cmp(lhs, rhs, it->len, it->type, cond.op)) return false;
+    }
+    return true;
+}
+
+void TransactionManager::ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid) {
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    SerInfo &info = ser_[txn->get_transaction_id()];
+    info.read_ts = txn->get_read_ts();
+    info.read_rids.push_back({tab, mvcc_key(rid)});
+}
+
+void TransactionManager::ser_record_pred(Transaction *txn, const std::string &tab,
+                                         const std::vector<Condition> &conds) {
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    SerInfo &info = ser_[txn->get_transaction_id()];
+    info.read_ts = txn->get_read_ts();
+    info.read_preds.push_back({tab, conds});
+}
+
+void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts) {
+    auto it = ser_.find(id);
+    if (it == ser_.end()) return;
+    if (committed) {
+        it->second.committed = true;
+        it->second.commit_ts = commit_ts;        // 保留信息供并发 SER 事务判定危险结构
+    } else {
+        for (txn_id_t o : it->second.in_rw)  { auto p = ser_.find(o); if (p != ser_.end()) p->second.out_rw.erase(id); }
+        for (txn_id_t o : it->second.out_rw) { auto p = ser_.find(o); if (p != ser_.end()) p->second.in_rw.erase(id); }
+        ser_.erase(it);                          // 回滚视为从未发生
+    }
+}
+
+bool TransactionManager::ser_overlap(txn_id_t a, txn_id_t b) {
+    auto ia = ser_.find(a), ib = ser_.find(b);
+    if (ia == ser_.end() || ib == ser_.end()) return true;          // 信息缺失：保守认为重叠
+    const SerInfo &A = ia->second, &B = ib->second;
+    if (A.committed && A.commit_ts <= B.read_ts) return false;      // A 在 B 开始前提交
+    if (B.committed && B.commit_ts <= A.read_ts) return false;      // B 在 A 开始前提交
+    return true;
+}
+
+bool TransactionManager::ser_dangerous(txn_id_t tin, txn_id_t tpiv, txn_id_t tout) {
+    if (!ser_overlap(tin, tpiv) || !ser_overlap(tpiv, tout)) return false;
+    if (tin == tout) return true;                                  // Tin = Tout
+    auto io = ser_.find(tout);
+    if (io == ser_.end() || !io->second.committed) return false;   // Tout 未提交，谈不上"先提交"
+    auto ii = ser_.find(tin);
+    if (ii == ser_.end()) return true;
+    if (!ii->second.committed) return true;                        // Tin 仍活跃，Tout 已提交 → Tout 先提交
+    return io->second.commit_ts < ii->second.commit_ts;
+}
+
+bool TransactionManager::ser_add_edge(txn_id_t reader, txn_id_t writer) {
+    if (reader == writer) return false;
+    SerInfo &R = ser_[reader];
+    SerInfo &W = ser_[writer];
+    W.in_rw.insert(reader);
+    R.out_rw.insert(writer);
+    for (txn_id_t y : W.out_rw) if (ser_dangerous(reader, writer, y)) return true;  // writer 为 pivot
+    for (txn_id_t x : R.in_rw)  if (ser_dangerous(x, reader, writer)) return true;  // reader 为 pivot
+    return false;
+}
+
+bool TransactionManager::ser_write_check(Transaction *txn, const std::string &tab,
+                                         const Rid &rid, const char *data) {
+    txn_id_t me = txn->get_transaction_id();
+    int64_t key = mvcc_key(rid);
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    SerInfo &my = ser_[me];
+    my.read_ts = txn->get_read_ts();
+    bool dangerous = false;
+    for (auto &kv : ser_) {
+        txn_id_t other = kv.first;
+        if (other == me) continue;
+        SerInfo &oi = kv.second;
+        bool hit = false;
+        for (auto &rr : oi.read_rids)
+            if (rr.second == key && rr.first == tab) { hit = true; break; }
+        if (!hit && data)
+            for (auto &pr : oi.read_preds)
+                if (pr.first == tab && ser_record_matches(tab, data, pr.second)) { hit = true; break; }
+        if (hit && ser_overlap(other, me))
+            if (ser_add_edge(other, me)) dangerous = true;   // other ->rw me
+    }
+    return dangerous;
+}
+
+bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab, const Rid &rid) {
+    txn_id_t me = txn->get_transaction_id();
+    timestamp_t rts = txn->get_read_ts();
+    int64_t key = mvcc_key(rid);
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    SerInfo &my = ser_[me];
+    my.read_ts = rts;
+    bool dangerous = false;
+    auto tit = mvcc_store_.find(tab);
+    if (tit == mvcc_store_.end()) return false;
+    auto cit = tit->second.find(key);
+    if (cit == tit->second.end()) return false;
+    MvccChain &ch = cit->second;
+    // 其他事务对该 rid 的未提交写 → me ->rw writer
+    if (ch.writer != INVALID_TXN_ID && ch.writer != me && ser_.count(ch.writer) && ser_overlap(me, ch.writer))
+        if (ser_add_edge(me, ch.writer)) dangerous = true;
+    // 已提交但对本事务快照不可见的写 → me ->rw writer
+    for (auto &v : ch.hist)
+        if (v.commit_ts > rts && v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
+            ser_.count(v.writer_txn) && ser_overlap(me, v.writer_txn))
+            if (ser_add_edge(me, v.writer_txn)) dangerous = true;
+    return dangerous;
 }

@@ -79,6 +79,11 @@ class InsertExecutor : public AbstractExecutor {
         if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->mvcc_should_version()) {
             context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,
                                             (int)fh_->get_file_hdr().record_size);
+            // 题9 SER：新插入记录 vs 其他事务谓词读 → rw 反依赖；成 SSI 危险结构则 abort
+            if (context_->txn_mgr_->is_ser(context_->txn_) &&
+                context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid_, rec.data)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+            }
         }
 
         // Insert into index
