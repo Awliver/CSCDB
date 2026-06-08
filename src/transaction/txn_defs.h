@@ -19,8 +19,8 @@ See the Mulan PSL v2 for more details. */
 /* 标识事务状态 */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
-/* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
-enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SERIALIZABLE };
+/* 系统的隔离级别。题9 需要 SNAPSHOT_ISOLATION 与 SERIALIZABLE 两种 */
+enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SERIALIZABLE, SNAPSHOT_ISOLATION };
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
 enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};

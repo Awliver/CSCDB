@@ -99,6 +99,9 @@ class Transaction {
 
     inline timestamp_t get_read_ts() const { return read_ts_; }
     inline timestamp_t get_commit_ts() const { return commit_ts_; }
+    inline void set_read_ts(timestamp_t read_ts) { read_ts_ = read_ts; }
+    inline void set_commit_ts(timestamp_t commit_ts) { commit_ts_ = commit_ts; }
+    inline void set_isolation_level(IsolationLevel level) { isolation_level_ = level; }
 
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {

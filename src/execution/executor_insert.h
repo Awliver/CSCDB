@@ -75,6 +75,12 @@ class InsertExecutor : public AbstractExecutor {
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
 
+        // 题9：有活跃显式事务时，登记为未提交插入版本（提交后才对他人可见，回滚则物理删除）
+        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->mvcc_should_version()) {
+            context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,
+                                            (int)fh_->get_file_hdr().record_size);
+        }
+
         // Insert into index
         for(size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];

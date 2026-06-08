@@ -72,6 +72,23 @@ class UpdateExecutor : public AbstractExecutor {
         for (const auto &rid : rids_) {
             char *slot = get_slot_ptr(rid);
 
+            // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
+            if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->mvcc_should_version()) {
+                std::vector<char> mv_old(slot, slot + record_size_);
+                std::vector<char> mv_new = mv_old;
+                for (const auto &set : set_clauses_) {
+                    auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                               [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                    if (col_it == tab_.cols.end()) continue;
+                    memcpy(mv_new.data() + col_it->offset, set.rhs.raw->data, col_it->len);
+                }
+                if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
+                                                    mv_old.data(), mv_new.data(), record_size_, false)) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+                }
+            }
+
             // 题3：先识别 SET 受影响的索引列；保存旧记录用于构造旧 key
             std::vector<char> old_data;
             bool need_index_sync = !tab_.indexes.empty();

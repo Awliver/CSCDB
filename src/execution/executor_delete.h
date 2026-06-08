@@ -74,9 +74,21 @@ class DeleteExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> Next() override {
         auto &file_hdr = fh_->get_file_hdr_mut();
         int num_per_page = file_hdr.num_records_per_page;
+        bool versioning = context_ && context_->txn_mgr_ && context_->txn_ &&
+                          context_->txn_mgr_->mvcc_should_version();
         for (const auto &rid : rids_) {
             cache_page(rid.page_no);
             char *slot = cached_slots_ + rid.slot_no * record_size_;
+
+            // 题9 MVCC：逻辑删除——写写冲突检测 + 登记删除版本，保留堆槽与索引供快照读
+            if (versioning) {
+                if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
+                                                    slot, nullptr, record_size_, true)) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+                }
+                continue;
+            }
 
             // 题3：删数据前，先把这条记录从所有索引里删除
             for (auto &index : tab_.indexes) {

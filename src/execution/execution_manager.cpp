@@ -106,8 +106,9 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             {
                 // 显示开启一个事务
                 context->txn_->set_txn_mode(true);
+                txn_mgr_->inc_explicit();   // 题9：活跃显式事务数 +1（写操作据此决定是否维护版本）
                 break;
-            }  
+            }
             case T_Transaction_commit:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);

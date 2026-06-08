@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/concurrency/lock_manager.h"
 #include "recovery/log_manager.h"
 
-// class TransactionManager;
+class TransactionManager;
 
 // used for data_send
 static int const_offset = -1;
@@ -28,7 +28,7 @@ public:
             ellipsis_ = false;
           }
 
-    // TransactionManager *txn_mgr_;
+    TransactionManager *txn_mgr_ = nullptr;
     LockManager *lock_mgr_;
     LogManager *log_mgr_;
     Transaction *txn_;

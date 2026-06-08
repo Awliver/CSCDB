@@ -138,6 +138,41 @@ public:
     /** 存储表堆中每个元组的先前版本。 */
     std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
 
+    /** ------------------------ 题9：MVCC 版本存储（SI / SER） ------------------------ */
+    /* 单个已提交版本：完整记录字节 + 提交时间戳 + 删除标记 */
+    struct MvccVer {
+        std::string data;
+        timestamp_t commit_ts;
+        bool is_deleted;
+    };
+    /* 一条逻辑记录 (table,rid) 的版本链：已提交版本(commit_ts 升序) + 至多一个未提交写覆盖 */
+    struct MvccChain {
+        std::vector<MvccVer> hist;          // 已提交版本，commit_ts 升序
+        txn_id_t writer = INVALID_TXN_ID;   // 未提交写者（同一时刻至多一个，否则写写冲突）
+        bool writer_del = false;            // 未提交写是否为删除
+        std::string writer_data;            // 未提交写的新值（非删除时有效）
+    };
+    static inline int64_t mvcc_key(const Rid &rid) {
+        return ((int64_t)rid.page_no << 32) | (uint32_t)rid.slot_no;
+    }
+
+    /* 活跃显式事务数：>0 时写操作才需维护版本，否则单语句直接落堆（避免批量加载开销） */
+    bool mvcc_should_version() const { return active_explicit_count_.load() > 0; }
+    void inc_explicit() { active_explicit_count_++; }
+    /* 该表是否被 MVCC 写过（读时才需查版本链，未脏表直接读堆，保持非事务负载性能） */
+    bool table_is_dirty(const std::string &tab) {
+        std::scoped_lock<std::mutex> lck(mvcc_latch_);
+        return mvcc_dirty_.count(tab) > 0;
+    }
+    /* 读：返回 txn 在其快照下对 (table,rid) 可见的记录字节；不可见/已删返回 false */
+    bool mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
+                   const char *heap_data, int len, std::string &out);
+    /* 插入：登记一条未提交插入版本（rid 为堆插入返回的位置） */
+    void mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
+                     const char *data, int len);
+    /* 写(update/delete)：写写冲突检测 + 登记未提交版本；冲突返回 false（调用方应 abort 该事务） */
+    bool mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
+                    const char *old_data, const char *new_data, int len, bool is_delete);
 
 private:
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
@@ -149,4 +184,10 @@ private:
 
     std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+
+    /* 题9 MVCC 状态 */
+    std::atomic<int> active_explicit_count_{0};   // 活跃显式事务数
+    std::mutex mvcc_latch_;                       // 保护 mvcc_store_ / mvcc_dirty_
+    std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> mvcc_store_;  // table -> ridkey -> 版本链
+    std::unordered_set<std::string> mvcc_dirty_;  // 曾被 MVCC 写过的表
 };

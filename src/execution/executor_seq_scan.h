@@ -31,6 +31,10 @@ class SeqScanExecutor : public AbstractExecutor {
     // 优化：缓存当前记录，Next() 接 move 出去
     std::unique_ptr<RmRecord> cur_rec_;
 
+    // 题9 MVCC：表被事务写过时，逐行按快照重建可见版本
+    bool mvcc_on_ = false;
+    std::string mvcc_buf_;
+
     // 优化：条件预编译（offset/len/type），避免每行 find_if
     struct CompiledCond {
         int lhs_offset;
@@ -112,10 +116,19 @@ class SeqScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             char *slot = get_slot_ptr(rid_);
-            if (eval_compiled(slot)) {
+            const char *eval_data = slot;
+            if (mvcc_on_) {
+                // 题9：按本事务快照重建可见版本；不可见/已删则跳过
+                if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_, slot, (int)len_, mvcc_buf_)) {
+                    scan_->next();
+                    continue;
+                }
+                eval_data = mvcc_buf_.data();
+            }
+            if (eval_compiled(eval_data)) {
                 // 仅匹配时才分配并复制到cur_rec_
                 cur_rec_ = std::make_unique<RmRecord>(len_);
-                memcpy(cur_rec_->data, slot, len_);
+                memcpy(cur_rec_->data, eval_data, len_);
                 return;
             }
             scan_->next();
@@ -178,6 +191,8 @@ class SeqScanExecutor : public AbstractExecutor {
 
 
     void beginTuple() override {
+        mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
+                   context_->txn_mgr_->table_is_dirty(tab_name_);
         scan_ = std::make_unique<RmScan>(fh_);
         position_to_next_match();
     }

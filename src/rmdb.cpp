@@ -55,14 +55,29 @@ void sigint_handler(int signo) {
     longjmp(jmpbuf, 1);
 }
 
+// 题9：识别会话级 "SET TRANSACTION ISOLATION LEVEL {SNAPSHOT ISOLATION|SERIALIZABLE}"
+// 该语句不进解析器，直接更新会话隔离级别。大小写不敏感。
+static bool parse_set_isolation(const char *sql, IsolationLevel *out) {
+    std::string low;
+    for (const char *p = sql; *p; ++p) {
+        char c = *p;
+        low += (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    if (low.find("isolation level") == std::string::npos) return false;
+    *out = (low.find("snapshot") != std::string::npos) ? IsolationLevel::SNAPSHOT_ISOLATION
+                                                        : IsolationLevel::SERIALIZABLE;
+    return true;
+}
+
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(txn_id_t *txn_id, Context *context) {
+void SetTransaction(txn_id_t *txn_id, Context *context, IsolationLevel sess_iso) {
     context->txn_ = txn_manager->get_transaction(*txn_id);
     if(context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
         context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
+        context->txn_->set_isolation_level(sess_iso);   // 题9：以会话隔离级别开启新事务
     }
 }
 
@@ -79,6 +94,8 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
+    // 题9：会话级隔离级别（SET TRANSACTION ISOLATION LEVEL 设置，跨语句保持）
+    IsolationLevel sess_iso = IsolationLevel::SERIALIZABLE;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -111,12 +128,24 @@ void *client_handler(void *sock_fd) {
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
+        // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
+        {
+            IsolationLevel new_iso;
+            if (parse_set_isolation(data_recv, &new_iso)) {
+                sess_iso = new_iso;
+                data_send[0] = '\0';
+                if (write(fd, data_send, 1) == -1) break;
+                continue;
+            }
+        }
+
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
-        SetTransaction(&txn_id, context);
+        context->txn_mgr_ = txn_manager.get();          // 题9：执行器经 Context 访问 MVCC 版本存储
+        SetTransaction(&txn_id, context, sess_iso);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
