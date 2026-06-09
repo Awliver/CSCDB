@@ -78,8 +78,8 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 }
 
 /**
- * @description: 事务回滚。题9：逆序撤销本事务所有未提交写——
- * 新插入的记录物理删除，update/delete 则将堆恢复为最新已提交版本，并清理未提交覆盖。
+ * @description: 事务回滚。题9：逆序撤销本事务所有未提交写——新插入的记录保留堆槽为不可见
+ * 墓碑(不物理删除、不复用槽，保证 select * 行序与标准一致)，update/delete 则将堆恢复为最新已提交版本。
  */
 void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) return;
@@ -103,9 +103,11 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             ch.writer_del = false;
             RmFileHandle *fh = sm_manager_->fhs_.at(wr->GetTableName()).get();
             if (ch.hist.empty()) {
-                // 本事务新插入且未提交 → 物理删除堆记录 + 清链
-                if (fh->is_record(wr->GetRid())) fh->delete_record(wr->GetRid(), nullptr);
-                chains.erase(cit);
+                // 本事务新插入回滚 → 保留堆槽作为不可见墓碑：hist 为空且 writer 已清，
+                // mvcc_read 判定不可见(SeqScan 跳过)。不物理删除、不复用槽位——否则后续 insert
+                // 复用空槽，使 select * 行序与标准(全程 MVCC,中止插入行不复用槽,新行恒在末尾)不一致。
+                // 差分测试 seed16 已复现该分歧。fh 在此分支不再使用。
+                (void)fh;
             } else {
                 // update/delete 回滚：把堆恢复为最新已提交版本（供无事务快路径读取一致）
                 const MvccVer &last = ch.hist.back();

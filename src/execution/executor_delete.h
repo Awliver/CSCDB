@@ -74,8 +74,10 @@ class DeleteExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> Next() override {
         auto &file_hdr = fh_->get_file_hdr_mut();
         int num_per_page = file_hdr.num_records_per_page;
-        bool versioning = context_ && context_->txn_mgr_ && context_->txn_ &&
-                          context_->txn_mgr_->needs_versioning(tab_name_);
+        // 题9：删除一律走逻辑删除（保留堆槽、登记删除版本），不走释放堆槽的快路径——
+        // 物理删除会让堆槽被后续 insert 复用，使 select * 行序与标准(全程 MVCC 逻辑删除,
+        // 重插行总在末尾)不一致。差分测试已证实该行序分歧。
+        bool versioning = context_ && context_->txn_mgr_ && context_->txn_;
         for (const auto &rid : rids_) {
             cache_page(rid.page_no);
             char *slot = cached_slots_ + rid.slot_no * record_size_;
