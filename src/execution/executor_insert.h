@@ -51,7 +51,8 @@ class InsertExecutor : public AbstractExecutor {
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
-        // 题3 测试点 3：唯一索引检查——若任一索引下 key 已存在，写 failure 并跳过整条 INSERT
+        // 题3 唯一索引检查 + 题9 MVCC 感知：索引项可能指向本事务快照下已删(不可见)的旧记录，
+        // 此时同事务可重插同键。仅当存在对本事务仍可见的同键记录才算真唯一冲突。
         for (auto& index : tab_.indexes) {
             auto ih = sm_manager_->ihs_.at(
                 sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
@@ -61,14 +62,33 @@ class InsertExecutor : public AbstractExecutor {
                 memcpy(key.data() + offset, rec.data + idx_col.offset, idx_col.len);
                 offset += idx_col.len;
             }
-            std::vector<Rid> dummy;
-            if (ih->get_value(key.data(), &dummy, context_ ? context_->txn_ : nullptr)) {
-                // 唯一性违反
-                std::fstream outfile;
-                outfile.open("output.txt", std::ios::out | std::ios::app);
-                outfile << "failure\n";
-                outfile.close();
-                return nullptr;
+            std::vector<Rid> existing;
+            if (ih->get_value(key.data(), &existing, context_ ? context_->txn_ : nullptr)) {
+                bool conflict = true;
+                bool mvcc = context_ && context_->txn_mgr_ && context_->txn_ &&
+                            context_->txn_mgr_->needs_versioning(tab_name_);
+                if (mvcc) {
+                    conflict = false;
+                    int rsz = (int)fh_->get_file_hdr().record_size;
+                    for (auto& er : existing) {
+                        if (!fh_->is_record(er)) continue;
+                        auto erec = fh_->get_record(er, context_);
+                        std::string vbuf;
+                        if (context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, er,
+                                                          erec->data, rsz, vbuf)) {
+                            conflict = true; break;   // 同键记录对本事务仍可见 → 真唯一冲突
+                        }
+                    }
+                }
+                if (conflict) {
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                    return nullptr;
+                }
+                // 同键记录均已删(不可见)：清掉陈旧索引项，下方再插入新项
+                if (mvcc) ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
             }
         }
 
