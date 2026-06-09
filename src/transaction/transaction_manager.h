@@ -172,6 +172,17 @@ public:
         if (!any_mvcc_dirty_.load()) return false;
         return table_is_dirty(tab);
     }
+    /* 题9 唯一索引: 该 (table,rid) 是否被另一活跃事务持写(未提交插入/更新/删除)。用于
+       并发同键插入的写写冲突检测——避免 MVCC 感知唯一检查把他人未提交插入误判为可重插。*/
+    bool mvcc_other_writer(const std::string &tab, const Rid &rid, txn_id_t me) {
+        std::scoped_lock<std::mutex> lck(mvcc_latch_);
+        auto tit = mvcc_store_.find(tab);
+        if (tit == mvcc_store_.end()) return false;
+        auto cit = tit->second.find(mvcc_key(rid));
+        if (cit == tit->second.end()) return false;
+        txn_id_t w = cit->second.writer;
+        return w != INVALID_TXN_ID && w != me;
+    }
     /* 读：返回 txn 在其快照下对 (table,rid) 可见的记录字节；不可见/已删返回 false */
     bool mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
                    const char *heap_data, int len, std::string &out);
