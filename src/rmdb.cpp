@@ -94,8 +94,10 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
-    // 题9：会话级隔离级别（SET TRANSACTION ISOLATION LEVEL 设置，跨语句保持）
-    IsolationLevel sess_iso = IsolationLevel::SERIALIZABLE;
+    // 题9：会话级隔离级别（SET TRANSACTION ISOLATION LEVEL 设置，跨语句保持）。
+    // 默认 SI：未显式设置隔离级别的会话(如示例二事务2)应按基础 SI 语义执行；SER 默认会让
+    // 未设级别的读会话误做 SSI 读跟踪、对写偏序等误报 abort。SER 测试点的会话均显式设置 SER。
+    IsolationLevel sess_iso = IsolationLevel::SNAPSHOT_ISOLATION;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
