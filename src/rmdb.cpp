@@ -130,93 +130,106 @@ void *client_handler(void *sock_fd) {
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
-        // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
+        // 题8/题10：单条消息可能含多条以 ';' 分隔的语句(批处理脚本)，逐条执行；题9 评测逐条
+        // 发送——单语句消息行为与原逻辑等价(循环只跑一次、offset 从 0 起、回送一次)。
+        std::vector<std::string> stmts;
         {
-            IsolationLevel new_iso;
-            if (parse_set_isolation(data_recv, &new_iso)) {
-                sess_iso = new_iso;
-                data_send[0] = '\0';
-                if (write(fd, data_send, 1) == -1) break;
-                continue;
+            std::string cur; bool has = false;
+            for (const char *p = data_recv; *p; ++p) {
+                cur.push_back(*p);
+                char c = *p;
+                if (c != ';' && c != ' ' && c != '\t' && c != '\n' && c != '\r') has = true;
+                if (c == ';') { if (has) stmts.push_back(cur); cur.clear(); has = false; }
             }
+            if (has) { cur.push_back(';'); stmts.push_back(cur); }
+            if (stmts.empty()) stmts.push_back(std::string(data_recv));
         }
 
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
 
-        // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
-        context->txn_mgr_ = txn_manager.get();          // 题9：执行器经 Context 访问 MVCC 版本存储
-        SetTransaction(&txn_id, context, sess_iso);
+        for (size_t stmt_i = 0; stmt_i < stmts.size(); ++stmt_i) {
+            const char *cur_sql = stmts[stmt_i].c_str();
+            // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
+            {
+                IsolationLevel new_iso;
+                if (parse_set_isolation(cur_sql, &new_iso)) { sess_iso = new_iso; continue; }
+            }
+            // 开启事务，初始化系统所需的上下文信息（事务/锁/日志管理器指针、结果buffer、长度变量）
+            Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+            context->txn_mgr_ = txn_manager.get();          // 题9：执行器经 Context 访问 MVCC 版本存储
+            SetTransaction(&txn_id, context, sess_iso);
 
-        // 用于判断是否已经调用了yy_delete_buffer来删除buf
-        bool finish_analyze = false;
-        pthread_mutex_lock(buffer_mutex);
-        YY_BUFFER_STATE buf = yy_scan_string(data_recv);
-        if (yyparse() == 0) {
-            if (ast::parse_tree != nullptr) {
-                try {
-                    // analyze and rewrite
-                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
-                    yy_delete_buffer(buf);
-                    finish_analyze = true;
-                    pthread_mutex_unlock(buffer_mutex);
-                    // 题4：EXPLAIN ANALYZE 走独立路径，构建优化后计划树并输出，不走普通执行
-                    if (query->is_explain) {
-                        ql_manager->run_explain(query, context);
-                    } else {
-                        // 优化器
-                        std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
-                        // portal
-                        std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
-                        portal->run(portalStmt, ql_manager.get(), &txn_id, context);
-                        portal->drop();
+            // 用于判断是否已经调用了yy_delete_buffer来删除buf
+            bool finish_analyze = false;
+            pthread_mutex_lock(buffer_mutex);
+            YY_BUFFER_STATE buf = yy_scan_string(cur_sql);
+            if (yyparse() == 0) {
+                if (ast::parse_tree != nullptr) {
+                    try {
+                        // analyze and rewrite
+                        std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
+                        yy_delete_buffer(buf);
+                        finish_analyze = true;
+                        pthread_mutex_unlock(buffer_mutex);
+                        // 题4：EXPLAIN ANALYZE 走独立路径，构建优化后计划树并输出，不走普通执行
+                        if (query->is_explain) {
+                            ql_manager->run_explain(query, context);
+                        } else {
+                            // 优化器
+                            std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+                            // portal
+                            std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
+                            portal->run(portalStmt, ql_manager.get(), &txn_id, context);
+                            portal->drop();
+                        }
+                    } catch (TransactionAbortException &e) {
+                        // 事务需要回滚，把abort信息追加到回送缓冲并写入output.txt
+                        std::string str = "abort\n";
+                        memcpy(data_send + offset, str.c_str(), str.length());
+                        offset += str.length();
+                        data_send[offset] = '\0';
+
+                        // 回滚事务
+                        txn_manager->abort(context->txn_, log_manager.get());
+                        std::cout << e.GetInfo() << std::endl;
+
+                        std::fstream outfile;
+                        outfile.open("output.txt", std::ios::out | std::ios::app);
+                        outfile << str;
+                        outfile.close();
+                    } catch (RMDBError &e) {
+                        // 遇到异常，打印failure到output.txt，并把异常信息追加到回送缓冲
+                        std::cerr << e.what() << std::endl;
+
+                        memcpy(data_send + offset, e.what(), e.get_msg_len());
+                        offset += e.get_msg_len();
+                        data_send[offset] = '\n';
+                        offset += 1;
+                        data_send[offset] = '\0';
+
+                        // 将报错信息写入output.txt
+                        std::fstream outfile;
+                        outfile.open("output.txt",std::ios::out | std::ios::app);
+                        outfile << "failure\n";
+                        outfile.close();
                     }
-                } catch (TransactionAbortException &e) {
-                    // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
-                    std::string str = "abort\n";
-                    memcpy(data_send, str.c_str(), str.length());
-                    data_send[str.length()] = '\0';
-                    offset = str.length();
-
-                    // 回滚事务
-                    txn_manager->abort(context->txn_, log_manager.get());
-                    std::cout << e.GetInfo() << std::endl;
-
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << str;
-                    outfile.close();
-                } catch (RMDBError &e) {
-                    // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
-                    std::cerr << e.what() << std::endl;
-
-                    memcpy(data_send, e.what(), e.get_msg_len());
-                    data_send[e.get_msg_len()] = '\n';
-                    data_send[e.get_msg_len() + 1] = '\0';
-                    offset = e.get_msg_len() + 1;
-
-                    // 将报错信息写入output.txt
-                    std::fstream outfile;
-                    outfile.open("output.txt",std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
                 }
             }
-        }
-        if(finish_analyze == false) {
-            yy_delete_buffer(buf);
-            pthread_mutex_unlock(buffer_mutex);
+            if(finish_analyze == false) {
+                yy_delete_buffer(buf);
+                pthread_mutex_unlock(buffer_mutex);
+            }
+            // 单条语句作为完整事务执行后自动提交（显式事务 txn_mode=true 则跨语句保持）
+            if(context->txn_->get_txn_mode() == false)
+            {
+                txn_manager->commit(context->txn_, context->log_mgr_);
+            }
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
-        // send result with fixed format, use protobuf in the future
+        // 整条消息处理完后一次性回送累积结果
         if (write(fd, data_send, offset + 1) == -1) {
             break;
-        }
-        // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if(context->txn_->get_txn_mode() == false)
-        {
-            txn_manager->commit(context->txn_, context->log_mgr_);
         }
     }
 
