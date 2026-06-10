@@ -107,8 +107,26 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_clause({x->tab_name}, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         // 处理insert 的values值
-        for (auto &sv_val : x->vals) {
-            query->values.push_back(convert_sv_value(sv_val));
+        if (x->cols.empty()) {
+            for (auto &sv_val : x->vals) {
+                query->values.push_back(convert_sv_value(sv_val));
+            }
+        } else {
+            // 题9：列清单 insert——按表列顺序重排 values；列须覆盖全部列且数量匹配
+            TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
+            if (x->cols.size() != x->vals.size()) {
+                throw InvalidValueCountError();
+            }
+            for (auto &col : tab.cols) {
+                size_t k = 0;
+                for (; k < x->cols.size(); ++k) {
+                    if (x->cols[k] == col.name) break;
+                }
+                if (k == x->cols.size()) {
+                    throw ColumnNotFoundError(col.name);  // 列清单未覆盖该列
+                }
+                query->values.push_back(convert_sv_value(x->vals[k]));
+            }
         }
     } else {
         // do nothing

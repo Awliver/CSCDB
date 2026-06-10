@@ -152,6 +152,11 @@ dml:
     {
         $$ = std::make_shared<InsertStmt>($3, $6);
     }
+    |   INSERT INTO tbName '(' colNameList ')' VALUES '(' valueList ')'
+    {
+        /* 题9：列清单 insert into t(c1,c2) values(...)，analyze 按表列序重排 */
+        $$ = std::make_shared<InsertStmt>($3, $5, $9);
+    }
     |   DELETE FROM tbName optWhereClause
     {
         $$ = std::make_shared<DeleteStmt>($3, $4);

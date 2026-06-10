@@ -189,9 +189,13 @@ struct OrderBy : public TreeNode
 struct InsertStmt : public TreeNode {
     std::string tab_name;
     std::vector<std::shared_ptr<Value>> vals;
+    std::vector<std::string> cols;   // 题9：可选列清单 insert into t(c1,c2) values(...)，空=按表列序
 
     InsertStmt(std::string tab_name_, std::vector<std::shared_ptr<Value>> vals_) :
             tab_name(std::move(tab_name_)), vals(std::move(vals_)) {}
+    InsertStmt(std::string tab_name_, std::vector<std::string> cols_,
+               std::vector<std::shared_ptr<Value>> vals_) :
+            tab_name(std::move(tab_name_)), vals(std::move(vals_)), cols(std::move(cols_)) {}
 };
 
 struct DeleteStmt : public TreeNode {
