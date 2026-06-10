@@ -76,7 +76,8 @@ class UpdateExecutor : public AbstractExecutor {
                                  [&](const ColMeta &c) { return c.name == set.rhs_col; });
         if (rcol != tab_.cols.end() && rcol->type == TYPE_INT)
             base = *(const int *)(base_rec + rcol->offset);
-        *(int *)dest_field = base + set.rhs.int_val;   // rhs.int_val 已含符号(+1/-1)
+        int delta = set.arith_neg ? -set.rhs.int_val : set.rhs.int_val;  // 带空格减号需取负
+        *(int *)dest_field = base + delta;
     }
 
     /**
