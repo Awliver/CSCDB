@@ -69,21 +69,27 @@ class InsertExecutor : public AbstractExecutor {
                             context_->txn_mgr_->needs_versioning(tab_name_);
                 if (mvcc) {
                     conflict = false;
+                    bool other_writer = false;
                     int rsz = (int)fh_->get_file_hdr().record_size;
                     for (auto& er : existing) {
                         if (!fh_->is_record(er)) continue;
-                        // 另一活跃事务正写同键(未提交插入/删除/更新) → 写写冲突 → abort 回滚本事务
-                        if (context_->txn_mgr_->mvcc_other_writer(tab_name_, er,
-                                                                  context_->txn_->get_transaction_id())) {
-                            throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                            AbortReason::DEADLOCK_PREVENTION);
-                        }
+                        // 先判可见性：同键记录在本事务快照下可见 → 真唯一冲突 → failure。
+                        // INSERT 无旧版本(spec 1755)，与并发删/写同键不构成写写冲突；可见冲突优先于 abort。
                         auto erec = fh_->get_record(er, context_);
                         std::string vbuf;
                         if (context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, er,
                                                           erec->data, rsz, vbuf)) {
                             conflict = true; break;   // 同键记录对本事务仍可见 → 真唯一冲突
                         }
+                        // 不可见但有其他活跃事务正写同键(未提交插入) → 记下，循环后无可见冲突再 abort
+                        if (context_->txn_mgr_->mvcc_other_writer(tab_name_, er,
+                                                                  context_->txn_->get_transaction_id())) {
+                            other_writer = true;
+                        }
+                    }
+                    if (!conflict && other_writer) {
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                        AbortReason::DEADLOCK_PREVENTION);
                     }
                 }
                 if (conflict) {
