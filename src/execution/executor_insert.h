@@ -31,7 +31,8 @@ class InsertExecutor : public AbstractExecutor {
         tab_ = sm_manager_->db_.get_table(tab_name);
         values_ = values;
         tab_name_ = tab_name;
-        if (values.size() != tab_.cols.size()) {
+        // 题9：values_ 可含多行(平铺)，总数须为列数整数倍
+        if (tab_.cols.empty() || values.size() % tab_.cols.size() != 0) {
             throw InvalidValueCountError();
         }
         fh_ = sm_manager_->fhs_.at(tab_name).get();
@@ -39,16 +40,32 @@ class InsertExecutor : public AbstractExecutor {
     };
 
     std::unique_ptr<RmRecord> Next() override {
+        // 题9：values_ 平铺多行，按表列数分块逐行插入；单行时 nrows_=1，行为不变
+        size_t ncols_ = tab_.cols.size();
+        size_t nrows_ = ncols_ ? values_.size() / ncols_ : 0;
+        for (size_t row_ = 0; row_ < nrows_; ++row_) {
         // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
-        for (size_t i = 0; i < values_.size(); i++) {
+        for (size_t i = 0; i < ncols_; i++) {
             auto &col = tab_.cols[i];
-            auto &val = values_[i];
+            auto &val = values_[row_ * ncols_ + i];
             if (col.type != val.type) {
                 throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
             }
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
+        }
+
+        // 题9 删-插写写冲突：插入的逻辑记录(按首列键)在本事务快照内可见、且正被并发删除
+        // (未提交删或快照后已提交删) → 与该删除基于同一旧版本 → first-updater-wins → abort
+        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_) &&
+            !tab_.cols.empty()) {
+            auto &kcol = tab_.cols[0];
+            if (context_->txn_mgr_->mvcc_insert_key_conflict(context_->txn_, tab_name_,
+                                                             rec.data, kcol.offset, kcol.len)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                AbortReason::DEADLOCK_PREVENTION);
+            }
         }
 
         // 题3 唯一索引检查 + 题9 MVCC 感知：索引项可能指向本事务快照下已删(不可见)的旧记录，
@@ -131,6 +148,7 @@ class InsertExecutor : public AbstractExecutor {
             ih->insert_entry(key, rid_, context_->txn_);
             delete[] key;
         }
+        }   // 题9：多行 insert 行循环结束
         return nullptr;
     }
     Rid &rid() override { return rid_; }

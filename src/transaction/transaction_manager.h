@@ -184,6 +184,11 @@ public:
         return w != INVALID_TXN_ID && w != me;
     }
     /* 读：返回 txn 在其快照下对 (table,rid) 可见的记录字节；不可见/已删返回 false */
+    /* 题9 删-插写写冲突: 插入键 K(首列)时,若本事务快照内可见同键旧版本,且该记录正被其他活跃
+       事务未提交删除、或在快照之后被提交删除 → 本插入与该删除基于同一旧版本 → 冲突(调用方 abort)。
+       新键插入(无可见旧版本)、自删重插(writer==me)、早已提交的重复键 均不冲突。 */
+    bool mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
+                                  const char *rec_data, int key_off, int key_len);
     bool mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
                    const char *heap_data, int len, std::string &out);
     /* 插入：登记一条未提交插入版本（rid 为堆插入返回的位置） */

@@ -195,6 +195,33 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     return true;
 }
 
+bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
+                                                  const char *rec_data, int key_off, int key_len) {
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    auto tit = mvcc_store_.find(tab);
+    if (tit == mvcc_store_.end()) return false;
+    txn_id_t me = txn->get_transaction_id();
+    timestamp_t rts = txn->get_read_ts();
+    const char *key = rec_data + key_off;
+    for (auto &kv : tit->second) {
+        MvccChain &ch = kv.second;
+        // 本事务快照可见的最新已提交版本
+        const MvccVer *vis = nullptr;
+        for (const auto &v : ch.hist) {          // commit_ts 升序
+            if (v.commit_ts <= rts) vis = &v;
+            else break;
+        }
+        if (vis == nullptr || vis->is_deleted) continue;   // 快照内无该记录 → 插入不基于旧版本
+        if ((int)vis->data.size() < key_off + key_len) continue;
+        if (memcmp(vis->data.data() + key_off, key, key_len) != 0) continue;  // 键不同
+        // 快照可见同键旧版本：被并发删除(未提交或快照后已提交) → 写写冲突
+        if (ch.writer != INVALID_TXN_ID && ch.writer != me && ch.writer_del) return true;
+        if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+            ch.hist.back().commit_ts > rts && ch.hist.back().is_deleted) return true;
+    }
+    return false;
+}
+
 /* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------
  * 锁约定：ser_record_read/pred、ser_write_check、ser_read_check 自持 mvcc_latch_；
  * 内部 helper(ser_finish/ser_add_edge/ser_overlap/ser_dangerous/ser_record_matches) 假定调用方已持锁。*/
