@@ -40,7 +40,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_comp_op> op
 %type <sv_expr> expr
 %type <sv_val> value
-%type <sv_vals> valueList
+%type <sv_vals> valueList valueRows
 %type <sv_str> tbName colName
 %type <sv_strs> colNameList
 %type <sv_node> fromClause
@@ -148,9 +148,10 @@ ddl:
     ;
 
 dml:
-        INSERT INTO tbName VALUES '(' valueList ')'
+        INSERT INTO tbName VALUES valueRows
     {
-        $$ = std::make_shared<InsertStmt>($3, $6);
+        /* 题9：valueRows 支持单行与多行 insert into t values(...),(...)；按 cols 数分块 */
+        $$ = std::make_shared<InsertStmt>($3, $5);
     }
     |   INSERT INTO tbName '(' colNameList ')' VALUES '(' valueList ')'
     {
@@ -244,6 +245,19 @@ valueList:
     |   valueList ',' value
     {
         $$.push_back($3);
+    }
+    ;
+
+valueRows:
+        '(' valueList ')'
+    {
+        $$ = $2;
+    }
+    |   valueRows ',' '(' valueList ')'
+    {
+        /* 题9：多行 insert——值平铺，executor 按表列数分块插入 */
+        $$ = $1;
+        for (auto &v : $4) $$.push_back(v);
     }
     ;
 
