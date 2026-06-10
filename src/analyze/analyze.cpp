@@ -76,6 +76,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         set.lhs.tab_name = x->tab_name;
         set.lhs.col_name = sv_set->col_name;
         set.rhs = convert_sv_value(sv_set->val);
+        set.is_arith = sv_set->is_arith;   // 题9：算术增量 v=v+字面量
+        set.rhs_col = sv_set->rhs_col;
 
         // 查找该列元数据，若不存在抛 ColumnNotFoundError
         auto col_it = tab_meta.get_col(sv_set->col_name);

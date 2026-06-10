@@ -159,9 +159,13 @@ struct Col : public Expr {
 struct SetClause : public TreeNode {
     std::string col_name;
     std::shared_ptr<Value> val;
+    bool is_arith = false;     // 题9：v = v + 字面量 的算术增量
+    std::string rhs_col;       // 算术时右侧列名
 
     SetClause(std::string col_name_, std::shared_ptr<Value> val_) :
-            col_name(std::move(col_name_)), val(std::move(val_)) {}
+            col_name(std::move(col_name_)), val(std::move(val_)), is_arith(false) {}
+    SetClause(std::string col_name_, std::string rhs_col_, std::shared_ptr<Value> val_) :
+            col_name(std::move(col_name_)), val(std::move(val_)), is_arith(true), rhs_col(std::move(rhs_col_)) {}
 };
 
 struct BinaryExpr : public TreeNode {

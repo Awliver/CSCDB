@@ -86,4 +86,6 @@ struct Condition {
 struct SetClause {
     TabCol lhs;
     Value rhs;
+    bool is_arith = false;   // 题9：lhs = rhs_col + rhs(带符号字面量) 的算术增量形式（如 v=v+1）
+    std::string rhs_col;     // 算术时右侧引用的列名
 };

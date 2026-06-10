@@ -65,6 +65,20 @@ class UpdateExecutor : public AbstractExecutor {
         return cached_slots_ + rid.slot_no * record_size_;
     }
 
+    // 题9：把一条 SET 子句应写入的值放到 dest_field。算术增量 v=v+字面量 从 base_rec 读取右侧列基值。
+    void apply_set_value(const char *base_rec, char *dest_field, const SetClause &set, const ColMeta &col) {
+        if (!set.is_arith) {
+            memcpy(dest_field, set.rhs.raw->data, col.len);
+            return;
+        }
+        int base = 0;
+        auto rcol = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                 [&](const ColMeta &c) { return c.name == set.rhs_col; });
+        if (rcol != tab_.cols.end() && rcol->type == TYPE_INT)
+            base = *(const int *)(base_rec + rcol->offset);
+        *(int *)dest_field = base + set.rhs.int_val;   // rhs.int_val 已含符号(+1/-1)
+    }
+
     /**
      * @description: 遍历所有匹配的 rid，对每条记录应用 SET 修改后写回
      */
@@ -80,7 +94,7 @@ class UpdateExecutor : public AbstractExecutor {
                     auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                                [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                     if (col_it == tab_.cols.end()) continue;
-                    memcpy(mv_new.data() + col_it->offset, set.rhs.raw->data, col_it->len);
+                    apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
                 }
                 if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
                                                     mv_old.data(), mv_new.data(), record_size_, false)) {
@@ -111,7 +125,7 @@ class UpdateExecutor : public AbstractExecutor {
                     auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                                [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                     if (col_it == tab_.cols.end()) continue;
-                    memcpy(new_data.data() + col_it->offset, set.rhs.raw->data, col_it->len);
+                    apply_set_value(old_data.data(), new_data.data() + col_it->offset, set, *col_it);
                 }
                 bool violated = false;
                 for (auto &index : tab_.indexes) {
@@ -172,12 +186,13 @@ class UpdateExecutor : public AbstractExecutor {
                 ih->delete_entry(old_key.data(), context_ ? context_->txn_ : nullptr);
             }
 
-            // 应用 SET 子句到 slot（原地写）
+            // 应用 SET 子句到 slot（原地写）。算术增量从更新前的原始记录读基值。
+            std::vector<char> orig_rec(slot, slot + record_size_);
             for (const auto &set : set_clauses_) {
                 auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                            [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                 if (col_it == tab_.cols.end()) continue;
-                memcpy(slot + col_it->offset, set.rhs.raw->data, col_it->len);
+                apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
             }
 
             // 第二遍：把新 key 插回受影响的索引

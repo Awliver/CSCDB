@@ -363,6 +363,11 @@ setClause:
     {
         $$ = std::make_shared<SetClause>($1, $3);
     }
+    |   colName '=' colName value
+    {
+        /* 题9：算术增量 v=v+1（词法把 +1/-1 归并为带符号 VALUE_INT，故无独立运算符记号） */
+        $$ = std::make_shared<SetClause>($1, $3, $4);
+    }
     ;
 
 selector:
