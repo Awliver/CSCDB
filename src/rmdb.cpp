@@ -103,9 +103,6 @@ void *client_handler(void *sock_fd) {
     std::cout << output;
 
     while (true) {
-        std::cout << "Waiting for request..." << std::endl;
-        memset(data_recv, 0, BUFFER_LENGTH);
-
         i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
 
         if (i_recvBytes == 0) {
@@ -116,8 +113,7 @@ void *client_handler(void *sock_fd) {
             std::cout << "Client read error!" << std::endl;
             break;
         }
-        
-        printf("i_recvBytes: %d \n ", i_recvBytes);
+        data_recv[i_recvBytes < BUFFER_LENGTH ? i_recvBytes : BUFFER_LENGTH - 1] = '\0';
 
         if (strcmp(data_recv, "exit") == 0) {
             std::cout << "Client exit." << std::endl;
@@ -135,8 +131,6 @@ void *client_handler(void *sock_fd) {
             continue;
         }
 
-        std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
-
         // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
         {
             IsolationLevel new_iso;
@@ -148,7 +142,7 @@ void *client_handler(void *sock_fd) {
             }
         }
 
-        memset(data_send, '\0', BUFFER_LENGTH);
+        data_send[0] = '\0';
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
@@ -217,7 +211,9 @@ void *client_handler(void *sock_fd) {
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
+        data_send[offset] = '\0';
         if (write(fd, data_send, offset + 1) == -1) {
+            delete context;
             break;
         }
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
@@ -225,6 +221,8 @@ void *client_handler(void *sock_fd) {
         {
             txn_manager->commit(context->txn_, context->log_mgr_);
         }
+        txn_manager->reap(context->txn_);
+        delete context;
     }
 
     // Clear

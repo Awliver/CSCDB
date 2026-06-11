@@ -79,13 +79,23 @@ public:
         if(txn_id == INVALID_TXN_ID) return nullptr;
         
         std::unique_lock<std::mutex> lock(latch_);
-        assert(TransactionManager::txn_map.find(txn_id) != TransactionManager::txn_map.end());
-        auto *res = TransactionManager::txn_map[txn_id];
+        auto it = TransactionManager::txn_map.find(txn_id);
+        Transaction *res = (it == TransactionManager::txn_map.end()) ? nullptr : it->second;
         lock.unlock();
-        assert(res != nullptr);
-        assert(res->get_thread_id() == std::this_thread::get_id());
 
         return res;
+    }
+
+    // 题10：已终结事务在语句尾回收，防止长会话内存增长
+    void reap(Transaction* txn) {
+        if (txn == nullptr) return;
+        if (txn->get_state() != TransactionState::COMMITTED &&
+            txn->get_state() != TransactionState::ABORTED) return;
+        {
+            std::unique_lock<std::mutex> lock(latch_);
+            txn_map.erase(txn->get_transaction_id());
+        }
+        delete txn;
     }
 
     static std::unordered_map<txn_id_t, Transaction *> txn_map;     // 全局事务表，存放事务ID与事务对象的映射关系
