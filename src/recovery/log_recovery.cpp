@@ -21,16 +21,33 @@ See the Mulan PSL v2 for more details. */
  * - undo：对未完成事务暂存操作逆序撤销。
  * - 末尾重建全部索引（崩溃后索引文件不可信），并做一次内部检查点，使再次重启零扫描。 */
 
+// 滚动缓冲:保证 [offset, offset+need) 可由连续内存返回;失败返回 nullptr
+const char* RecoveryManager::ensure_bytes(long offset, int need) {
+    if (offset < rdbuf_start_ || offset + need > rdbuf_start_ + rdbuf_len_) {
+        size_t cap = rdbuf_.size();
+        if (cap < (size_t)(1 << 20)) cap = (size_t)(1 << 20);
+        if (cap < (size_t)need) cap = (size_t)need;
+        rdbuf_.resize(cap);
+        long take = log_end_ - offset;
+        if (take > (long)rdbuf_.size()) take = (long)rdbuf_.size();
+        if (take < need) return nullptr;
+        int n = disk_manager_->read_log(rdbuf_.data(), (int)take, (int)offset);
+        rdbuf_start_ = offset;
+        rdbuf_len_ = n;
+        if (n < need) return nullptr;
+    }
+    return rdbuf_.data() + (offset - rdbuf_start_);
+}
+
 int RecoveryManager::read_one(long offset, std::vector<char>& scratch) {
     if (offset + LOG_HEADER_SIZE > log_end_) return 0;
-    char hdr[LOG_HEADER_SIZE];
-    int n = disk_manager_->read_log(hdr, LOG_HEADER_SIZE, (int)offset);
-    if (n < LOG_HEADER_SIZE) return 0;
+    const char* hdr = ensure_bytes(offset, LOG_HEADER_SIZE);
+    if (hdr == nullptr) return 0;
     uint32_t tot = *reinterpret_cast<const uint32_t*>(hdr + OFFSET_LOG_TOT_LEN);
     if (tot < (uint32_t)LOG_HEADER_SIZE || offset + (long)tot > log_end_) return 0;  // 截断尾
-    scratch.resize(tot);
-    n = disk_manager_->read_log(scratch.data(), (int)tot, (int)offset);
-    if (n < (int)tot) return 0;
+    const char* rec = ensure_bytes(offset, (int)tot);
+    if (rec == nullptr) return 0;
+    scratch.assign(rec, rec + tot);
     return (int)tot;
 }
 

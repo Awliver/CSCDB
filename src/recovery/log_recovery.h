@@ -58,11 +58,17 @@ private:
     void apply_delete(RmFileHandle* fh, const Rid& rid);
     void rebuild_indexes();
 
+    const char* ensure_bytes(long offset, int need);                // 滚动缓冲取数
+
     LogBuffer buffer_;                                              // 读入日志
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
     SmManager* sm_manager_;
     LogManager* log_manager_ = nullptr;
+
+    std::vector<char> rdbuf_;                                       // 日志滚动读缓冲
+    long rdbuf_start_ = 0;
+    int rdbuf_len_ = 0;
 
     long start_offset_ = 0;                                         // 扫描起点（restart 文件）
     long log_end_ = 0;                                              // 有效日志终点
