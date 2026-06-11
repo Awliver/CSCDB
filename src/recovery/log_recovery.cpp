@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "log_recovery.h"
 #include <fstream>
+#include <unistd.h>
 #include "record/rm_defs.h"
 
 /* 题10：恢复流程（静态检查点版 UNDO/REDO）
@@ -253,6 +254,12 @@ void RecoveryManager::undo() {
 
     // 内部检查点：恢复完成的状态全量落盘并推进 restart 起点，使重复重启零扫描、幂等
     if (log_manager_ != nullptr) {
+        // 物理截断到有效终点：残留半条记录/垃圾尾不切除的话，
+        // 追加会把残桩夹在日志中间，未来全量扫描在此失步丢事务
+        if (disk_manager_->is_file(LOG_FILE_NAME) &&
+            disk_manager_->get_file_size(LOG_FILE_NAME) > log_end_) {
+            truncate(LOG_FILE_NAME.c_str(), (off_t)log_end_);
+        }
         log_manager_->init_offset(log_end_);
         sm_manager_->do_checkpoint(log_manager_);
     }
