@@ -71,13 +71,27 @@ class UpdateExecutor : public AbstractExecutor {
             memcpy(dest_field, set.rhs.raw->data, col.len);
             return;
         }
-        int base = 0;
         auto rcol = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                  [&](const ColMeta &c) { return c.name == set.rhs_col; });
-        if (rcol != tab_.cols.end() && rcol->type == TYPE_INT)
-            base = *(const int *)(base_rec + rcol->offset);
-        int delta = set.arith_neg ? -set.rhs.int_val : set.rhs.int_val;  // 带空格减号需取负
-        *(int *)dest_field = base + delta;
+        if (col.type == TYPE_FLOAT) {
+            float base = 0.0f;
+            if (rcol != tab_.cols.end()) {
+                if (rcol->type == TYPE_FLOAT) base = *(const float *)(base_rec + rcol->offset);
+                else if (rcol->type == TYPE_INT) base = (float)*(const int *)(base_rec + rcol->offset);
+            }
+            float delta = (set.rhs.type == TYPE_FLOAT) ? set.rhs.float_val : (float)set.rhs.int_val;
+            if (set.arith_neg) delta = -delta;       // 带空格减号需取负
+            *(float *)dest_field = base + delta;
+        } else {
+            int base = 0;
+            if (rcol != tab_.cols.end()) {
+                if (rcol->type == TYPE_INT) base = *(const int *)(base_rec + rcol->offset);
+                else if (rcol->type == TYPE_FLOAT) base = (int)*(const float *)(base_rec + rcol->offset);
+            }
+            int delta = (set.rhs.type == TYPE_INT) ? set.rhs.int_val : (int)set.rhs.float_val;
+            if (set.arith_neg) delta = -delta;       // 带空格减号需取负
+            *(int *)dest_field = base + delta;
+        }
     }
 
     /**

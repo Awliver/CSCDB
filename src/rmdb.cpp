@@ -102,10 +102,11 @@ void *client_handler(void *sock_fd) {
     pthread_mutex_unlock(sockfd_mutex);
 
     int i_recvBytes;
-    // 接收客户端发送的请求（按 '\0' 分帧：容忍 TCP 半包/粘包）
-    char data_recv[BUFFER_LENGTH];
+    // 接收客户端发送的请求（按 '\0' 分帧：容忍 TCP 半包/粘包；缓冲随语句长度增长）
+    std::vector<char> rbuf(BUFFER_LENGTH);
     int recv_len = 0;
-    char stmt[BUFFER_LENGTH];
+    std::vector<char> stmt_buf(BUFFER_LENGTH);
+    char *stmt = stmt_buf.data();
     // 需要返回给客户端的结果
     char *data_send = new char[BUFFER_LENGTH];
     // 需要返回给客户端的结果的长度
@@ -121,23 +122,31 @@ void *client_handler(void *sock_fd) {
     std::cout << output;
 
     while (true) {
-        char *nul = (char *)memchr(data_recv, '\0', recv_len);
+        char *nul = (char *)memchr(rbuf.data(), '\0', recv_len);
         while (nul == nullptr) {
-            if (recv_len >= BUFFER_LENGTH) {        // 超长帧防御
-                recv_len = 0;
+            if (recv_len >= (int)rbuf.size()) {
+                if (rbuf.size() >= (1u << 24)) {    // 16MB 上限防御
+                    recv_len = 0;
+                } else {
+                    rbuf.resize(rbuf.size() * 2);
+                }
             }
-            i_recvBytes = read(fd, data_recv + recv_len, BUFFER_LENGTH - recv_len);
+            i_recvBytes = read(fd, rbuf.data() + recv_len, rbuf.size() - recv_len);
             if (i_recvBytes <= 0) break;
             recv_len += i_recvBytes;
-            nul = (char *)memchr(data_recv, '\0', recv_len);
+            nul = (char *)memchr(rbuf.data(), '\0', recv_len);
         }
         if (nul == nullptr) {
             std::cout << "Maybe the client has closed" << std::endl;
             break;
         }
-        int consumed = (int)(nul - data_recv) + 1;
-        memcpy(stmt, data_recv, consumed);
-        memmove(data_recv, data_recv + consumed, recv_len - consumed);
+        int consumed = (int)(nul - rbuf.data()) + 1;
+        if ((int)stmt_buf.size() < consumed) {
+            stmt_buf.resize(consumed);
+        }
+        stmt = stmt_buf.data();
+        memcpy(stmt, rbuf.data(), consumed);
+        memmove(rbuf.data(), rbuf.data() + consumed, recv_len - consumed);
         recv_len -= consumed;
 
         if (strncasecmp(stmt, "exit", 4) == 0) {
