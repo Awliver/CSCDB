@@ -259,17 +259,19 @@ void *client_handler(void *sock_fd) {
             yy_delete_buffer(buf);
             pthread_mutex_unlock(buffer_mutex);
         }
+        // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务。
+        // 必须先提交（WAL 落盘）再回复客户端：回复即持久，否则 ack 后崩溃会丢已确认语句
+        if(context->txn_->get_txn_mode() == false)
+        {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+        }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
         data_send[offset] = '\0';
         if (!write_all(fd, data_send, offset + 1)) {
+            txn_manager->reap(context->txn_);
             delete context;
             break;
-        }
-        // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if(context->txn_->get_txn_mode() == false)
-        {
-            txn_manager->commit(context->txn_, context->log_mgr_);
         }
         txn_manager->reap(context->txn_);
         delete context;
