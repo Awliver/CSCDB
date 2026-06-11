@@ -224,8 +224,15 @@ void DiskManager::write_log(char *log_data, int size) {
 
     // write from the file_end
     lseek(log_fd_, 0, SEEK_END);
-    ssize_t bytes_write = write(log_fd_, log_data, size);
-    if (bytes_write != size) {
-        throw UnixError();
+    int remain = size;
+    char *p = log_data;
+    while (remain > 0) {
+        ssize_t n = write(log_fd_, p, remain);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw UnixError();
+        }
+        p += n;
+        remain -= (int)n;
     }
 }

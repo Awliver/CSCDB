@@ -81,13 +81,29 @@ void SetTransaction(txn_id_t *txn_id, Context *context, IsolationLevel sess_iso)
     }
 }
 
+// 完整写出（容忍短写/EINTR）；失败返回 false
+static bool write_all(int fd, const char *buf, int len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        buf += n;
+        len -= (int)n;
+    }
+    return true;
+}
+
 void *client_handler(void *sock_fd) {
     int fd = (int)(intptr_t)sock_fd;
     pthread_mutex_unlock(sockfd_mutex);
 
     int i_recvBytes;
-    // 接收客户端发送的请求
+    // 接收客户端发送的请求（按 '\0' 分帧：容忍 TCP 半包/粘包）
     char data_recv[BUFFER_LENGTH];
+    int recv_len = 0;
+    char stmt[BUFFER_LENGTH];
     // 需要返回给客户端的结果
     char *data_send = new char[BUFFER_LENGTH];
     // 需要返回给客户端的结果的长度
@@ -103,41 +119,48 @@ void *client_handler(void *sock_fd) {
     std::cout << output;
 
     while (true) {
-        i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
-
-        if (i_recvBytes == 0) {
+        char *nul = (char *)memchr(data_recv, '\0', recv_len);
+        while (nul == nullptr) {
+            if (recv_len >= BUFFER_LENGTH) {        // 超长帧防御
+                recv_len = 0;
+            }
+            i_recvBytes = read(fd, data_recv + recv_len, BUFFER_LENGTH - recv_len);
+            if (i_recvBytes <= 0) break;
+            recv_len += i_recvBytes;
+            nul = (char *)memchr(data_recv, '\0', recv_len);
+        }
+        if (nul == nullptr) {
             std::cout << "Maybe the client has closed" << std::endl;
             break;
         }
-        if (i_recvBytes == -1) {
-            std::cout << "Client read error!" << std::endl;
-            break;
-        }
-        data_recv[i_recvBytes < BUFFER_LENGTH ? i_recvBytes : BUFFER_LENGTH - 1] = '\0';
+        int consumed = (int)(nul - data_recv) + 1;
+        memcpy(stmt, data_recv, consumed);
+        memmove(data_recv, data_recv + consumed, recv_len - consumed);
+        recv_len -= consumed;
 
-        if (strcmp(data_recv, "exit") == 0) {
+        if (strcmp(stmt, "exit") == 0) {
             std::cout << "Client exit." << std::endl;
             break;
         }
-        if (strcmp(data_recv, "crash") == 0) {
+        if (strcmp(stmt, "crash") == 0) {
             std::cout << "Server crash" << std::endl;
             exit(1);
         }
         // 题10：创建静态检查点
-        if (strncasecmp(data_recv, "create static_checkpoint", 24) == 0) {
+        if (strncasecmp(stmt, "create static_checkpoint", 24) == 0) {
             sm_manager->do_checkpoint(log_manager.get());
             data_send[0] = '\0';
-            if (write(fd, data_send, 1) == -1) break;
+            if (!write_all(fd, data_send, 1)) break;
             continue;
         }
 
         // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
         {
             IsolationLevel new_iso;
-            if (parse_set_isolation(data_recv, &new_iso)) {
+            if (parse_set_isolation(stmt, &new_iso)) {
                 sess_iso = new_iso;
                 data_send[0] = '\0';
-                if (write(fd, data_send, 1) == -1) break;
+                if (!write_all(fd, data_send, 1)) break;
                 continue;
             }
         }
@@ -153,7 +176,7 @@ void *client_handler(void *sock_fd) {
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
         pthread_mutex_lock(buffer_mutex);
-        YY_BUFFER_STATE buf = yy_scan_string(data_recv);
+        YY_BUFFER_STATE buf = yy_scan_string(stmt);
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
@@ -202,6 +225,22 @@ void *client_handler(void *sock_fd) {
                     outfile.open("output.txt",std::ios::out | std::ios::app);
                     outfile << "failure\n";
                     outfile.close();
+                } catch (std::exception &e) {
+                    // 题10：任何未预期异常不得终止服务进程
+                    if (!finish_analyze) {
+                        yy_delete_buffer(buf);
+                        finish_analyze = true;
+                        pthread_mutex_unlock(buffer_mutex);
+                    }
+                    std::cerr << e.what() << std::endl;
+                    memcpy(data_send, "failure\n", 8);
+                    data_send[8] = '\0';
+                    offset = 8;
+
+                    std::fstream outfile;
+                    outfile.open("output.txt",std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 }
             }
         }
@@ -212,7 +251,7 @@ void *client_handler(void *sock_fd) {
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
         data_send[offset] = '\0';
-        if (write(fd, data_send, offset + 1) == -1) {
+        if (!write_all(fd, data_send, offset + 1)) {
             delete context;
             break;
         }
@@ -310,6 +349,7 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGINT, sigint_handler);
+    signal(SIGPIPE, SIG_IGN);   // 题10：客户端异常断连时 write 不得终止进程
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
