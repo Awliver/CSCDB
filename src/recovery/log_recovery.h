@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include "log_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
@@ -23,6 +24,15 @@ public:
     std::vector<lsn_t> redo_logs_;   // 在该page上需要redo的操作的lsn
 };
 
+/* 题10：未提交事务的一条已记录操作（undo 用） */
+struct PendingOp {
+    LogType type;
+    std::string table;
+    Rid rid;
+    std::string old_data;   // DELETE/UPDATE 的旧值
+    std::string new_data;   // INSERT/UPDATE 的新值
+};
+
 class RecoveryManager {
 public:
     RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager) {
@@ -31,12 +41,32 @@ public:
         sm_manager_ = sm_manager;
     }
 
+    void set_log_manager(LogManager* log_manager) { log_manager_ = log_manager; }
+
     void analyze();
     void redo();
     void undo();
+    void undo_pass();
+
 private:
+    // 从 offset 读出一条完整日志到 scratch；返回总长，0 表示到尾/截断
+    int read_one(long offset, std::vector<char>& scratch);
+    RmFileHandle* table_fh(const std::string& tab);
+    void ensure_pages(RmFileHandle* fh, int page_no);
+    void apply_insert(RmFileHandle* fh, const Rid& rid, const char* data);
+    void apply_update(RmFileHandle* fh, const Rid& rid, const char* data);
+    void apply_delete(RmFileHandle* fh, const Rid& rid);
+    void rebuild_indexes();
+
     LogBuffer buffer_;                                              // 读入日志
-    DiskManager* disk_manager_;                                     // 用来读写文件
-    BufferPoolManager* buffer_pool_manager_;                        // 对页面进行读写
-    SmManager* sm_manager_;                                         // 访问数据库元数据
+    DiskManager* disk_manager_;
+    BufferPoolManager* buffer_pool_manager_;
+    SmManager* sm_manager_;
+    LogManager* log_manager_ = nullptr;
+
+    long start_offset_ = 0;                                         // 扫描起点（restart 文件）
+    long log_end_ = 0;                                              // 有效日志终点
+    std::unordered_set<txn_id_t> committed_;                        // redo list
+    std::map<txn_id_t, std::vector<PendingOp>> uncommitted_;        // undo list（操作按记录序）
+    bool touched_ = false;                                          // 本次恢复是否有重放动作
 };

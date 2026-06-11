@@ -196,6 +196,16 @@ class UpdateExecutor : public AbstractExecutor {
                 apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
             }
 
+            // 题10 WAL：记录更新前后镜像
+            if (context_ && context_->log_mgr_ && context_->txn_) {
+                RmRecord old_rec(record_size_), new_rec(record_size_);
+                memcpy(old_rec.data, orig_rec.data(), record_size_);
+                memcpy(new_rec.data, slot, record_size_);
+                Rid r = rid;
+                UpdateLogRecord lr(context_->txn_->get_transaction_id(), old_rec, new_rec, r, tab_name_);
+                context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+            }
+
             // 第二遍：把新 key 插回受影响的索引
             for (auto &index : tab_.indexes) {
                 bool touches = false;

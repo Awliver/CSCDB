@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "bitmap.h"
 #include "common/context.h"
 #include "rm_defs.h"
+#include <mutex>
 
 class RmManager;
 
@@ -97,6 +98,9 @@ class RmFileHandle {
             buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
         }
     }
+
+   public:
+    std::mutex op_latch_;   // 题10:结构性操作(槽位分配/位图)互斥,多线程并发插入防竞态
 
    private:
     RmPageHandle create_page_handle();

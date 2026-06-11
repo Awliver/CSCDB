@@ -9,10 +9,12 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
+#include "recovery/log_manager.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
 
@@ -28,6 +30,10 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         txn->set_start_ts(next_timestamp_++);
         // 题9：事务级快照——以当前最后提交序为快照标识
         txn->set_read_ts(last_commit_ts_.load());
+    }
+    {
+        std::scoped_lock<std::mutex> lck(mvcc_latch_);
+        active_rts_.insert(txn->get_read_ts());
     }
     txn_map[txn->get_transaction_id()] = txn;
     return txn;
@@ -51,6 +57,13 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             cts = ++last_commit_ts_;
             txn->set_commit_ts(cts);
         }
+        {
+            auto wit = active_rts_.find(txn->get_read_ts());
+            if (wit != active_rts_.end()) active_rts_.erase(wit);
+        }
+        // 题10: mvcc chain GC 前置水位(本事务已从 active_rts_ 注销)
+        timestamp_t gc_min_rts = active_rts_.empty()
+            ? std::numeric_limits<timestamp_t>::max() : *active_rts_.begin();
         for (auto *wr : *write_set) {
             auto tit = mvcc_store_.find(wr->GetTableName());
             if (tit == mvcc_store_.end()) continue;
@@ -66,11 +79,25 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
                 ch.hist.push_back(std::move(v));
                 ch.writer = INVALID_TXN_ID;
                 ch.writer_data.clear();
+                // 题10: 链级水位 GC——终版即堆内容(insert/update 均已写堆)、
+                // 无早于本提交的活跃快照、非删除终版 → 链可整体清除;
+                // mvcc_read 对缺链记录天然回退堆字节(语义不变)。
+                // 删除终版的链保留(堆行仍在,可见性依赖墓碑)。
+                if (cts <= gc_min_rts && !ch.hist.back().is_deleted) {
+                    tit->second.erase(cit);
+                }
             }
         }
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
         ser_finish(txn->get_transaction_id(), true, cts);   // 题9 SER：记录提交序，保留信息供并发事务判定
+    }
+
+    // 题10 WAL：提交记录落盘后事务方告提交
+    if (log_manager != nullptr) {
+        CommitLogRecord lr(txn->get_transaction_id());
+        log_manager->add_log_to_buffer(&lr);
+        log_manager->flush_log_to_disk();
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
@@ -118,7 +145,16 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         }
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
+        auto wit = active_rts_.find(txn->get_read_ts());
+        if (wit != active_rts_.end()) active_rts_.erase(wit);
         ser_finish(txn->get_transaction_id(), false, 0);   // 题9 SER：回滚视为从未发生，清理读写集与 rw 边
+    }
+
+    // 题10 WAL：回滚记录（恢复时该事务计入 undo list）
+    if (log_manager != nullptr) {
+        AbortLogRecord lr(txn->get_transaction_id());
+        log_manager->add_log_to_buffer(&lr);
+        log_manager->flush_log_to_disk();
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
@@ -294,6 +330,19 @@ void TransactionManager::ser_record_pred(Transaction *txn, const std::string &ta
 }
 
 void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts) {
+    // 题10:水位 GC——已提交且早于所有活跃事务快照、且无 rw 边的 SerInfo 不可能再
+    // 参与危险结构,安全清除(否则巨大数据下 ser_write_check 随历史线性膨胀致二次方)
+    timestamp_t min_rts = active_rts_.empty()
+        ? std::numeric_limits<timestamp_t>::max() : *active_rts_.begin();
+    for (auto pit = ser_.begin(); pit != ser_.end();) {
+        const SerInfo &si = pit->second;
+        if (pit->first != id && si.committed && si.commit_ts <= min_rts &&
+            si.in_rw.empty() && si.out_rw.empty()) {
+            pit = ser_.erase(pit);
+        } else {
+            ++pit;
+        }
+    }
     auto it = ser_.find(id);
     if (it == ser_.end()) return;
     if (committed) {

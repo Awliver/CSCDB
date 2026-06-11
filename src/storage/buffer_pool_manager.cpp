@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "buffer_pool_manager.h"
+#include "recovery/log_manager.h"
 
 /**
  * @description: 从free_list或replacer中得到可淘汰帧页的 *frame_id
@@ -33,6 +34,7 @@ bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
 void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id) {
     if (page->is_dirty_)
     {
+        if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(page->id_.fd, page->id_.page_no,
                                   page->data_, PAGE_SIZE);
         page->is_dirty_ = false;
@@ -103,7 +105,8 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) return false;
     frame_id_t frame_id = it->second;
-    disk_manager_->write_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+    if (g_log_manager) g_log_manager->flush_log_to_disk();
+        disk_manager_->write_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
     pages_[frame_id].is_dirty_ = false;
     return true;
 }
@@ -137,6 +140,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     Page& page = pages_[frame_id];
     if (page.pin_count_ != 0) return false;
     if (page.is_dirty_) {
+        if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(page.id_.fd, page.id_.page_no, page.data_, PAGE_SIZE);
     }
     page_table_.erase(it);
@@ -159,6 +163,7 @@ void BufferPoolManager::flush_all_pages(int fd) {
         const PageId& pid = entry.first;
         if (pid.fd != fd) continue;
         frame_id_t frame_id = entry.second;
+        if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(pid.fd, pid.page_no, pages_[frame_id].data_, PAGE_SIZE);
         pages_[frame_id].is_dirty_ = false;
     }
@@ -176,7 +181,8 @@ void BufferPoolManager::delete_all_pages(int fd) {
         frame_id_t frame_id = it->second;
         Page& page = pages_[frame_id];
         if (page.is_dirty_) {
-            disk_manager_->write_page(pid.fd, pid.page_no, page.data_, PAGE_SIZE);
+            if (g_log_manager) g_log_manager->flush_log_to_disk();
+        disk_manager_->write_page(pid.fd, pid.page_no, page.data_, PAGE_SIZE);
         }
         // 重置帧元数据
         page.id_ = PageId{-1, INVALID_PAGE_ID};

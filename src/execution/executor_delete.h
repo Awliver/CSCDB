@@ -95,6 +95,14 @@ class DeleteExecutor : public AbstractExecutor {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
+                // 题10 WAL：逻辑删除也记删除日志（redo 时物化删除）
+                if (context_->log_mgr_) {
+                    RmRecord old_rec(record_size_);
+                    memcpy(old_rec.data, slot, record_size_);
+                    Rid r = rid;
+                    DeleteLogRecord lr(context_->txn_->get_transaction_id(), old_rec, r, tab_name_);
+                    context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+                }
                 continue;
             }
 
@@ -109,6 +117,15 @@ class DeleteExecutor : public AbstractExecutor {
                 auto ih = sm_manager_->ihs_.at(
                     sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
+            }
+
+            // 题10 WAL：物理删除记日志
+            if (context_ && context_->log_mgr_ && context_->txn_) {
+                RmRecord old_rec(record_size_);
+                memcpy(old_rec.data, slot, record_size_);
+                Rid r = rid;
+                DeleteLogRecord lr(context_->txn_->get_transaction_id(), old_rec, r, tab_name_);
+                context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
             }
 
             // 删数据：bitmap + 计数 + free-list 维护

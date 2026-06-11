@@ -124,6 +124,12 @@ class InsertExecutor : public AbstractExecutor {
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
 
+        // 题10 WAL：插入即时记日志（含记录镜像与 rid）
+        if (context_ && context_->log_mgr_ && context_->txn_) {
+            InsertLogRecord lr(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+            context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+        }
+
         // 题9：有活跃显式事务时，登记为未提交插入版本（提交后才对他人可见，回滚则物理删除）
         if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_)) {
             context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,

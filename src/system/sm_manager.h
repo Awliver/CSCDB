@@ -48,6 +48,9 @@ class SmManager {
 
     BufferPoolManager* get_bpm() { return buffer_pool_manager_; }
 
+    // 题10：静态检查点——刷日志、写检查点记录、全量落盘数据页与文件头、写 restart 文件
+    void do_checkpoint(class LogManager* log_manager);
+
     RmManager* get_rm_manager() { return rm_manager_; }  
 
     IxManager* get_ix_manager() { return ix_manager_; }  

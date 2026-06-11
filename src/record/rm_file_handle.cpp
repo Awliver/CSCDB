@@ -42,6 +42,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
  * @return {Rid} 插入的记录的记录号（位置）
  */
 Rid RmFileHandle::insert_record(char *buf, Context *context) {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
     // Step 1：决定写入页 —— 优先用缓存
     bool use_cache = (cached_insert_page_no_ != -1 &&
                       cached_insert_hdr_->num_records < file_hdr_.num_records_per_page);
@@ -92,6 +93,7 @@ Rid RmFileHandle::insert_record(char *buf, Context *context) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 
     // 直接写入指定 slot
@@ -113,6 +115,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  * @param {Context*} context
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 
     // 检查记录存在

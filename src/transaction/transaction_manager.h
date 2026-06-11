@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <unordered_map>
+#include <set>
 #include <optional>
 #include <functional>
 #include <shared_mutex>
@@ -219,6 +220,7 @@ private:
     LockManager *lock_manager_;
 
     std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
+    std::multiset<timestamp_t> active_rts_;         // 题10:活跃事务 read_ts 水位(SER 状态 GC 用)
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
 
     /* 题9 MVCC 状态 */

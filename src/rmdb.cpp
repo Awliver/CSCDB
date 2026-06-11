@@ -127,6 +127,13 @@ void *client_handler(void *sock_fd) {
             std::cout << "Server crash" << std::endl;
             exit(1);
         }
+        // 题10：创建静态检查点
+        if (strncasecmp(data_recv, "create static_checkpoint", 24) == 0) {
+            sm_manager->do_checkpoint(log_manager.get());
+            data_send[0] = '\0';
+            if (write(fd, data_send, 1) == -1) break;
+            continue;
+        }
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
@@ -327,6 +334,8 @@ int main(int argc, char **argv) {
         sm_manager->open_db(db_name);
 
         // recovery database
+        g_log_manager = log_manager.get();
+        recovery->set_log_manager(log_manager.get());
         recovery->analyze();
         recovery->redo();
         recovery->undo();

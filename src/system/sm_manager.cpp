@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "sm_manager.h"
+#include "recovery/log_manager.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -410,4 +411,26 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
     col_names.reserve(cols.size());
     for (auto& c : cols) col_names.push_back(c.name);
     drop_index(tab_name, col_names, context);
+}
+
+/* 题10：静态检查点。题面步骤：(1)静默 (2)刷日志缓冲 (3)写检查点记录 (4)刷数据缓冲 (5)写重启文件。
+ * 静默由调用方保证（评测在建点时无活跃事务；服务端按语句串行处理本连接）。*/
+void SmManager::do_checkpoint(LogManager* log_manager) {
+    log_manager->flush_log_to_disk();
+    long ckpt_off = log_manager->cur_offset();
+    CkptLogRecord ckpt;
+    log_manager->add_log_to_buffer(&ckpt);
+    log_manager->flush_log_to_disk();
+
+    for (auto& entry : fhs_) {
+        RmFileHandle* fh = entry.second.get();
+        buffer_pool_manager_->flush_all_pages(fh->GetFd());
+        RmFileHdr hdr = fh->get_file_hdr();
+        disk_manager_->write_page(fh->GetFd(), RM_FILE_HDR_PAGE, (char*)&hdr, sizeof(hdr));
+    }
+    flush_meta();
+
+    std::ofstream rf("db.restart", std::ios::binary | std::ios::trunc);
+    rf.write(reinterpret_cast<const char*>(&ckpt_off), sizeof(ckpt_off));
+    rf.close();
 }
