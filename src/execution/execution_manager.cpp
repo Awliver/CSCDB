@@ -155,6 +155,12 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                             Context *context) {
     if (context) context->ser_in_select_ = true;   // 题9 SER：本次扫描属于 SELECT，记录读集
+
+    // 题10：聚合查询（一致性检测 SQL：COUNT/MAX/MIN/SUM，单表）
+    if (!sel_cols.empty() && sel_cols[0].agg_type != 0) {
+        select_agg(std::move(executorTreeRoot), sel_cols, context);
+        return;
+    }
     std::vector<std::string> captions;
     captions.reserve(sel_cols.size());
     for (auto &sel_col : sel_cols) {
@@ -199,6 +205,94 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // 题9：扫描成功后，把本条 SELECT 的带框输出一次性写入 output.txt（与客户端一致）；
     // 若 SER 读侧在扫描中途中止则抛出，不会执行到此，output.txt 不产生残缺输出
+    if (context && context->data_send_ && context->offset_ && *context->offset_ > buf_start) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile.write(context->data_send_ + buf_start, *context->offset_ - buf_start);
+        outfile.close();
+    }
+}
+
+// 题10：聚合执行——单遍扫描折叠，输出单行带框结果（表头=AS 别名）
+void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
+                           std::vector<TabCol> &sel_cols, Context *context) {
+    size_t n = sel_cols.size();
+    std::vector<std::string> captions(n);
+    static const char *fn[] = {"", "COUNT", "MAX", "MIN", "SUM"};
+    for (size_t i = 0; i < n; i++) {
+        captions[i] = !sel_cols[i].alias.empty()
+                          ? sel_cols[i].alias
+                          : std::string(fn[sel_cols[i].agg_type]) + "(" + sel_cols[i].col_name + ")";
+    }
+    std::vector<long long> cnt(n, 0);
+    std::vector<long long> isum(n, 0);
+    std::vector<double> fsum(n, 0.0);
+    std::vector<int> ival(n, 0);
+    std::vector<float> fval(n, 0.0f);
+    std::vector<std::string> sval(n);
+    std::vector<ColMeta> metas(n);
+    bool meta_ok = false;
+
+    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+        auto Tuple = executorTreeRoot->Next();
+        if (!meta_ok) {
+            for (size_t i = 0; i < n; i++) {
+                for (auto &cm : executorTreeRoot->cols()) {
+                    if (cm.name == sel_cols[i].col_name) { metas[i] = cm; break; }
+                }
+            }
+            meta_ok = true;
+        }
+        for (size_t i = 0; i < n; i++) {
+            const ColMeta &cm = metas[i];
+            char *p = Tuple->data + cm.offset;
+            bool first = (cnt[i] == 0);
+            cnt[i]++;
+            if (sel_cols[i].agg_type == 1) continue;             // COUNT
+            if (cm.type == TYPE_INT) {
+                int v = *(int *)p;
+                isum[i] += v;
+                if (first || (sel_cols[i].agg_type == 2 && v > ival[i]) ||
+                    (sel_cols[i].agg_type == 3 && v < ival[i])) ival[i] = v;
+            } else if (cm.type == TYPE_FLOAT) {
+                float v = *(float *)p;
+                fsum[i] += v;
+                if (first || (sel_cols[i].agg_type == 2 && v > fval[i]) ||
+                    (sel_cols[i].agg_type == 3 && v < fval[i])) fval[i] = v;
+            } else {
+                std::string v((char *)p, cm.len);
+                v.resize(strlen(v.c_str()));
+                if (first || (sel_cols[i].agg_type == 2 && v > sval[i]) ||
+                    (sel_cols[i].agg_type == 3 && v < sval[i])) sval[i] = v;
+            }
+        }
+    }
+
+    std::vector<std::string> row(n);
+    for (size_t i = 0; i < n; i++) {
+        int at = sel_cols[i].agg_type;
+        const ColMeta &cm = metas[i];
+        if (at == 1) {
+            row[i] = std::to_string(cnt[i]);
+        } else if (cnt[i] == 0) {
+            row[i] = (at == 4) ? "0" : "";                       // 空表：SUM=0，MAX/MIN 空
+        } else if (cm.type == TYPE_INT) {
+            row[i] = (at == 4) ? std::to_string(isum[i]) : std::to_string(ival[i]);
+        } else if (cm.type == TYPE_FLOAT) {
+            row[i] = (at == 4) ? std::to_string((float)fsum[i]) : std::to_string(fval[i]);
+        } else {
+            row[i] = sval[i];
+        }
+    }
+
+    int buf_start = context && context->offset_ ? *context->offset_ : 0;
+    RecordPrinter rec_printer(n);
+    rec_printer.print_separator(context);
+    rec_printer.print_record(captions, context);
+    rec_printer.print_separator(context);
+    rec_printer.print_record(row, context);
+    rec_printer.print_separator(context);
+    RecordPrinter::print_record_count(1, context);
     if (context && context->data_send_ && context->offset_ && *context->offset_ > buf_start) {
         std::fstream outfile;
         outfile.open("output.txt", std::ios::out | std::ios::app);

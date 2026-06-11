@@ -42,6 +42,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             std::string tn = sv_sel_col->tab_name;
             if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
             TabCol sel_col = {.tab_name = tn, .col_name = sv_sel_col->col_name};
+            sel_col.agg_type = sv_sel_col->agg_type;
+            sel_col.alias = sv_sel_col->alias;
             query->cols.push_back(sel_col);
         }
 
@@ -56,6 +58,12 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         } else {
             // infer table name from column name
             for (auto &sel_col : query->cols) {
+                if (sel_col.agg_type != 0 && sel_col.col_name == "*") {
+                    // COUNT(*)：绑定到首列（仅作扫描载体）
+                    sel_col.tab_name = all_cols[0].tab_name;
+                    sel_col.col_name = all_cols[0].name;
+                    continue;
+                }
                 sel_col = check_column(all_cols, sel_col);  // 列元数据校验
             }
         }

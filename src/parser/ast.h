@@ -151,6 +151,8 @@ struct BoolLit : public Value {
 struct Col : public Expr {
     std::string tab_name;
     std::string col_name;
+    int agg_type = 0;        // 题10：0=无 1=COUNT 2=MAX 3=MIN 4=SUM
+    std::string alias;       // 题10：AS 别名
 
     Col(std::string tab_name_, std::string col_name_) :
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}

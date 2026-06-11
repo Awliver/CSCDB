@@ -44,6 +44,9 @@ class QlManager {
     void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                         Context *context);
 
+    void select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> &sel_cols,
+                    Context *context);
+
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
 
     // 题4：EXPLAIN ANALYZE —— 构建优化后的计划树、执行计数、输出计划树（不输出结果集）

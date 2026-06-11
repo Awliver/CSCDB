@@ -35,8 +35,8 @@
    especially those whose name start with YY_ or yy_.  They are
    private implementation details that can be changed or removed.  */
 
-#ifndef YY_YY_HOME_ERONY_PROJECTS_DB2026_SRC_PARSER_YACC_TAB_H_INCLUDED
-# define YY_YY_HOME_ERONY_PROJECTS_DB2026_SRC_PARSER_YACC_TAB_H_INCLUDED
+#ifndef YY_YY_HOME_ERONY_P10EVAL_WT_SRC_PARSER_YACC_TAB_H_INCLUDED
+# define YY_YY_HOME_ERONY_P10EVAL_WT_SRC_PARSER_YACC_TAB_H_INCLUDED
 /* Debug traces.  */
 #ifndef YYDEBUG
 # define YYDEBUG 0
@@ -96,9 +96,14 @@ extern int yydebug;
     T_EOF = 297,                   /* T_EOF  */
     IDENTIFIER = 298,              /* IDENTIFIER  */
     VALUE_STRING = 299,            /* VALUE_STRING  */
-    VALUE_INT = 300,               /* VALUE_INT  */
-    VALUE_FLOAT = 301,             /* VALUE_FLOAT  */
-    VALUE_BOOL = 302               /* VALUE_BOOL  */
+    COUNT = 300,                   /* COUNT  */
+    MAX = 301,                     /* MAX  */
+    MIN = 302,                     /* MIN  */
+    SUM = 303,                     /* SUM  */
+    AS = 304,                      /* AS  */
+    VALUE_INT = 305,               /* VALUE_INT  */
+    VALUE_FLOAT = 306,             /* VALUE_FLOAT  */
+    VALUE_BOOL = 307               /* VALUE_BOOL  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -125,4 +130,4 @@ struct YYLTYPE
 int yyparse (void);
 
 
-#endif /* !YY_YY_HOME_ERONY_PROJECTS_DB2026_SRC_PARSER_YACC_TAB_H_INCLUDED  */
+#endif /* !YY_YY_HOME_ERONY_P10EVAL_WT_SRC_PARSER_YACC_TAB_H_INCLUDED  */

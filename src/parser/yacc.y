@@ -28,6 +28,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 
 // type-specific tokens
 %token <sv_str> IDENTIFIER VALUE_STRING
+%token COUNT MAX MIN SUM AS
 %token <sv_int> VALUE_INT
 %token <sv_float> VALUE_FLOAT
 %token <sv_bool> VALUE_BOOL
@@ -47,6 +48,8 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_table_ref> tableRef
 %type <sv_col> col
 %type <sv_cols> colList selector
+%type <sv_int> aggFunc
+%type <sv_col> aggArg
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
@@ -315,6 +318,31 @@ col:
     {
         $$ = std::make_shared<Col>("", $1);
     }
+    |   aggFunc '(' aggArg ')' AS colName
+    {
+        auto c = $3;
+        c->agg_type = $1;
+        c->alias = $6;
+        $$ = c;
+    }
+    |   aggFunc '(' aggArg ')'
+    {
+        auto c = $3;
+        c->agg_type = $1;
+        $$ = c;
+    }
+    ;
+
+aggArg:
+        col   { $$ = $1; }
+    |   '*'   { $$ = std::make_shared<Col>("", "*"); }
+    ;
+
+aggFunc:
+        COUNT { $$ = 1; }
+    |   MAX   { $$ = 2; }
+    |   MIN   { $$ = 3; }
+    |   SUM   { $$ = 4; }
     ;
 
 colList:
