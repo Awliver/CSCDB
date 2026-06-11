@@ -180,7 +180,8 @@ void *client_handler(void *sock_fd) {
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+        Context context_obj(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+        Context *context = &context_obj;
         context->txn_mgr_ = txn_manager.get();          // 题9：执行器经 Context 访问 MVCC 版本存储
         SetTransaction(&txn_id, context, sess_iso);
 
@@ -270,11 +271,9 @@ void *client_handler(void *sock_fd) {
         data_send[offset] = '\0';
         if (!write_all(fd, data_send, offset + 1)) {
             txn_manager->reap(context->txn_);
-            delete context;
             break;
         }
         txn_manager->reap(context->txn_);
-        delete context;
     }
 
     // Clear
@@ -335,6 +334,11 @@ void start_server() {
             std::cout << "Accept error!" << std::endl;
             continue;  // ignore current socket ,continue while loop.
         }
+        // 题10：扩大发送缓冲——流水线装载下回复不被客户端及时读取时避免写阻塞死锁
+        {
+            int sndbuf = 16 << 20;
+            setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        }
         
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
         if (pthread_create(&thread_id, nullptr, &client_handler, (void *)(intptr_t)sockfd) != 0) {
@@ -383,6 +387,11 @@ int main(int argc, char **argv) {
         }
         // Open database
         sm_manager->open_db(db_name);
+
+        // 题10：每次启动清空 output.txt——重启后评测只比对本次运行的输出
+        {
+            std::ofstream ofs("output.txt", std::ios::out | std::ios::trunc);
+        }
 
         // recovery database
         g_log_manager = log_manager.get();
