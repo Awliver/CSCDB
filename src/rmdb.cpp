@@ -82,7 +82,7 @@ void SetTransaction(txn_id_t *txn_id, Context *context, IsolationLevel sess_iso)
 }
 
 void *client_handler(void *sock_fd) {
-    int fd = *((int *)sock_fd);
+    int fd = (int)(intptr_t)sock_fd;
     pthread_mutex_unlock(sockfd_mutex);
 
     int i_recvBytes;
@@ -287,7 +287,7 @@ void start_server() {
         }
         
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        if (pthread_create(&thread_id, nullptr, &client_handler, (void *)(&sockfd)) != 0) {
+        if (pthread_create(&thread_id, nullptr, &client_handler, (void *)(intptr_t)sockfd) != 0) {
             std::cout << "Create thread fail!" << std::endl;
             break;  // break while loop
         }
