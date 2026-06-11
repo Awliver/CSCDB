@@ -58,6 +58,8 @@ void sigint_handler(int signo) {
 // 题9：识别会话级 "SET TRANSACTION ISOLATION LEVEL {SNAPSHOT ISOLATION|SERIALIZABLE}"
 // 该语句不进解析器，直接更新会话隔离级别。大小写不敏感。
 static bool parse_set_isolation(const char *sql, IsolationLevel *out) {
+    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
+    if (strncasecmp(sql, "set", 3) != 0) return false;
     std::string low;
     for (const char *p = sql; *p; ++p) {
         char c = *p;
@@ -138,11 +140,11 @@ void *client_handler(void *sock_fd) {
         memmove(data_recv, data_recv + consumed, recv_len - consumed);
         recv_len -= consumed;
 
-        if (strcmp(stmt, "exit") == 0) {
+        if (strncasecmp(stmt, "exit", 4) == 0) {
             std::cout << "Client exit." << std::endl;
             break;
         }
-        if (strcmp(stmt, "crash") == 0) {
+        if (strncasecmp(stmt, "crash", 5) == 0) {
             std::cout << "Server crash" << std::endl;
             exit(1);
         }
