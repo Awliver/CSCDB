@@ -218,11 +218,9 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
                            std::vector<TabCol> &sel_cols, Context *context) {
     size_t n = sel_cols.size();
     std::vector<std::string> captions(n);
-    static const char *fn[] = {"", "COUNT", "MAX", "MIN", "SUM"};
     for (size_t i = 0; i < n; i++) {
-        captions[i] = !sel_cols[i].alias.empty()
-                          ? sel_cols[i].alias
-                          : std::string(fn[sel_cols[i].agg_type]) + "(" + sel_cols[i].col_name + ")";
+        // 无别名表头=裸列名（COUNT(*) 在 analyze 阶段已设别名 count(*)），与参考实现一致
+        captions[i] = !sel_cols[i].alias.empty() ? sel_cols[i].alias : sel_cols[i].col_name;
     }
     std::vector<long long> cnt(n, 0);
     std::vector<long long> isum(n, 0);
@@ -231,18 +229,14 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
     std::vector<float> fval(n, 0.0f);
     std::vector<std::string> sval(n);
     std::vector<ColMeta> metas(n);
-    bool meta_ok = false;
+    for (size_t i = 0; i < n; i++) {
+        for (auto &cm : executorTreeRoot->cols()) {
+            if (cm.name == sel_cols[i].col_name) { metas[i] = cm; break; }
+        }
+    }
 
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
-        if (!meta_ok) {
-            for (size_t i = 0; i < n; i++) {
-                for (auto &cm : executorTreeRoot->cols()) {
-                    if (cm.name == sel_cols[i].col_name) { metas[i] = cm; break; }
-                }
-            }
-            meta_ok = true;
-        }
         for (size_t i = 0; i < n; i++) {
             const ColMeta &cm = metas[i];
             char *p = Tuple->data + cm.offset;
@@ -275,7 +269,7 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
         if (at == 1) {
             row[i] = std::to_string(cnt[i]);
         } else if (cnt[i] == 0) {
-            row[i] = (at == 4) ? "0" : "";                       // 空表：SUM=0，MAX/MIN 空
+            row[i] = (metas[i].type == TYPE_FLOAT) ? "0.000000" : "0";   // 空集按列型零值，与参考实现一致
         } else if (cm.type == TYPE_INT) {
             row[i] = (at == 4) ? std::to_string(isum[i]) : std::to_string(ival[i]);
         } else if (cm.type == TYPE_FLOAT) {

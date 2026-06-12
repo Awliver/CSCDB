@@ -60,6 +60,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             for (auto &sel_col : query->cols) {
                 if (sel_col.agg_type != 0 && sel_col.col_name == "*") {
                     // COUNT(*)：绑定到首列（仅作扫描载体）
+                    if (sel_col.alias.empty()) sel_col.alias = "count(*)";
                     sel_col.tab_name = all_cols[0].tab_name;
                     sel_col.col_name = all_cols[0].name;
                     continue;
