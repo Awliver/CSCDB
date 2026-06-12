@@ -388,11 +388,6 @@ int main(int argc, char **argv) {
         // Open database
         sm_manager->open_db(db_name);
 
-        // 题10：每次启动清空 output.txt——重启后评测只比对本次运行的输出
-        {
-            std::ofstream ofs("output.txt", std::ios::out | std::ios::trunc);
-        }
-
         // recovery database
         g_log_manager = log_manager.get();
         recovery->set_log_manager(log_manager.get());
