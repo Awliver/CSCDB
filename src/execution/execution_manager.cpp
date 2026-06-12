@@ -167,14 +167,19 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         captions.push_back(sel_col.col_name);
     }
 
-    // 记录扫描前客户端缓冲位置：output.txt 写入与客户端完全一致的带框输出
-    int buf_start = context && context->offset_ ? *context->offset_ : 0;
-
     // Print header into buffer
     RecordPrinter rec_printer(sel_cols.size());
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
+    // print header into file（框架原始紧凑格式：output.txt 与客户端带框输出是两种格式）
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << "|";
+    for(size_t i = 0; i < captions.size(); ++i) {
+        outfile << " " << captions[i] << " |";
+    }
+    outfile << "\n";
 
     // Print records
     size_t num_rec = 0;
@@ -198,20 +203,18 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
         // print record into buffer
         rec_printer.print_record(columns, context);
+        // print record into file
+        outfile << "|";
+        for(size_t i = 0; i < columns.size(); ++i) {
+            outfile << " " << columns[i] << " |";
+        }
+        outfile << "\n";
         num_rec++;
     }
+    outfile.close();
     // Print footer + record count into buffer
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
-
-    // 题9：扫描成功后，把本条 SELECT 的带框输出一次性写入 output.txt（与客户端一致）；
-    // 若 SER 读侧在扫描中途中止则抛出，不会执行到此，output.txt 不产生残缺输出
-    if (context && context->data_send_ && context->offset_ && *context->offset_ > buf_start) {
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile.write(context->data_send_ + buf_start, *context->offset_ - buf_start);
-        outfile.close();
-    }
 }
 
 // 题10：聚合执行——单遍扫描折叠，输出单行带框结果（表头=AS 别名）
@@ -280,7 +283,6 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
         }
     }
 
-    int buf_start = context && context->offset_ ? *context->offset_ : 0;
     RecordPrinter rec_printer(n);
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
@@ -288,12 +290,15 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
     rec_printer.print_record(row, context);
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(1, context);
-    if (context && context->data_send_ && context->offset_ && *context->offset_ > buf_start) {
+    // 文件侧：框架紧凑格式（表头行+值行）
         std::fstream outfile;
         outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile.write(context->data_send_ + buf_start, *context->offset_ - buf_start);
+    outfile << "|";
+    for (size_t i = 0; i < n; ++i) outfile << " " << captions[i] << " |";
+    outfile << "\n|";
+    for (size_t i = 0; i < n; ++i) outfile << " " << row[i] << " |";
+    outfile << "\n";
         outfile.close();
-    }
 }
 
 // 执行DML语句
