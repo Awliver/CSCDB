@@ -23,6 +23,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 处理表名（真实表名，按 FROM/JOIN 顺序）+ 题4 别名映射
         query->tables = x->tabs;
         query->is_explain = x->is_explain;
+        query->limit = x->limit;
         for (size_t i = 0; i < x->tabs.size(); ++i) {
             const std::string &real = x->tabs[i];
             std::string al = (i < x->aliases.size()) ? x->aliases[i] : "";

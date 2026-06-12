@@ -36,6 +36,8 @@ class Query{
     //insert 的values值
     std::vector<Value> values;
 
+    int limit = -1;                                // LIMIT N；-1 无限制
+
     // 题4：EXPLAIN ANALYZE 支持
     bool is_explain = false;                       // 是否 EXPLAIN ANALYZE
     bool select_all = false;                       // 是否 SELECT *（决定 Project 输出 [*]）

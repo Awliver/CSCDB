@@ -11,6 +11,7 @@
 %option bison-locations
 
 %{
+
 #include "ast.h"
 #include "yacc.tab.h"
 #include <iostream>
@@ -91,6 +92,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "EXIT" { return EXIT; }
 "HELP" { return HELP; }
 "ORDER" { return ORDER; }
+"LIMIT" { return LIMIT; }
 "BY" {  return BY;  }
 "ASC" { return ASC; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }

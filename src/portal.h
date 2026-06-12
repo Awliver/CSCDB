@@ -123,7 +123,11 @@ class Portal
         switch(portal->tag) {
             case PORTAL_ONE_SELECT:
             {
-                ql->select_from(std::move(portal->root), std::move(portal->sel_cols), context);
+                int limit = -1;
+                if (auto dp = std::dynamic_pointer_cast<DMLPlan>(portal->plan)) {
+                    if (auto pp = std::dynamic_pointer_cast<ProjectionPlan>(dp->subplan_)) limit = pp->limit_;
+                }
+                ql->select_from(std::move(portal->root), std::move(portal->sel_cols), context, limit);
                 break;
             }
 

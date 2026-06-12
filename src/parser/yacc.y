@@ -1,4 +1,5 @@
 %{
+
 #include "ast.h"
 #include "yacc.tab.h"
 #include <iostream>
@@ -21,7 +22,7 @@ using namespace ast;
 %define parse.error verbose
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ON EXPLAIN ANALYZE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -48,7 +49,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_table_ref> tableRef
 %type <sv_col> col
 %type <sv_cols> colList selector
-%type <sv_int> aggFunc
+%type <sv_int> aggFunc opt_limit_clause
 %type <sv_col> aggArg
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
@@ -169,7 +170,7 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM fromClause optWhereClause opt_order_clause
+    |   SELECT selector FROM fromClause optWhereClause opt_order_clause opt_limit_clause
     {
         auto fc = std::dynamic_pointer_cast<FromClause>($4);
         std::vector<std::string> tabs;
@@ -179,6 +180,7 @@ dml:
         for (auto &c : fc->join_conds) conds.push_back(c);
         auto s = std::make_shared<SelectStmt>($2, tabs, conds, $6);
         s->aliases = aliases;
+        s->limit = $7;
         $$ = s;
     }
     |   EXPLAIN ANALYZE SELECT selector FROM fromClause optWhereClause opt_order_clause
@@ -489,11 +491,19 @@ order_clause:
     }
     ;   
 
+opt_limit_clause:
+    LIMIT VALUE_INT
+    {
+        $$ = $2;
+    }
+    |   /* epsilon */ { $$ = -1; }
+    ;
+
 opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }
     |  DESC      { $$ = OrderBy_DESC;    }
     |       { $$ = OrderBy_DEFAULT; }
-    ;    
+    ;
 
 set_knob_type:
     ENABLE_NESTLOOP { $$ = EnableNestLoop; }

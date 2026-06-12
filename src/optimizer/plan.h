@@ -114,6 +114,7 @@ class ProjectionPlan : public Plan
         ~ProjectionPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> sel_cols_;
+        int limit_ = -1;
         
 };
 

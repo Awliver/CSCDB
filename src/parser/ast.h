@@ -254,6 +254,7 @@ struct SelectStmt : public TreeNode {
 
     bool has_sort;
     std::shared_ptr<OrderBy> order;
+    int limit = -1;
 
 
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,

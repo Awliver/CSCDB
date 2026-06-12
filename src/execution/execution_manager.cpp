@@ -153,7 +153,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
-                            Context *context) {
+                            Context *context, int limit) {
     if (context) context->ser_in_select_ = true;   // 题9 SER：本次扫描属于 SELECT，记录读集
 
     // 题10：聚合查询（一致性检测 SQL：COUNT/MAX/MIN/SUM，单表）
@@ -180,6 +180,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     size_t num_rec = 0;
     // 执行query_plan
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+        if (limit >= 0 && num_rec >= (size_t)limit) break;
         auto Tuple = executorTreeRoot->Next();
         std::vector<std::string> columns;
         for (auto &col : executorTreeRoot->cols()) {
