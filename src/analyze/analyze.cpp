@@ -78,6 +78,44 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 cond.rhs_col.tab_name = query->alias2real[cond.rhs_col.tab_name];
         }
         check_clause(query->tables, query->conds);
+        // 等值常量经连接等值传递：col_a=col_b 且 col_a=常量 → 派生 col_b=常量，
+        // 使连接内侧也能走索引而不必全表扫。EXPLAIN 不执行，跳过以保持计划树输出。
+        if (!query->is_explain) {
+            for (int pass = 0; pass < 3; ++pass) {
+                bool changed = false;
+                std::vector<Condition> derived;
+                for (const auto &j : query->conds) {
+                    if (j.op != OP_EQ || j.is_rhs_val) continue;   // 仅列=列的连接等值
+                    for (const auto &cc : query->conds) {
+                        if (cc.op != OP_EQ || !cc.is_rhs_val) continue;   // 仅列=常量
+                        const TabCol *src = nullptr; const TabCol *dst = nullptr;
+                        if (cc.lhs_col.tab_name == j.lhs_col.tab_name && cc.lhs_col.col_name == j.lhs_col.col_name) {
+                            src = &j.lhs_col; dst = &j.rhs_col;
+                        } else if (cc.lhs_col.tab_name == j.rhs_col.tab_name && cc.lhs_col.col_name == j.rhs_col.col_name) {
+                            src = &j.rhs_col; dst = &j.lhs_col;
+                        }
+                        if (dst == nullptr) continue;
+                        bool exists = false;
+                        for (const auto &e : query->conds)
+                            if (e.op == OP_EQ && e.is_rhs_val && e.lhs_col.tab_name == dst->tab_name &&
+                                e.lhs_col.col_name == dst->col_name) { exists = true; break; }
+                        for (const auto &e : derived)
+                            if (e.lhs_col.tab_name == dst->tab_name && e.lhs_col.col_name == dst->col_name) { exists = true; break; }
+                        if (exists) continue;
+                        Condition nc;
+                        nc.lhs_col = *dst;
+                        nc.op = OP_EQ;
+                        nc.is_rhs_val = true;
+                        nc.rhs_val = cc.rhs_val;
+                        nc.rhs_is_float_lit = cc.rhs_is_float_lit;
+                        derived.push_back(nc);
+                        changed = true;
+                    }
+                }
+                for (auto &d : derived) query->conds.push_back(d);
+                if (!changed) break;
+            }
+        }
 } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
     // 处理 SET 子句
     TabMeta& tab_meta = sm_manager_->db_.get_table(x->tab_name);
