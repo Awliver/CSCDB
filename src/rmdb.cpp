@@ -23,6 +23,8 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 #include "portal.h"
 #include "analyze/analyze.h"
+#include "parser/ast.h"
+#include <cctype>
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 8
@@ -95,6 +97,68 @@ static bool write_all(int fd, const char *buf, int len) {
         len -= (int)n;
     }
     return true;
+}
+
+// 简单单元组 INSERT 的手写快路径解析:仅识别 `insert into <表> values (字面量,...)`，
+// 构建与 yacc 完全相同的 AST 交给后续 analyze/optimize/execute；任何偏离都返回 nullptr
+// 回退到 flex/bison。词法严格对齐 lex.l：整数 {sign}?digit+ 用 atoi，浮点 {sign}?digit+.digit*
+// 用 atof，字符串 '[^']*' 去引号。绕过 yyparse 削减巨量单行装载的每语句解析开销。
+static std::shared_ptr<ast::TreeNode> try_fast_parse_insert(const char *s) {
+    const char *p = s;
+    auto skipws = [&]() { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p; };
+    auto kw = [&](const char *k) -> bool {
+        skipws();
+        const char *q = p;
+        for (; *k; ++k, ++q)
+            if (tolower((unsigned char)*q) != *k) return false;
+        p = q;
+        return true;
+    };
+    if (!kw("insert") || !kw("into")) return nullptr;
+    skipws();
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return nullptr;
+    const char *ts = p;
+    while (isalnum((unsigned char)*p) || *p == '_') ++p;
+    std::string tab(ts, p - ts);
+    skipws();
+    if (*p == '(') return nullptr;          // 带列清单形式，回退
+    if (!kw("values")) return nullptr;
+    skipws();
+    if (*p != '(') return nullptr;
+    ++p;
+    std::vector<std::shared_ptr<ast::Value>> vals;
+    while (true) {
+        skipws();
+        if (*p == '\'') {
+            ++p;
+            const char *vs = p;
+            while (*p && *p != '\'') ++p;
+            if (*p != '\'') return nullptr;
+            vals.push_back(std::make_shared<ast::StringLit>(std::string(vs, p - vs)));
+            ++p;
+        } else if (*p == '-' || *p == '+' || isdigit((unsigned char)*p)) {
+            const char *vs = p;
+            if (*p == '-' || *p == '+') ++p;
+            if (!isdigit((unsigned char)*p)) return nullptr;
+            while (isdigit((unsigned char)*p)) ++p;
+            bool is_float = false;
+            if (*p == '.') { is_float = true; ++p; while (isdigit((unsigned char)*p)) ++p; }
+            std::string num(vs, p - vs);
+            if (is_float) vals.push_back(std::make_shared<ast::FloatLit>((float)atof(num.c_str())));
+            else vals.push_back(std::make_shared<ast::IntLit>(atoi(num.c_str())));
+        } else {
+            return nullptr;                 // NULL、表达式等，回退
+        }
+        skipws();
+        if (*p == ',') { ++p; continue; }
+        if (*p == ')') { ++p; break; }
+        return nullptr;
+    }
+    skipws();
+    if (*p == ';') { ++p; skipws(); }
+    if (*p != '\0') return nullptr;         // 尾部残留，回退
+    if (vals.empty()) return nullptr;
+    return std::make_shared<ast::InsertStmt>(tab, vals);
 }
 
 void *client_handler(void *sock_fd) {
@@ -189,7 +253,9 @@ void *client_handler(void *sock_fd) {
         bool finish_analyze = false;
         pthread_mutex_lock(buffer_mutex);
         YY_BUFFER_STATE buf = yy_scan_string(stmt);
-        if (yyparse() == 0) {
+        std::shared_ptr<ast::TreeNode> fast_tree = try_fast_parse_insert(stmt);
+        if (fast_tree != nullptr) ast::parse_tree = fast_tree;
+        if (fast_tree != nullptr || yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
                     // analyze and rewrite
