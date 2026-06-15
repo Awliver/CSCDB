@@ -328,7 +328,22 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
     std::scoped_lock<std::mutex> lock(root_latch_);
 
-    auto [leaf, _] = find_leaf_page(key, Operation::INSERT, transaction);
+    // 顺序追加快路径：缓存的叶仍是最右叶且 key 不小于其首 key 时，落点必在此叶，
+    // 直接取它（一次页查找）跳过从根逐层遍历；否则回退正常查找
+    IxNodeHandle *leaf = nullptr;
+    if (cached_leaf_no_ != IX_NO_PAGE && cached_leaf_no_ == file_hdr_->last_leaf_) {
+        IxNodeHandle *c = fetch_node(cached_leaf_no_);
+        if (c->is_leaf_page() && c->get_size() > 0 &&
+            ix_compare(key, c->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) >= 0) {
+            leaf = c;
+        } else {
+            buffer_pool_manager_->unpin_page(c->get_page_id(), false);
+            delete c;
+        }
+    }
+    if (leaf == nullptr) {
+        leaf = find_leaf_page(key, Operation::INSERT, transaction).first;
+    }
     int old_size = leaf->get_size();
     int new_size = leaf->insert(key, value);
     page_id_t leaf_page = leaf->get_page_no();
@@ -340,8 +355,10 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
         return leaf_page;
     }
 
-    // 插入可能改变了叶子的首 key，向上传播
-    maintain_parent(leaf);
+    // 仅当插入成为叶子首 key 时才需向上传播分隔键；追加插入首 key 未变，省去父节点访问
+    if (memcmp(leaf->get_key(0), key, file_hdr_->col_tot_len_) == 0) {
+        maintain_parent(leaf);
+    }
 
     // 满了则分裂并把新节点上插
     if (new_size >= leaf->get_max_size()) {
@@ -349,6 +366,9 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
         insert_into_parent(leaf, new_leaf->get_key(0), new_leaf, transaction);
         buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
         delete new_leaf;
+        cached_leaf_no_ = file_hdr_->last_leaf_;   // 分裂改变了最右叶，缓存指向新的最右叶
+    } else {
+        cached_leaf_no_ = leaf_page;               // 记住本次落点叶，供下次顺序插入复用
     }
 
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
@@ -363,6 +383,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
     std::scoped_lock<std::mutex> lock(root_latch_);
+    cached_leaf_no_ = IX_NO_PAGE;   // 删除可能合并/重分配改变叶结构，作废顺序插入缓存
 
     auto [leaf, _] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
