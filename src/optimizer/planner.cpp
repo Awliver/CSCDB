@@ -162,10 +162,11 @@ std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> quer
     return query;
 }
 
-// 题9: 显式事务中或表已有 MVCC 版本(脏)时强制 SeqScan，避免 IndexScan 直读堆——
-// 否则快照读返回最新已提交值(破坏 SI 可见性)，且 SER 读侧记录/检测被跳过(IndexScan 无 ser_on_)
+// SER 隔离且(显式事务或表有未提交版本)时强制 SeqScan，保证 SSI 读集与谓词追踪完整。
+// SI 隔离改用 MVCC 感知的 IndexScan，按快照可见性过滤，既正确又能用上索引。
 static bool mvcc_force_seqscan(Context *context, const std::string &tab) {
     return context && context->txn_ && context->txn_mgr_ &&
+           context->txn_mgr_->is_ser(context->txn_) &&
            (context->txn_->get_txn_mode() || context->txn_mgr_->table_is_dirty(tab));
 }
 

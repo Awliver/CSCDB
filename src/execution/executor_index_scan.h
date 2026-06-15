@@ -62,6 +62,12 @@ class IndexScanExecutor : public AbstractExecutor {
     bool need_eval_ = true;             // false = 所有 cond 都被 index range 吸收，跳过 eval
     bool need_prefix_check_ = true;     // false = hi 是精确的（EQ 全匹配 或 range 上界），EQ 前缀检查冗余
 
+    // 题9 MVCC：SI 下索引扫描也按快照可见性过滤，避免直读堆破坏快照读
+    bool mvcc_on_ = false;
+    bool ser_on_ = false;
+    std::string mvcc_buf_;
+    const char *cur_data_ = nullptr;    // 当前命中行的可见字节，Next 据此返回
+
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
                     Context *context) {
@@ -212,13 +218,15 @@ class IndexScanExecutor : public AbstractExecutor {
         while (!range_exhausted_ && !scan_->is_end()) {
             rid_ = scan_->rid();
 
-            // Fast path：range 已精确，且无残余 cond，直接返回匹配
-            if (!need_eval_ && !need_prefix_check_) {
+            // Fast path：range 已精确、无残余 cond、且无需快照可见性，直接返回
+            if (!need_eval_ && !need_prefix_check_ && !mvcc_on_) {
+                cur_data_ = nullptr;
                 return;
             }
 
             const char *slot = get_table_slot(rid_);  // 0-alloc 直接读 slot
 
+            // EQ 前缀检查走索引键列（主键不可变，堆槽键列即索引键）
             if (need_prefix_check_) {
                 int offset = 0;
                 bool match = true;
@@ -236,12 +244,29 @@ class IndexScanExecutor : public AbstractExecutor {
                 }
             }
 
-            if (need_eval_) {
-                if (!eval_compiled(slot)) {
+            const char *eval_data = slot;
+            if (mvcc_on_) {
+                // 按本事务快照重建可见版本，不可见或已删则跳过
+                if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_, slot,
+                                                   (int)table_record_size_, mvcc_buf_)) {
                     scan_->next();
                     continue;
                 }
+                eval_data = mvcc_buf_.data();
             }
+
+            if (need_eval_ && !eval_compiled(eval_data)) {
+                scan_->next();
+                continue;
+            }
+
+            if (ser_on_) {
+                context_->txn_mgr_->ser_record_read(context_->txn_, tab_name_, rid_);
+                if (context_->txn_mgr_->ser_read_check(context_->txn_, tab_name_, rid_))
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+            }
+            cur_data_ = eval_data;
             return;
         }
     }
@@ -342,6 +367,17 @@ class IndexScanExecutor : public AbstractExecutor {
         analyze_conditions();
         compile_conds();
         range_exhausted_ = false;
+
+        mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
+                   context_->txn_mgr_->table_is_dirty(tab_name_);
+        ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
+                  context_->txn_mgr_->is_ser(context_->txn_);
+        if (ser_on_) {
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                AbortReason::DEADLOCK_PREVENTION);
+        }
 
         // 构造 start_key / end_key：默认 EQ 前缀 + 零填充
         int eq_len = (int)eq_prefix_data_.size();
@@ -473,10 +509,10 @@ class IndexScanExecutor : public AbstractExecutor {
     bool is_end() const override { return range_exhausted_ || scan_->is_end(); }
 
     std::unique_ptr<RmRecord> Next() override {
-        // 从缓存的 slot 复制到新 RmRecord（仅匹配时调一次）
-        const char *slot = get_table_slot(rid_);
+        // 命中时优先返回快照可见版本，否则直接复制堆槽
+        const char *src = cur_data_ ? cur_data_ : get_table_slot(rid_);
         auto rec = std::make_unique<RmRecord>(table_record_size_);
-        memcpy(rec->data, slot, table_record_size_);
+        memcpy(rec->data, src, table_record_size_);
         return rec;
     }
 
