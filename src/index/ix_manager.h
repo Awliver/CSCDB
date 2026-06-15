@@ -166,4 +166,14 @@ class IxManager {
         buffer_pool_manager_->delete_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
     }
+
+    // 题10：静态检查点用——把索引头(root/last_leaf 等分裂时会变)与脏页刷盘但不关闭 fd，
+    // 否则崩溃后恢复读到旧索引头致遍历落空（do_checkpoint 原本只刷了表数据漏了索引）
+    void flush_index(const IxIndexHandle *ih) {
+        char* data = new char[ih->file_hdr_->tot_len_];
+        ih->file_hdr_->serialize(data);
+        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
+        delete[] data;
+        buffer_pool_manager_->flush_all_pages(ih->fd_);
+    }
 };

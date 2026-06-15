@@ -428,6 +428,10 @@ void SmManager::do_checkpoint(LogManager* log_manager) {
         RmFileHdr hdr = fh->get_file_hdr();
         disk_manager_->write_page(fh->GetFd(), RM_FILE_HDR_PAGE, (char*)&hdr, sizeof(hdr));
     }
+    // 索引文件头(分裂时 root/last_leaf 会变)与脏页同样须落盘，否则崩溃后恢复读到旧索引头致点查落空
+    for (auto& entry : ihs_) {
+        ix_manager_->flush_index(entry.second.get());
+    }
     flush_meta();
 
     std::ofstream rf("db.restart", std::ios::binary | std::ios::trunc);
