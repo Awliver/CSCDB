@@ -1,5 +1,4 @@
 %{
-
 #include "ast.h"
 #include "yacc.tab.h"
 #include <iostream>
@@ -22,20 +21,22 @@ using namespace ast;
 %define parse.error verbose
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ON EXPLAIN ANALYZE
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
+WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
 // type-specific tokens
 %token <sv_str> IDENTIFIER VALUE_STRING
-%token COUNT MAX MIN SUM AS
 %token <sv_int> VALUE_INT
 %token <sv_float> VALUE_FLOAT
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
 %type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
+%type <sv_select> select_stmt union_branch
+%type <sv_selects> union_query
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -45,18 +46,23 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_vals> valueList valueRows
 %type <sv_str> tbName colName
 %type <sv_strs> colNameList
-%type <sv_node> fromClause
-%type <sv_table_ref> tableRef
+%type <sv_table_list> tableList
 %type <sv_col> col
 %type <sv_cols> colList selector
-%type <sv_int> aggFunc opt_limit_clause
-%type <sv_col> aggArg
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
-%type <sv_cond> condition
-%type <sv_conds> whereClause optWhereClause
-%type <sv_orderby>  order_clause opt_order_clause
+%type <sv_cond> condition having_condition
+%type <sv_conds> whereClause optWhereClause having_clause
+%type <sv_orderby>  order_clause
+%type <sv_orderbys> opt_order_clause order_list
 %type <sv_orderby_dir> opt_asc_desc
+%type <sv_agg_expr> agg_func
+%type <sv_agg_exprs> agg_list
+%type <sv_cols> opt_group_by group_by_list
+%type <sv_conds> opt_having
+%type <sv_int> opt_limit
+%type <sv_cols> select_list
+%type <sv_str> opt_alias
 %type <sv_setKnobType> set_knob_type
 
 %%
@@ -154,12 +160,10 @@ ddl:
 dml:
         INSERT INTO tbName VALUES valueRows
     {
-        /* 题9：valueRows 支持单行与多行 insert into t values(...),(...)；按 cols 数分块 */
         $$ = std::make_shared<InsertStmt>($3, $5);
     }
     |   INSERT INTO tbName '(' colNameList ')' VALUES '(' valueList ')'
     {
-        /* 题9：列清单 insert into t(c1,c2) values(...)，analyze 按表列序重排 */
         $$ = std::make_shared<InsertStmt>($3, $5, $9);
     }
     |   DELETE FROM tbName optWhereClause
@@ -170,31 +174,87 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM fromClause optWhereClause opt_order_clause opt_limit_clause
+    |   select_stmt
     {
-        auto fc = std::dynamic_pointer_cast<FromClause>($4);
-        std::vector<std::string> tabs;
-        std::vector<std::string> aliases;
-        for (auto &r : fc->refs) { tabs.push_back(r.tab_name); aliases.push_back(r.alias); }
-        std::vector<std::shared_ptr<BinaryExpr>> conds = $5;
-        for (auto &c : fc->join_conds) conds.push_back(c);
-        auto s = std::make_shared<SelectStmt>($2, tabs, conds, $6);
-        s->aliases = aliases;
-        s->limit = $7;
-        $$ = s;
+        $$ = $1;
     }
-    |   EXPLAIN ANALYZE SELECT selector FROM fromClause optWhereClause opt_order_clause
+    |   EXPLAIN select_stmt
     {
-        auto fc = std::dynamic_pointer_cast<FromClause>($6);
-        std::vector<std::string> tabs;
-        std::vector<std::string> aliases;
-        for (auto &r : fc->refs) { tabs.push_back(r.tab_name); aliases.push_back(r.alias); }
-        std::vector<std::shared_ptr<BinaryExpr>> conds = $7;
-        for (auto &c : fc->join_conds) conds.push_back(c);
-        auto s = std::make_shared<SelectStmt>($4, tabs, conds, $8);
-        s->aliases = aliases;
-        s->is_explain = true;
-        $$ = s;
+        $$ = std::make_shared<ExplainStmt>($2, false);
+    }
+    |   EXPLAIN ANALYZE select_stmt
+    {
+        $$ = std::make_shared<ExplainStmt>($3, true);
+    }
+    |   SELECT '*' FROM '(' union_query ')' AS tbName opt_order_clause opt_limit
+    {
+        $$ = std::make_shared<UnionStmt>($5, $8, $9, $10 >= 0, $10 < 0 ? 0 : $10);
+    }
+    ;
+
+select_stmt:
+        SELECT '*' FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    {
+        auto conds = $4->join_conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
+    }
+    |   SELECT colList FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    {
+        auto conds = $4->join_conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
+    }
+    |   SELECT agg_list FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    {
+        auto conds = $4->join_conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4->tabs, conds, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
+    }
+    |   SELECT colList ',' agg_list FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    {
+        auto conds = $6->join_conds;
+        conds.insert(conds.end(), $7.begin(), $7.end());
+        $$ = std::make_shared<SelectStmt>($2, $4, $6->tabs, conds, $8, $9, $10, $11 >= 0, $11 < 0 ? 0 : $11);
+    }
+    ;
+
+union_branch:
+        SELECT '*' FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    {
+        auto conds = $4->join_conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
+    }
+    |   SELECT colList FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    {
+        auto conds = $4->join_conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
+    }
+    |   SELECT agg_list FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    {
+        auto conds = $4->join_conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4->tabs, conds, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
+    }
+    |   SELECT colList ',' agg_list FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    {
+        auto conds = $6->join_conds;
+        conds.insert(conds.end(), $7.begin(), $7.end());
+        $$ = std::make_shared<SelectStmt>($2, $4, $6->tabs, conds, $8, $9, std::vector<std::shared_ptr<OrderBy>>{}, $10 >= 0, $10 < 0 ? 0 : $10);
+    }
+    ;
+
+union_query:
+        union_branch UNION union_branch
+    {
+        $$ = std::vector<std::shared_ptr<SelectStmt>>{$1, $3};
+    }
+    |   union_query UNION union_branch
+    {
+        $$ = $1;
+        $$.push_back($3);
     }
     ;
 
@@ -260,7 +320,6 @@ valueRows:
     }
     |   valueRows ',' '(' valueList ')'
     {
-        /* 题9：多行 insert——值平铺，executor 按表列数分块插入 */
         $$ = $1;
         for (auto &v : $4) $$.push_back(v);
     }
@@ -320,31 +379,6 @@ col:
     {
         $$ = std::make_shared<Col>("", $1);
     }
-    |   aggFunc '(' aggArg ')' AS colName
-    {
-        auto c = $3;
-        c->agg_type = $1;
-        c->alias = $6;
-        $$ = c;
-    }
-    |   aggFunc '(' aggArg ')'
-    {
-        auto c = $3;
-        c->agg_type = $1;
-        $$ = c;
-    }
-    ;
-
-aggArg:
-        col   { $$ = $1; }
-    |   '*'   { $$ = std::make_shared<Col>("", "*"); }
-    ;
-
-aggFunc:
-        COUNT { $$ = 1; }
-    |   MAX   { $$ = 2; }
-    |   MIN   { $$ = 3; }
-    |   SUM   { $$ = 4; }
     ;
 
 colList:
@@ -412,20 +446,60 @@ setClause:
     {
         $$ = std::make_shared<SetClause>($1, $3);
     }
-    |   colName '=' colName value
+    ;
+
+
+
+agg_list:
+        agg_func
     {
-        /* 题9：算术增量 v=v+1（词法把 +1/-1 归并为带符号 VALUE_INT，无空格情形） */
-        $$ = std::make_shared<SetClause>($1, $3, $4);
+        $$ = std::vector<std::shared_ptr<AggExpr>>{$1};
     }
-    |   colName '=' colName '+' value
+    |   agg_list ',' agg_func
     {
-        /* 带空格加号 v = v + 1 */
-        $$ = std::make_shared<SetClause>($1, $3, $5);
+        $$.push_back($3);
     }
-    |   colName '=' colName '-' value
+    ;
+
+agg_func:
+        COUNT '(' '*' ')' opt_alias
     {
-        /* 带空格减号 v = v - 1：字面量为正、置 neg 取负 */
-        $$ = std::make_shared<SetClause>($1, $3, $5, true);
+        $$ = std::make_shared<AggExpr>(AGG_COUNT, nullptr, $5, true);
+    }
+    |   COUNT '(' col ')' opt_alias
+    {
+        $$ = std::make_shared<AggExpr>(AGG_COUNT, $3, $5, false);
+    }
+    |   MAX '(' col ')' opt_alias
+    {
+        $$ = std::make_shared<AggExpr>(AGG_MAX, $3, $5, false);
+    }
+    |   MIN '(' col ')' opt_alias
+    {
+        $$ = std::make_shared<AggExpr>(AGG_MIN, $3, $5, false);
+    }
+    |   SUM '(' col ')' opt_alias
+    {
+        $$ = std::make_shared<AggExpr>(AGG_SUM, $3, $5, false);
+    }
+    |   AVG '(' col ')' opt_alias
+    {
+        $$ = std::make_shared<AggExpr>(AGG_AVG, $3, $5, false);
+    }
+    ;
+
+opt_alias:
+        /* empty */
+    {
+        $$ = "";
+    }
+    |   AS IDENTIFIER
+    {
+        $$ = $2;
+    }
+    |   IDENTIFIER
+    {
+        $$ = $1;
     }
     ;
 
@@ -437,73 +511,137 @@ selector:
     |   colList
     ;
 
-fromClause:
-        tableRef
+select_list:
+        colList
+    |   colList ',' agg_list
+    |   agg_list
+    ;
+
+tableList:
+        tbName
     {
-        auto fc = std::make_shared<FromClause>();
-        fc->refs.push_back($1);
-        $$ = fc;
+        $$ = std::make_shared<TableListInfo>();
+        $$->tabs.push_back($1);
     }
-    |   fromClause ',' tableRef
+    |   tableList ',' tbName
     {
-        auto fc = std::dynamic_pointer_cast<FromClause>($1);
-        fc->refs.push_back($3);
-        $$ = fc;
+        $$ = $1;
+        $$->tabs.push_back($3);
     }
-    |   fromClause JOIN tableRef ON whereClause
+    |   tableList JOIN tbName
     {
-        auto fc = std::dynamic_pointer_cast<FromClause>($1);
-        fc->refs.push_back($3);
-        for (auto &c : $5) fc->join_conds.push_back(c);
-        $$ = fc;
+        $$ = $1;
+        $$->tabs.push_back($3);
     }
-    |   fromClause JOIN tableRef
+    |   tableList JOIN tbName ON whereClause
     {
-        auto fc = std::dynamic_pointer_cast<FromClause>($1);
-        fc->refs.push_back($3);
-        $$ = fc;
+        $$ = $1;
+        $$->tabs.push_back($3);
+        $$->join_conds.insert($$->join_conds.end(), $5.begin(), $5.end());
     }
     ;
 
-tableRef:
-        tbName
+opt_group_by:
+        /* epsilon */
     {
-        $$ = JoinTableRef{$1, ""};
+        $$ = {};
     }
-    |   tbName IDENTIFIER
+    |   GROUP BY group_by_list
     {
-        $$ = JoinTableRef{$1, $2};
+        $$ = $3;
+    }
+    ;
+
+group_by_list:
+        col
+    {
+        $$ = std::vector<std::shared_ptr<Col>>{$1};
+    }
+    |   group_by_list ',' col
+    {
+        $$.push_back($3);
+    }
+    ;
+
+having_condition:
+        col op expr
+    {
+        $$ = std::make_shared<BinaryExpr>($1, $2, $3);
+    }
+    |   agg_func op expr
+    {
+        auto col = std::make_shared<Col>("", $1->to_string());
+        $$ = std::make_shared<BinaryExpr>(col, $2, $3);
+    }
+    ;
+
+having_clause:
+        having_condition
+    {
+        $$ = std::vector<std::shared_ptr<BinaryExpr>>{$1};
+    }
+    |   having_clause AND having_condition
+    {
+        $$.push_back($3);
+    }
+    ;
+
+opt_having:
+        /* epsilon */
+    {
+        $$ = {};
+    }
+    |   HAVING having_clause
+    {
+        $$ = $2;
     }
     ;
 
 opt_order_clause:
-    ORDER BY order_clause      
-    { 
-        $$ = $3; 
+    ORDER BY order_list
+    {
+        $$ = $3;
     }
-    |   /* epsilon */ { /* ignore*/ }
+    |   /* epsilon */
+    {
+        $$ = {};
+    }
+    ;
+
+order_list:
+      order_clause
+    {
+        $$ = std::vector<std::shared_ptr<OrderBy>>{$1};
+    }
+    |   order_list ',' order_clause
+    {
+        $$.push_back($3);
+    }
     ;
 
 order_clause:
-      col  opt_asc_desc 
-    { 
+      col  opt_asc_desc
+    {
         $$ = std::make_shared<OrderBy>($1, $2);
     }
     ;   
-
-opt_limit_clause:
-    LIMIT VALUE_INT
-    {
-        $$ = $2;
-    }
-    |   /* epsilon */ { $$ = -1; }
-    ;
 
 opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }
     |  DESC      { $$ = OrderBy_DESC;    }
     |       { $$ = OrderBy_DEFAULT; }
     ;
+
+opt_limit:
+        /* epsilon */
+    {
+        $$ = -1;
+    }
+    |   LIMIT VALUE_INT
+    {
+        $$ = $2;
+    }
+    ;    
 
 set_knob_type:
     ENABLE_NESTLOOP { $$ = EnableNestLoop; }

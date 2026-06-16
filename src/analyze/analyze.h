@@ -21,31 +21,61 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "common/common.h"
 
+struct AggregateInfo {
+    ast::AggType type;
+    TabCol col;
+    std::string alias;
+    bool is_star;
+    ColType arg_type;
+    bool in_output = true;
+
+    std::string to_string() const {
+        std::string name;
+        switch (type) {
+            case ast::AGG_COUNT: name = "count"; break;
+            case ast::AGG_MAX:   name = "max"; break;
+            case ast::AGG_MIN:   name = "min"; break;
+            case ast::AGG_SUM:   name = "sum"; break;
+            case ast::AGG_AVG:   name = "avg"; break;
+        }
+        name += "(" + (is_star ? std::string("*") : col.col_name) + ")";
+        return name;
+    }
+};
+
 class Query{
     public:
     std::shared_ptr<ast::TreeNode> parse;
-    // TODO jointree
-    // where条件
     std::vector<Condition> conds;
-    // 投影列
     std::vector<TabCol> cols;
-    // 表名（真实表名，按 FROM/JOIN 出现顺序，用于保持连接顺序）
     std::vector<std::string> tables;
-    // update 的set 值
     std::vector<SetClause> set_clauses;
-    //insert 的values值
     std::vector<Value> values;
 
-    int limit = -1;                                // LIMIT N；-1 无限制
+    // 题5 聚合
+    std::vector<AggregateInfo> aggs;
+    std::vector<TabCol> group_by_cols;
+    std::vector<Condition> having_conds;
+    std::vector<std::pair<TabCol, ast::OrderByDir>> orders;
+    bool has_limit = false;
+    int limit_count = 0;
+    int limit = -1;  // 题10 简单 LIMIT 兼容
+    std::vector<std::string> sel_captions;
 
-    // 题4：EXPLAIN ANALYZE 支持
-    bool is_explain = false;                       // 是否 EXPLAIN ANALYZE
-    bool select_all = false;                       // 是否 SELECT *（决定 Project 输出 [*]）
-    std::map<std::string, std::string> alias2real; // 别名->真表（含真表->真表，解析列归属用）
-    std::map<std::string, std::string> real2alias; // 真表->显示名（有别名用别名，否则真名），EXPLAIN 输出用
+    // 题6 UNION
+    std::vector<std::shared_ptr<Query>> union_queries;
+    std::vector<ColMeta> union_output_cols;
+    std::string union_alias;
+
+    // 题4 EXPLAIN
+    bool is_explain = false;
+    bool explain_analyze = false;
+    bool select_all = false;
+    std::shared_ptr<Query> explain_query;
+    std::map<std::string, std::string> alias2real;
+    std::map<std::string, std::string> real2alias;
 
     Query(){}
-
 };
 
 class Analyze
@@ -65,5 +95,19 @@ private:
     void check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
-};
+    bool is_compatible_type(ColType lhs, ColType rhs);
 
+    ColType get_col_type(const std::vector<ColMeta> &all_cols, const TabCol &col);
+    void check_group_by_validity(const std::vector<TabCol> &sel_cols,
+                                 const std::vector<AggregateInfo> &aggs,
+                                 const std::vector<TabCol> &group_by);
+    bool is_in_group_by(const TabCol &col, const std::vector<TabCol> &group_by);
+    bool is_aggregate_argument(const TabCol &col, const std::vector<AggregateInfo> &aggs);
+    void check_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+                             const std::vector<TabCol> &group_by,
+                             std::vector<AggregateInfo> &aggs,
+                             const std::vector<ColMeta> &all_cols);
+    void check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds);
+    std::vector<ColMeta> infer_select_output_cols(const std::shared_ptr<Query> &query);
+    ColMeta promote_union_col(const ColMeta &base, const ColMeta &incoming);
+};

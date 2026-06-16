@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze.h"
 
+#include <algorithm>
+
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
  * @param {shared_ptr<ast::TreeNode>} parse parser生成的结果集
@@ -18,58 +20,185 @@ See the Mulan PSL v2 for more details. */
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 {
     std::shared_ptr<Query> query = std::make_shared<Query>();
-    if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
+    if (auto e = std::dynamic_pointer_cast<ast::ExplainStmt>(parse))
     {
-        // 处理表名（真实表名，按 FROM/JOIN 顺序）+ 题4 别名映射
+        query->is_explain = true;
+        query->explain_analyze = e->analyze;
+        query->explain_query = do_analyze(e->select);
+    }
+    else if (auto u = std::dynamic_pointer_cast<ast::UnionStmt>(parse))
+    {
+        if (u->selects.size() < 2) {
+            throw InternalError("failure");
+        }
+        query->union_alias = u->alias;
+        for (auto &sel : u->selects) {
+            auto child = do_analyze(sel);
+            query->union_queries.push_back(child);
+        }
+
+        std::vector<ColMeta> common_cols = infer_select_output_cols(query->union_queries[0]);
+        if (common_cols.empty()) throw InternalError("failure");
+        for (size_t i = 1; i < query->union_queries.size(); i++) {
+            auto cols = infer_select_output_cols(query->union_queries[i]);
+            if (cols.size() != common_cols.size()) {
+                throw InternalError("failure");
+            }
+            for (size_t j = 0; j < common_cols.size(); j++) {
+                common_cols[j] = promote_union_col(common_cols[j], cols[j]);
+            }
+        }
+
+        int offset = 0;
+        for (auto &col : common_cols) {
+            col.tab_name = query->union_alias;
+            col.offset = offset;
+            offset += col.len;
+            query->union_output_cols.push_back(col);
+            query->cols.push_back({query->union_alias, col.name});
+            query->sel_captions.push_back(col.name);
+        }
+
+        for (auto &sv_order : u->orders) {
+            TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
+            bool found = false;
+            for (auto &col : query->union_output_cols) {
+                if (col.name == order_col.col_name &&
+                    (order_col.tab_name.empty() || order_col.tab_name == query->union_alias)) {
+                    found = true;
+                    order_col.tab_name = query->union_alias;
+                    break;
+                }
+            }
+            if (!found) throw InternalError("failure");
+            query->orders.emplace_back(order_col, sv_order->orderby_dir);
+        }
+        query->has_limit = u->has_limit;
+        query->limit_count = u->limit_count;
+    }
+    else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
+    {
         query->tables = x->tabs;
         query->is_explain = x->is_explain;
-        query->limit = x->limit;
         for (size_t i = 0; i < x->tabs.size(); ++i) {
             const std::string &real = x->tabs[i];
             std::string al = (i < x->aliases.size()) ? x->aliases[i] : "";
-            query->alias2real[real] = real;            // 允许用真表名直接引用
+            query->alias2real[real] = real;
             if (!al.empty()) {
-                query->alias2real[al] = real;          // 别名 -> 真表
-                query->real2alias[real] = al;          // 真表 -> 别名（显示用）
+                query->alias2real[al] = real;
+                query->real2alias[real] = al;
             } else {
-                query->real2alias[real] = real;        // 无别名则显示真名
+                query->real2alias[real] = real;
             }
         }
-        // 题4：记录是否 SELECT *（Project 输出 [*] 用）
-        query->select_all = x->cols.empty();
-
-        // 处理 target list；列的 tab_name 可能是别名，先解析为真表名
-        for (auto &sv_sel_col : x->cols) {
-            std::string tn = sv_sel_col->tab_name;
-            if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
-            TabCol sel_col = {.tab_name = tn, .col_name = sv_sel_col->col_name};
-            sel_col.agg_type = sv_sel_col->agg_type;
-            sel_col.alias = sv_sel_col->alias;
-            query->cols.push_back(sel_col);
-        }
+        query->select_all = x->cols.empty() && x->aggs.empty();
 
         std::vector<ColMeta> all_cols;
         get_all_cols(query->tables, all_cols);
-        if (query->cols.empty()) {
-            // select all columns
+
+        // 普通列
+        for (auto &sv_sel_col : x->cols) {
+            if (sv_sel_col->agg_type != 0) continue;  // 题10 简单聚合走下方转换
+            std::string tn = sv_sel_col->tab_name;
+            if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
+            TabCol sel_col = {.tab_name = tn, .col_name = sv_sel_col->col_name};
+            query->cols.push_back(sel_col);
+        }
+        if (query->cols.empty() && x->aggs.empty()) {
             for (auto &col : all_cols) {
-                TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
-                query->cols.push_back(sel_col);
+                query->cols.push_back({col.tab_name, col.name});
             }
-        } else {
-            // infer table name from column name
+        } else if (!query->cols.empty()) {
             for (auto &sel_col : query->cols) {
-                if (sel_col.agg_type != 0 && sel_col.col_name == "*") {
-                    // COUNT(*)：绑定到首列（仅作扫描载体）
-                    if (sel_col.alias.empty()) sel_col.alias = "count(*)";
-                    sel_col.tab_name = all_cols[0].tab_name;
-                    sel_col.col_name = all_cols[0].name;
-                    continue;
-                }
-                sel_col = check_column(all_cols, sel_col);  // 列元数据校验
+                sel_col = check_column(all_cols, sel_col);
             }
         }
-        //处理where条件（WHERE + JOIN..ON 已并入 x->conds）；条件里别名先解析为真表名
+
+        // p7 AggExpr 列表
+        for (auto &sv_agg : x->aggs) {
+            AggregateInfo agg;
+            agg.type = sv_agg->agg_type;
+            agg.is_star = sv_agg->is_star;
+            agg.alias = sv_agg->alias;
+            if (sv_agg->col) {
+                agg.col = {.tab_name = sv_agg->col->tab_name, .col_name = sv_agg->col->col_name};
+                if (!agg.col.tab_name.empty() && query->alias2real.count(agg.col.tab_name))
+                    agg.col.tab_name = query->alias2real[agg.col.tab_name];
+                agg.col = check_column(all_cols, agg.col);
+                agg.arg_type = get_col_type(all_cols, agg.col);
+                if (sv_agg->agg_type != ast::AGG_COUNT &&
+                    agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT) {
+                    throw InternalError("failure");
+                }
+            } else {
+                agg.arg_type = TYPE_INT;
+            }
+            query->aggs.push_back(agg);
+            query->sel_captions.push_back(agg.alias.empty() ? (sv_agg->is_star ? "count(*)" : agg.col.col_name) : agg.alias);
+        }
+        // 题10 简单聚合（Col.agg_type）转 AggregateInfo
+        for (auto &sv_sel_col : x->cols) {
+            if (sv_sel_col->agg_type == 0) continue;
+            AggregateInfo agg;
+            static const ast::AggType map[] = {ast::AGG_COUNT, ast::AGG_COUNT, ast::AGG_MAX, ast::AGG_MIN, ast::AGG_SUM};
+            agg.type = map[sv_sel_col->agg_type];
+            agg.is_star = (sv_sel_col->col_name == "*");
+            agg.alias = sv_sel_col->alias;
+            if (agg.is_star) {
+                agg.arg_type = TYPE_INT;
+            } else {
+                std::string tn = sv_sel_col->tab_name;
+                if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
+                agg.col = {tn, sv_sel_col->col_name};
+                agg.col = check_column(all_cols, agg.col);
+                agg.arg_type = get_col_type(all_cols, agg.col);
+            }
+            query->aggs.push_back(agg);
+            query->sel_captions.push_back(!agg.alias.empty() ? agg.alias : agg.to_string());
+        }
+
+        for (auto &sv_gb : x->group_by_cols) {
+            TabCol gb_col = {.tab_name = sv_gb->tab_name, .col_name = sv_gb->col_name};
+            if (!gb_col.tab_name.empty() && query->alias2real.count(gb_col.tab_name))
+                gb_col.tab_name = query->alias2real[gb_col.tab_name];
+            gb_col = check_column(all_cols, gb_col);
+            query->group_by_cols.push_back(gb_col);
+        }
+
+        get_clause(x->having_conds, query->having_conds);
+        for (auto &cond : query->having_conds) {
+            if (!cond.lhs_col.tab_name.empty() && query->alias2real.count(cond.lhs_col.tab_name))
+                cond.lhs_col.tab_name = query->alias2real[cond.lhs_col.tab_name];
+        }
+
+        if (!x->orders.empty()) {
+            for (auto &sv_order : x->orders) {
+                TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
+                if (!order_col.tab_name.empty() && query->alias2real.count(order_col.tab_name))
+                    order_col.tab_name = query->alias2real[order_col.tab_name];
+                order_col = check_column(all_cols, order_col);
+                query->orders.emplace_back(order_col, sv_order->orderby_dir);
+            }
+        } else if (x->order) {
+            TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
+            if (!order_col.tab_name.empty() && query->alias2real.count(order_col.tab_name))
+                order_col.tab_name = query->alias2real[order_col.tab_name];
+            order_col = check_column(all_cols, order_col);
+            query->orders.emplace_back(order_col, x->order->orderby_dir);
+        }
+
+        query->has_limit = x->has_limit || x->limit >= 0;
+        query->limit_count = x->has_limit ? x->limit_count : (x->limit >= 0 ? x->limit : 0);
+        query->limit = query->has_limit ? query->limit_count : x->limit;
+
+        check_group_by_validity(query->cols, query->aggs, query->group_by_cols);
+        if (!query->having_conds.empty()) {
+            check_having_clause(x->having_conds, query->group_by_cols, query->aggs, all_cols);
+        }
+        for (auto &sel_col : query->cols) {
+            query->sel_captions.push_back(sel_col.col_name);
+        }
+
         get_clause(x->conds, query->conds);
         for (auto &cond : query->conds) {
             if (!cond.lhs_col.tab_name.empty() && query->alias2real.count(cond.lhs_col.tab_name))
@@ -78,22 +207,21 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 cond.rhs_col.tab_name = query->alias2real[cond.rhs_col.tab_name];
         }
         check_clause(query->tables, query->conds);
-        // 等值常量经连接等值传递：col_a=col_b 且 col_a=常量 → 派生 col_b=常量，
-        // 使连接内侧也能走索引而不必全表扫。EXPLAIN 不执行，跳过以保持计划树输出。
+        check_where_no_aggregate(x->conds);
+
         if (!query->is_explain) {
             for (int pass = 0; pass < 3; ++pass) {
                 bool changed = false;
                 std::vector<Condition> derived;
                 for (const auto &j : query->conds) {
-                    if (j.op != OP_EQ || j.is_rhs_val) continue;   // 仅列=列的连接等值
+                    if (j.op != OP_EQ || j.is_rhs_val) continue;
                     for (const auto &cc : query->conds) {
-                        if (cc.op != OP_EQ || !cc.is_rhs_val) continue;   // 仅列=常量
-                        const TabCol *src = nullptr; const TabCol *dst = nullptr;
-                        if (cc.lhs_col.tab_name == j.lhs_col.tab_name && cc.lhs_col.col_name == j.lhs_col.col_name) {
-                            src = &j.lhs_col; dst = &j.rhs_col;
-                        } else if (cc.lhs_col.tab_name == j.rhs_col.tab_name && cc.lhs_col.col_name == j.rhs_col.col_name) {
-                            src = &j.rhs_col; dst = &j.lhs_col;
-                        }
+                        if (cc.op != OP_EQ || !cc.is_rhs_val) continue;
+                        const TabCol *dst = nullptr;
+                        if (cc.lhs_col.tab_name == j.lhs_col.tab_name && cc.lhs_col.col_name == j.lhs_col.col_name)
+                            dst = &j.rhs_col;
+                        else if (cc.lhs_col.tab_name == j.rhs_col.tab_name && cc.lhs_col.col_name == j.rhs_col.col_name)
+                            dst = &j.lhs_col;
                         if (dst == nullptr) continue;
                         bool exists = false;
                         for (const auto &e : query->conds)
@@ -124,7 +252,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         set.lhs.tab_name = x->tab_name;
         set.lhs.col_name = sv_set->col_name;
         set.rhs = convert_sv_value(sv_set->val);
-        set.is_arith = sv_set->is_arith;   // 题9：算术增量 v=v±字面量
+        set.is_arith = sv_set->is_arith;
         set.rhs_col = sv_set->rhs_col;
         set.arith_neg = sv_set->arith_neg;
 
@@ -154,14 +282,13 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
-        // 处理insert 的values值
+        TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
+        std::vector<Value> raw_vals;
         if (x->cols.empty()) {
             for (auto &sv_val : x->vals) {
-                query->values.push_back(convert_sv_value(sv_val));
+                raw_vals.push_back(convert_sv_value(sv_val));
             }
         } else {
-            // 题9：列清单 insert——按表列顺序重排 values；列须覆盖全部列且数量匹配
-            TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
             if (x->cols.size() != x->vals.size()) {
                 throw InvalidValueCountError();
             }
@@ -171,16 +298,89 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                     if (x->cols[k] == col.name) break;
                 }
                 if (k == x->cols.size()) {
-                    throw ColumnNotFoundError(col.name);  // 列清单未覆盖该列
+                    throw ColumnNotFoundError(col.name);
                 }
-                query->values.push_back(convert_sv_value(x->vals[k]));
+                raw_vals.push_back(convert_sv_value(x->vals[k]));
             }
+        }
+        for (size_t i = 0; i < tab.cols.size(); ++i) {
+            Value v = raw_vals[i];
+            auto &col = tab.cols[i];
+            if (col.type == TYPE_FLOAT && v.type == TYPE_INT) {
+                v.set_float(static_cast<float>(v.int_val));
+            }
+            if (col.type != v.type) {
+                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(v.type));
+            }
+            v.init_raw(col.len);
+            query->values.push_back(v);
         }
     } else {
         // do nothing
     }
     query->parse = std::move(parse);
     return query;
+}
+
+std::vector<ColMeta> Analyze::infer_select_output_cols(const std::shared_ptr<Query> &query) {
+    std::vector<ColMeta> result;
+    int offset = 0;
+    if (!query->aggs.empty() || !query->group_by_cols.empty()) {
+        for (auto &gc : query->group_by_cols) {
+            auto tab = sm_manager_->db_.get_table(gc.tab_name);
+            auto col_it = tab.get_col(gc.col_name);
+            ColMeta col = *col_it;
+            col.offset = offset;
+            offset += col.len;
+            result.push_back(col);
+        }
+        for (auto &agg : query->aggs) {
+            if (!agg.in_output) continue;
+            ColMeta col;
+            col.name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
+            col.tab_name = agg.col.tab_name;
+            if (agg.type == ast::AGG_COUNT) {
+                col.type = TYPE_INT;
+                col.len = sizeof(int);
+            } else if (agg.type == ast::AGG_AVG) {
+                col.type = TYPE_FLOAT;
+                col.len = sizeof(float);
+            } else {
+                col.type = agg.arg_type;
+                col.len = agg.arg_type == TYPE_INT ? sizeof(int) : sizeof(float);
+            }
+            col.offset = offset;
+            offset += col.len;
+            result.push_back(col);
+        }
+        return result;
+    }
+
+    for (auto &tc : query->cols) {
+        auto tab = sm_manager_->db_.get_table(tc.tab_name);
+        auto col_it = tab.get_col(tc.col_name);
+        ColMeta col = *col_it;
+        col.offset = offset;
+        offset += col.len;
+        result.push_back(col);
+    }
+    return result;
+}
+
+ColMeta Analyze::promote_union_col(const ColMeta &base, const ColMeta &incoming) {
+    ColMeta result = base;
+    if (base.type == incoming.type) {
+        if (base.type == TYPE_STRING) result.len = std::max(base.len, incoming.len);
+        return result;
+    }
+    bool numeric = (base.type == TYPE_INT || base.type == TYPE_FLOAT) &&
+                   (incoming.type == TYPE_INT || incoming.type == TYPE_FLOAT);
+    if (numeric) {
+        result.type = TYPE_FLOAT;
+        result.len = sizeof(float);
+        return result;
+    }
+    throw InternalError("failure");
 }
 
 
@@ -287,4 +487,139 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         {ast::SV_OP_GT, OP_GT}, {ast::SV_OP_LE, OP_LE}, {ast::SV_OP_GE, OP_GE},
     };
     return m.at(op);
+}
+
+ColType Analyze::get_col_type(const std::vector<ColMeta> &all_cols, const TabCol &col) {
+    for (auto &c : all_cols) {
+        if (c.tab_name == col.tab_name && c.name == col.col_name) {
+            return c.type;
+        }
+    }
+    return TYPE_INT;  // should not reach here if check_column passed
+}
+
+bool Analyze::is_in_group_by(const TabCol &col, const std::vector<TabCol> &group_by) {
+    for (auto &g : group_by) {
+        if (g.tab_name == col.tab_name && g.col_name == col.col_name)
+            return true;
+    }
+    return false;
+}
+
+bool Analyze::is_aggregate_argument(const TabCol &col, const std::vector<AggregateInfo> &aggs) {
+    for (auto &agg : aggs) {
+        if (agg.col.col_name == col.col_name &&
+            (col.tab_name.empty() || agg.col.tab_name == col.tab_name))
+            return true;
+    }
+    return false;
+}
+
+void Analyze::check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds) {
+    for (auto &expr : sv_conds) {
+        if (expr->lhs->agg_type != 0) throw InternalError("failure");
+        const std::string &n = expr->lhs->col_name;
+        if (n.find('(') != std::string::npos) throw InternalError("failure");
+    }
+}
+
+void Analyze::check_group_by_validity(const std::vector<TabCol> &sel_cols,
+                                      const std::vector<AggregateInfo> &aggs,
+                                      const std::vector<TabCol> &group_by) {
+    bool has_agg = !aggs.empty();
+    bool has_plain_col = !sel_cols.empty();
+
+    if (!has_agg && group_by.empty()) return;  // 无聚合且无 GROUP BY，无需检查
+
+    if (group_by.empty()) {
+        // R2: 无 GROUP BY，但不能有普通列
+        if (has_plain_col) {
+            throw InternalError("failure");
+        }
+        return;
+    }
+
+    // R1: 有 GROUP BY，检查每个非聚合参数列都在 GROUP BY 中
+    for (auto &col : sel_cols) {
+        if (!is_in_group_by(col, group_by) && !is_aggregate_argument(col, aggs)) {
+            throw InternalError("failure");
+        }
+    }
+}
+
+// 从聚合函数字符串（如 "count(*)", "max(score)"）解析聚合信息
+static bool parse_agg_string(const std::string &s, ast::AggType &type, std::string &col_name, bool &is_star) {
+    if (s.size() < 4) return false;
+    size_t lp = s.find('(');
+    size_t rp = s.find(')');
+    if (lp == std::string::npos || rp == std::string::npos || rp != s.size() - 1) return false;
+    std::string name = s.substr(0, lp);
+    std::string arg = s.substr(lp + 1, rp - lp - 1);
+    if (name == "count") type = ast::AGG_COUNT;
+    else if (name == "max") type = ast::AGG_MAX;
+    else if (name == "min") type = ast::AGG_MIN;
+    else if (name == "sum") type = ast::AGG_SUM;
+    else if (name == "avg") type = ast::AGG_AVG;
+    else return false;
+    if (arg == "*") {
+        is_star = true;
+        col_name = "";
+    } else {
+        is_star = false;
+        col_name = arg;
+    }
+    return true;
+}
+
+void Analyze::check_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+                                  const std::vector<TabCol> &group_by,
+                                  std::vector<AggregateInfo> &aggs,
+                                  const std::vector<ColMeta> &all_cols) {
+    for (auto &expr : sv_conds) {
+        TabCol lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
+        // 检查 lhs_col 是否在 GROUP BY 中
+        bool valid = is_in_group_by(lhs_col, group_by);
+        if (!valid) {
+            // 检查是否是聚合别名或聚合函数字符串
+            for (auto &agg : aggs) {
+                if (agg.alias == lhs_col.col_name ||
+                    (lhs_col.col_name == agg.col.col_name && !agg.is_star) ||
+                    lhs_col.col_name == agg.to_string()) {
+                    valid = true;
+                    break;
+                }
+            }
+        }
+        if (!valid) {
+            // 尝试解析为聚合函数字符串，并添加到 aggs
+            ast::AggType agg_type;
+            std::string agg_col_name;
+            bool is_star;
+            if (parse_agg_string(lhs_col.col_name, agg_type, agg_col_name, is_star)) {
+                AggregateInfo agg;
+                agg.type = agg_type;
+                agg.is_star = is_star;
+                agg.alias = "";
+                if (!is_star) {
+                    agg.col = {.tab_name = "", .col_name = agg_col_name};
+                    agg.col = check_column(all_cols, agg.col);
+                    agg.arg_type = get_col_type(all_cols, agg.col);
+                    if (agg_type == ast::AGG_COUNT) {
+                        agg.arg_type = TYPE_INT;
+                    } else if (agg_type != ast::AGG_COUNT && agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT) {
+                        throw InternalError("failure");
+                    }
+                } else {
+                    agg.col = {.tab_name = "", .col_name = ""};
+                    agg.arg_type = TYPE_INT;
+                }
+                agg.in_output = false;  // HAVING 中的聚合不出现在输出中
+                aggs.push_back(agg);
+                valid = true;
+            }
+        }
+        if (!valid) {
+            throw InternalError("failure");
+        }
+    }
 }

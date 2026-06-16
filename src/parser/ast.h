@@ -36,6 +36,10 @@ enum SetKnobType {
     EnableNestLoop, EnableSortMerge
 };
 
+enum AggType {
+    AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG
+};
+
 // Base class for tree nodes
 struct TreeNode {
     virtual ~TreeNode() = default;  // enable polymorphism
@@ -151,11 +155,33 @@ struct BoolLit : public Value {
 struct Col : public Expr {
     std::string tab_name;
     std::string col_name;
-    int agg_type = 0;        // 题10：0=无 1=COUNT 2=MAX 3=MIN 4=SUM
+    int agg_type = 0;        // 题10：0=无 1=COUNT 2=MAX 3=MIN 4=SUM（简单聚合快路径）
     std::string alias;       // 题10：AS 别名
 
     Col(std::string tab_name_, std::string col_name_) :
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
+};
+
+struct AggExpr : public Expr {
+    AggType agg_type;
+    std::shared_ptr<Col> col;
+    std::string alias;
+    bool is_star;
+    AggExpr(AggType t, std::shared_ptr<Col> c, std::string a, bool star = false)
+        : agg_type(t), col(std::move(c)), alias(std::move(a)), is_star(star) {}
+
+    std::string to_string() const {
+        std::string name;
+        switch (agg_type) {
+            case AGG_COUNT: name = "count"; break;
+            case AGG_MAX:   name = "max"; break;
+            case AGG_MIN:   name = "min"; break;
+            case AGG_SUM:   name = "sum"; break;
+            case AGG_AVG:   name = "avg"; break;
+        }
+        name += "(" + (is_star ? std::string("*") : (col ? col->col_name : "")) + ")";
+        return name;
+    }
 };
 
 struct SetClause : public TreeNode {
@@ -230,6 +256,11 @@ struct JoinExpr : public TreeNode {
             left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)), type(type_) {}
 };
 
+struct TableListInfo {
+    std::vector<std::string> tabs;
+    std::vector<std::shared_ptr<BinaryExpr>> join_conds;
+};
+
 // 题4：FROM 子句里的一个表引用，带可选别名（如 customers c）
 struct JoinTableRef {
     std::string tab_name;   // 真实表名
@@ -244,6 +275,7 @@ struct FromClause : public TreeNode {
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Col>> cols;
+    std::vector<std::shared_ptr<AggExpr>> aggs;
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
@@ -252,10 +284,15 @@ struct SelectStmt : public TreeNode {
     std::vector<std::string> aliases;
     bool is_explain = false;
 
-    bool has_sort;
-    std::shared_ptr<OrderBy> order;
-    int limit = -1;
+    std::vector<std::shared_ptr<Col>> group_by_cols;
+    std::vector<std::shared_ptr<BinaryExpr>> having_conds;
 
+    bool has_sort;
+    std::shared_ptr<OrderBy> order;                      // 单 ORDER BY（题4/题10 兼容）
+    std::vector<std::shared_ptr<OrderBy>> orders;        // 多 ORDER BY（题5/p7）
+    int limit = -1;
+    bool has_limit = false;
+    int limit_count = 0;
 
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
                std::vector<std::string> tabs_,
@@ -264,7 +301,51 @@ struct SelectStmt : public TreeNode {
             cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
             order(std::move(order_)) {
                 has_sort = (bool)order;
+                if (order) orders = {order};
             }
+
+    SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
+               std::vector<std::shared_ptr<AggExpr>> aggs_,
+               std::vector<std::string> tabs_,
+               std::vector<std::shared_ptr<BinaryExpr>> conds_,
+               std::vector<std::shared_ptr<Col>> group_by_cols_,
+               std::vector<std::shared_ptr<BinaryExpr>> having_conds_,
+               std::vector<std::shared_ptr<OrderBy>> orders_,
+               bool has_limit_,
+               int limit_count_) :
+            cols(std::move(cols_)), aggs(std::move(aggs_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+            group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
+            orders(std::move(orders_)), has_limit(has_limit_), limit_count(limit_count_) {
+                has_sort = !orders.empty();
+                if (!orders.empty()) order = orders[0];
+            }
+};
+
+struct ExplainStmt : public TreeNode {
+    std::shared_ptr<SelectStmt> select;
+    bool analyze;
+
+    ExplainStmt(std::shared_ptr<SelectStmt> select_, bool analyze_)
+        : select(std::move(select_)), analyze(analyze_) {}
+};
+
+struct UnionStmt : public TreeNode {
+    std::vector<std::shared_ptr<SelectStmt>> selects;
+    std::string alias;
+    std::vector<std::shared_ptr<OrderBy>> orders;
+    bool has_limit;
+    int limit_count;
+
+    UnionStmt(std::vector<std::shared_ptr<SelectStmt>> selects_,
+              std::string alias_,
+              std::vector<std::shared_ptr<OrderBy>> orders_,
+              bool has_limit_,
+              int limit_count_)
+        : selects(std::move(selects_)),
+          alias(std::move(alias_)),
+          orders(std::move(orders_)),
+          has_limit(has_limit_),
+          limit_count(limit_count_) {}
 };
 
 // set enable_nestloop
@@ -284,10 +365,12 @@ struct SemValue {
     bool sv_bool;
     OrderByDir sv_orderby_dir;
     std::vector<std::string> sv_strs;
+    std::shared_ptr<TableListInfo> sv_table_list;
 
     std::shared_ptr<TreeNode> sv_node;
+    std::shared_ptr<SelectStmt> sv_select;
+    std::vector<std::shared_ptr<SelectStmt>> sv_selects;
 
-    // 题4：FROM 子句的单个表引用（表名+可选别名）
     JoinTableRef sv_table_ref;
 
     SvCompOp sv_comp_op;
@@ -305,6 +388,9 @@ struct SemValue {
     std::shared_ptr<Col> sv_col;
     std::vector<std::shared_ptr<Col>> sv_cols;
 
+    std::shared_ptr<AggExpr> sv_agg_expr;
+    std::vector<std::shared_ptr<AggExpr>> sv_agg_exprs;
+
     std::shared_ptr<SetClause> sv_set_clause;
     std::vector<std::shared_ptr<SetClause>> sv_set_clauses;
 
@@ -312,6 +398,7 @@ struct SemValue {
     std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
 
     std::shared_ptr<OrderBy> sv_orderby;
+    std::vector<std::shared_ptr<OrderBy>> sv_orderbys;
 
     SetKnobType sv_setKnobType;
 };

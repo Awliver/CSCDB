@@ -79,7 +79,11 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "MAX" { return MAX; }
 "MIN" { return MIN; }
 "SUM" { return SUM; }
+"AVG" { return AVG; }
 "AS" { return AS; }
+"GROUP" { return GROUP; }
+"HAVING" { return HAVING; }
+"UNION" { return UNION; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }

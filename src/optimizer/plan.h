@@ -16,8 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 #include "parser/ast.h"
-
 #include "parser/parser.h"
+#include "analyze/analyze.h"
 
 typedef enum PlanTag{
     T_Invalid = 1,
@@ -34,6 +34,7 @@ typedef enum PlanTag{
     T_Update,
     T_Delete,
     T_select,
+    T_Explain,
     T_Transaction_begin,
     T_Transaction_commit,
     T_Transaction_abort,
@@ -41,9 +42,13 @@ typedef enum PlanTag{
     T_SeqScan,
     T_IndexScan,
     T_NestLoop,
+    T_IndexNestLoop,
     T_SortMerge,    // sort merge join
     T_Sort,
-    T_Projection
+    T_Projection,
+    T_Aggregation,
+    T_Limit,
+    T_Union
 } PlanTag;
 
 // 查询执行计划
@@ -114,7 +119,6 @@ class ProjectionPlan : public Plan
         ~ProjectionPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> sel_cols_;
-        int limit_ = -1;
         
 };
 
@@ -125,17 +129,87 @@ class SortPlan : public Plan
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
-            sel_col_ = sel_col;
-            is_desc_ = is_desc;
+            sort_cols_.emplace_back(sel_col, is_desc);
+        }
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<std::pair<TabCol, bool>> sort_cols)
+        {
+            Plan::tag = tag;
+            subplan_ = std::move(subplan);
+            sort_cols_ = std::move(sort_cols);
         }
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
-        TabCol sel_col_;
-        bool is_desc_;
+        std::vector<std::pair<TabCol, bool>> sort_cols_;
         
 };
 
+class AggPlan : public Plan
+{
+    public:
+        AggPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> group_cols,
+                std::vector<AggregateInfo> agg_exprs, std::vector<Condition> having_conds,
+                std::vector<ColMeta> output_cols)
+        {
+            Plan::tag = tag;
+            subplan_ = std::move(subplan);
+            group_cols_ = std::move(group_cols);
+            agg_exprs_ = std::move(agg_exprs);
+            having_conds_ = std::move(having_conds);
+            output_cols_ = std::move(output_cols);
+        }
+        ~AggPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        std::vector<TabCol> group_cols_;
+        std::vector<AggregateInfo> agg_exprs_;
+        std::vector<Condition> having_conds_;
+        std::vector<ColMeta> output_cols_;
+};
+
+class LimitPlan : public Plan
+{
+    public:
+        LimitPlan(PlanTag tag, std::shared_ptr<Plan> subplan, size_t limit)
+        {
+            Plan::tag = tag;
+            subplan_ = std::move(subplan);
+            limit_ = limit;
+        }
+        ~LimitPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        size_t limit_;
+};
+
+class UnionPlan : public Plan
+{
+    public:
+        UnionPlan(PlanTag tag, std::vector<std::shared_ptr<Plan>> subplans, std::vector<ColMeta> output_cols)
+        {
+            Plan::tag = tag;
+            subplans_ = std::move(subplans);
+            output_cols_ = std::move(output_cols);
+        }
+        ~UnionPlan(){}
+        std::vector<std::shared_ptr<Plan>> subplans_;
+        std::vector<ColMeta> output_cols_;
+};
+
 // dml语句，包括insert; delete; update; select语句　
+class ExplainPlan : public Plan
+{
+    public:
+        ExplainPlan(std::shared_ptr<Plan> select_plan, std::shared_ptr<Query> query, bool analyze)
+        {
+            Plan::tag = T_Explain;
+            select_plan_ = std::move(select_plan);
+            query_ = std::move(query);
+            analyze_ = analyze;
+        }
+        ~ExplainPlan(){}
+        std::shared_ptr<Plan> select_plan_;
+        std::shared_ptr<Query> query_;
+        bool analyze_;
+};
+
 class DMLPlan : public Plan
 {
     public:

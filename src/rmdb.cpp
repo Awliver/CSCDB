@@ -265,7 +265,8 @@ void *client_handler(void *sock_fd) {
                     pthread_mutex_unlock(buffer_mutex);
                     // 题4：EXPLAIN ANALYZE 走独立路径，构建优化后计划树并输出，不走普通执行
                     if (query->is_explain) {
-                        ql_manager->run_explain(query, context);
+                        auto eq = query->explain_query ? query->explain_query : query;
+                        ql_manager->run_explain(eq, context);
                     } else {
                         // 优化器
                         std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
@@ -321,6 +322,14 @@ void *client_handler(void *sock_fd) {
                     outfile.close();
                 }
             }
+        } else {
+            yy_delete_buffer(buf);
+            finish_analyze = true;
+            pthread_mutex_unlock(buffer_mutex);
+            std::fstream outfile;
+            outfile.open("output.txt", std::ios::out | std::ios::app);
+            outfile << "failure\n";
+            outfile.close();
         }
         if(finish_analyze == false) {
             yy_delete_buffer(buf);

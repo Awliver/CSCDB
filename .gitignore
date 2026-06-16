@@ -52,6 +52,7 @@ output.txt
 .project
 .settings/
 .vs/
+.*
 
 # ============================================
 # OS files

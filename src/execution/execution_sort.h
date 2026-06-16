@@ -18,30 +18,51 @@ See the Mulan PSL v2 for more details. */
 class SortExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> prev_;
-    ColMeta cols_;
-    size_t tuple_num;
-    bool is_desc_;
-    std::vector<size_t> used_tuple;
-    std::unique_ptr<RmRecord> current_tuple;
-
-    // 实现：一次性收集所有 tuple，排序，逐个返回
+    std::vector<std::pair<ColMeta, bool>> sort_cols_;
     std::vector<std::unique_ptr<RmRecord>> buffer_;
     size_t idx_ = 0;
+
+    int compare_single(const char *a, const char *b, const ColMeta &col) {
+        if (col.type == TYPE_INT) {
+            int ia = *reinterpret_cast<const int *>(a);
+            int ib = *reinterpret_cast<const int *>(b);
+            return (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
+        } else if (col.type == TYPE_FLOAT) {
+            float fa = *reinterpret_cast<const float *>(a);
+            float fb = *reinterpret_cast<const float *>(b);
+            return (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
+        } else {
+            return memcmp(a, b, col.len);
+        }
+    }
+
+    int compare_records(const char *a, const char *b) {
+        for (auto &[col, is_desc] : sort_cols_) {
+            int cmp = compare_single(a + col.offset, b + col.offset, col);
+            if (cmp != 0) return is_desc ? -cmp : cmp;
+        }
+        return 0;
+    }
 
    public:
     SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
         prev_ = std::move(prev);
-        // 修复：按列名在子算子输出列中解析排序列。原 get_col_offset 走基类默认实现返回空
-        // ColMeta(offset=0)，导致所有 ORDER BY 都按首列排序（首列恰为排序列时才"碰巧"正确）。
-        const auto &pcols = prev_->cols();
-        auto it = std::find_if(pcols.begin(), pcols.end(), [&](const ColMeta &c) {
-            return c.name == sel_cols.col_name &&
-                   (sel_cols.tab_name.empty() || c.tab_name == sel_cols.tab_name);
-        });
-        cols_ = (it != pcols.end()) ? *it : prev_->get_col_offset(sel_cols);
-        is_desc_ = is_desc;
-        tuple_num = 0;
-        used_tuple.clear();
+        auto &input_cols = prev_->cols();
+        auto it = std::find_if(input_cols.begin(), input_cols.end(),
+            [&](const ColMeta &c) {
+                return c.name == sel_cols.col_name &&
+                       (sel_cols.tab_name.empty() || c.tab_name == sel_cols.tab_name);
+            });
+        if (it == input_cols.end()) throw ColumnNotFoundError(sel_cols.col_name);
+        sort_cols_.emplace_back(*it, is_desc);
+        idx_ = 0;
+    }
+
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev,
+                 const std::vector<std::pair<ColMeta, bool>> &sort_cols) {
+        prev_ = std::move(prev);
+        sort_cols_ = sort_cols;
+        idx_ = 0;
     }
 
     void beginTuple() override {
@@ -50,24 +71,9 @@ class SortExecutor : public AbstractExecutor {
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             buffer_.push_back(prev_->Next());
         }
-        // 按 cols_ 排序
-        std::sort(buffer_.begin(), buffer_.end(),
-            [this](const std::unique_ptr<RmRecord>& a, const std::unique_ptr<RmRecord>& b) {
-                int cmp;
-                const char* pa = a->data + cols_.offset;
-                const char* pb = b->data + cols_.offset;
-                if (cols_.type == TYPE_INT) {
-                    int ia = *reinterpret_cast<const int*>(pa);
-                    int ib = *reinterpret_cast<const int*>(pb);
-                    cmp = (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
-                } else if (cols_.type == TYPE_FLOAT) {
-                    float fa = *reinterpret_cast<const float*>(pa);
-                    float fb = *reinterpret_cast<const float*>(pb);
-                    cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
-                } else {
-                    cmp = memcmp(pa, pb, cols_.len);
-                }
-                return is_desc_ ? cmp > 0 : cmp < 0;
+        std::stable_sort(buffer_.begin(), buffer_.end(),
+            [this](const std::unique_ptr<RmRecord> &a, const std::unique_ptr<RmRecord> &b) {
+                return compare_records(a->data, b->data) < 0;
             });
     }
 
@@ -77,12 +83,11 @@ class SortExecutor : public AbstractExecutor {
 
     std::unique_ptr<RmRecord> Next() override {
         if (idx_ >= buffer_.size()) return nullptr;
-        // 复制返回（多次 Next 可能被调）
         auto rec = std::make_unique<RmRecord>(*buffer_[idx_]);
         return rec;
     }
 
-    const std::vector<ColMeta>& cols() const override { return prev_->cols(); }
+    const std::vector<ColMeta> &cols() const override { return prev_->cols(); }
     size_t tupleLen() const override { return prev_->tupleLen(); }
 
     Rid &rid() override { return _abstract_rid; }
