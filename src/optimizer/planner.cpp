@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "planner.h"
 
+#include <chrono>
+#include <fstream>
 #include <memory>
 
 #include "execution/executor_delete.h"
@@ -21,6 +23,22 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_update.h"
 #include "index/ix.h"
 #include "record_printer.h"
+
+namespace {
+// #region agent log
+inline void debug_log_planner(const char *run_id, const char *hypothesis_id, const std::string &location,
+                              const std::string &message, const std::string &data) {
+    std::ofstream ofs("/home/neo/CSC_DB/db2026/.cursor/debug-b42dcf.log", std::ios::app);
+    if (!ofs.is_open()) return;
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    ofs << "{\"sessionId\":\"b42dcf\",\"runId\":\"" << run_id << "\",\"hypothesisId\":\"" << hypothesis_id
+        << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":\"" << data
+        << "\",\"timestamp\":" << ts << "}\n";
+}
+// #endregion
+}  // namespace
 
 // 最左匹配规则：对表上每条索引按 cols 顺序贪心匹配前缀。
 // 列要么能找到 OP_EQ 条件（继续匹配后续列），要么找到 OP_LT/GT/LE/GE 条件（匹配此列后停止）。
@@ -205,12 +223,7 @@ static bool mvcc_force_seqscan(Context *context, const std::string &tab) {
 std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> query, Context *context)
 {
     std::shared_ptr<Plan> plan = make_one_rel_sql_order(query, context);
-    
-    // 其他物理优化
-
-    // 处理orderby
-    plan = generate_sort_plan(query, std::move(plan)); 
-
+    // ORDER BY 由 generate_select_plan 统一处理（含聚合别名）
     return plan;
 }
 
@@ -473,7 +486,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
         for (auto &agg : query->aggs) {
             if (agg.in_output) {
                 std::string name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
-                sel_cols.push_back({agg.col.tab_name, name});
+                sel_cols.push_back({"", name});
             }
         }
     }
@@ -482,6 +495,10 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     if (!query->orders.empty()) {
         std::vector<std::pair<TabCol, bool>> sort_cols;
         for (auto &order : query->orders) {
+            // #region agent log
+            debug_log_planner("run1", "H3", "planner.cpp:497", "planner sees order",
+                              "tab=" + order.first.tab_name + ",col=" + order.first.col_name);
+            // #endregion
             sort_cols.emplace_back(order.first, order.second == ast::OrderBy_DESC);
         }
         plannerRoot = std::make_shared<SortPlan>(T_Sort, std::move(plannerRoot), sort_cols);

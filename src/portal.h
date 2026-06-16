@@ -82,6 +82,13 @@ class Portal
                             break;
                         } else if (auto l = std::dynamic_pointer_cast<LimitPlan>(cur)) {
                             cur = l->subplan_;
+                        } else if (auto s = std::dynamic_pointer_cast<SortPlan>(cur)) {
+                            cur = s->subplan_;
+                        } else if (auto u = std::dynamic_pointer_cast<UnionPlan>(cur)) {
+                            for (auto &col : u->output_cols_) {
+                                sel_cols.push_back({col.tab_name, col.name});
+                            }
+                            break;
                         } else {
                             break;
                         }

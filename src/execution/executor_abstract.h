@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/common.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include <chrono>
+#include <fstream>
 
 class AbstractExecutor {
    public:
@@ -46,10 +48,23 @@ class AbstractExecutor {
 
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta> &rec_cols, const TabCol &target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta &col) {
-            return col.tab_name == target.tab_name && col.name == target.col_name;
+            return col.name == target.col_name &&
+                   (target.tab_name.empty() || col.tab_name == target.tab_name);
         });
         if (pos == rec_cols.end()) {
-            throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
+            // #region agent log
+            std::ofstream ofs("/home/neo/CSC_DB/db2026/.cursor/debug-b42dcf.log", std::ios::app);
+            if (ofs.is_open()) {
+                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                ofs << "{\"sessionId\":\"b42dcf\",\"runId\":\"run1\",\"hypothesisId\":\"H4\",\"location\":"
+                    << "\"executor_abstract.h:54\",\"message\":\"get_col not found\",\"data\":\"target_tab="
+                    << target.tab_name << ",target_col=" << target.col_name << "\",\"timestamp\":" << ts
+                    << "}\n";
+            }
+            // #endregion
+            throw ColumnNotFoundError(target.col_name);
         }
         return pos;
     }

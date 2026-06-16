@@ -108,6 +108,11 @@ private:
                              std::vector<AggregateInfo> &aggs,
                              const std::vector<ColMeta> &all_cols);
     void check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds);
+    TabCol resolve_order_column(TabCol order_col,
+                                const std::vector<TabCol> &sel_cols,
+                                const std::vector<TabCol> &group_by_cols,
+                                const std::vector<AggregateInfo> &aggs,
+                                const std::vector<ColMeta> &all_cols);
     std::vector<ColMeta> infer_select_output_cols(const std::shared_ptr<Query> &query);
     ColMeta promote_union_col(const ColMeta &base, const ColMeta &incoming);
 };

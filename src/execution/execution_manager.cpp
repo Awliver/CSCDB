@@ -27,6 +27,24 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 #include "explain_plan.h"
 #include "parser/ast.h"
+#include <chrono>
+#include <fstream>
+
+namespace {
+// #region agent log
+inline void debug_log_exec(const char *run_id, const char *hypothesis_id, const std::string &location,
+                           const std::string &message, const std::string &data) {
+    std::ofstream ofs("/home/neo/CSC_DB/db2026/.cursor/debug-b42dcf.log", std::ios::app);
+    if (!ofs.is_open()) return;
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    ofs << "{\"sessionId\":\"b42dcf\",\"runId\":\"" << run_id << "\",\"hypothesisId\":\"" << hypothesis_id
+        << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":\"" << data
+        << "\",\"timestamp\":" << ts << "}\n";
+}
+// #endregion
+}  // namespace
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -428,9 +446,21 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     for (auto &sel_col : sel_cols) {
         captions.push_back(sel_col.col_name);
     }
+    // Union / 部分聚合路径无 ProjectionPlan，从执行器输出列推断表头
+    if (captions.empty()) {
+        for (auto &col : executorTreeRoot->cols()) {
+            captions.push_back(col.name);
+        }
+    }
+    // #region agent log
+    debug_log_exec("run2", "H8", "execution_manager.cpp:455", "select_from header size",
+                   "sel_cols=" + std::to_string(sel_cols.size()) + ",exec_cols=" +
+                       std::to_string(executorTreeRoot->cols().size()) + ",captions=" +
+                       std::to_string(captions.size()));
+    // #endregion
 
     // Print header into buffer
-    RecordPrinter rec_printer(sel_cols.size());
+    RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
