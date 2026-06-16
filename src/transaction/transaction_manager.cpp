@@ -13,28 +13,10 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 #include <algorithm>
-#include <chrono>
 #include <cstring>
-#include <fstream>
 #include <limits>
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
-
-namespace {
-// #region agent log
-inline void debug_log_txn(const char *run_id, const char *hypothesis_id, const std::string &location,
-                          const std::string &message, const std::string &data) {
-    std::ofstream ofs("/home/neo/CSC_DB/db2026/.cursor/debug-b42dcf.log", std::ios::app);
-    if (!ofs.is_open()) return;
-    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-    ofs << "{\"sessionId\":\"b42dcf\",\"runId\":\"" << run_id << "\",\"hypothesisId\":\"" << hypothesis_id
-        << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":\"" << data
-        << "\",\"timestamp\":" << ts << "}\n";
-}
-// #endregion
-}
 
 /**
  * @description: 事务的开始方法。空指针代表创建新事务。
@@ -53,13 +35,6 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         std::scoped_lock<std::mutex> lck(mvcc_latch_);
         active_rts_.insert(txn->get_read_ts());
     }
-    // #region agent log
-    debug_log_txn("run-si-2", "H1", "transaction_manager.cpp:begin", "txn snapshot assigned",
-                  "txn=" + std::to_string(txn->get_transaction_id()) +
-                  ",read_ts=" + std::to_string(txn->get_read_ts()) +
-                  ",start_ts=" + std::to_string(txn->get_start_ts()) +
-                  ",txn_mode=" + std::to_string((int)txn->get_txn_mode()));
-    // #endregion
     txn_map[txn->get_transaction_id()] = txn;
     return txn;
 }
@@ -224,25 +199,10 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     MvccChain &ch = mvcc_store_[tab][mvcc_key(rid)];
     // 写写冲突检测
     if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) {
-        // #region agent log
-        debug_log_txn("run-si-2", "H2", "transaction_manager.cpp:mvcc_write",
-                      "reject due to active writer",
-                      "txn=" + std::to_string(txn->get_transaction_id()) +
-                      ",rid=" + std::to_string(rid.page_no) + ":" + std::to_string(rid.slot_no) +
-                      ",holder=" + std::to_string(ch.writer));
-        // #endregion
         return false;   // 另一未提交事务正持有该记录
     }
     if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         ch.hist.back().commit_ts > txn->get_read_ts()) {
-        // #region agent log
-        debug_log_txn("run-si-2", "H3", "transaction_manager.cpp:mvcc_write",
-                      "reject due to stale snapshot",
-                      "txn=" + std::to_string(txn->get_transaction_id()) +
-                      ",rid=" + std::to_string(rid.page_no) + ":" + std::to_string(rid.slot_no) +
-                      ",last_commit=" + std::to_string(ch.hist.back().commit_ts) +
-                      ",read_ts=" + std::to_string(txn->get_read_ts()));
-        // #endregion
         return false;   // 该记录在本事务快照之后已被其他事务提交修改
     }
     bool first_touch = (ch.writer != txn->get_transaction_id());
@@ -401,23 +361,9 @@ bool TransactionManager::ser_add_edge(txn_id_t reader, txn_id_t writer) {
     W.in_rw.insert(reader);
     R.out_rw.insert(writer);
     for (txn_id_t y : W.out_rw) if (ser_dangerous(reader, writer, y)) {
-        // #region agent log
-        debug_log_txn("run-si-2", "H4", "transaction_manager.cpp:ser_add_edge",
-                      "dangerous structure writer pivot",
-                      "reader=" + std::to_string(reader) +
-                      ",pivot=" + std::to_string(writer) +
-                      ",tout=" + std::to_string(y));
-        // #endregion
         return true;
     }  // writer 为 pivot
     for (txn_id_t x : R.in_rw)  if (ser_dangerous(x, reader, writer)) {
-        // #region agent log
-        debug_log_txn("run-si-2", "H4", "transaction_manager.cpp:ser_add_edge",
-                      "dangerous structure reader pivot",
-                      "tin=" + std::to_string(x) +
-                      ",pivot=" + std::to_string(reader) +
-                      ",writer=" + std::to_string(writer));
-        // #endregion
         return true;
     }  // reader 为 pivot
     return false;

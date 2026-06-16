@@ -11,24 +11,6 @@ See the Mulan PSL v2 for more details. */
 #include "analyze.h"
 
 #include <algorithm>
-#include <chrono>
-#include <fstream>
-
-namespace {
-// #region agent log
-inline void debug_log_analyze(const char *run_id, const char *hypothesis_id, const std::string &location,
-                              const std::string &message, const std::string &data) {
-    std::ofstream ofs("/home/neo/CSC_DB/db2026/.cursor/debug-b42dcf.log", std::ios::app);
-    if (!ofs.is_open()) return;
-    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-    ofs << "{\"sessionId\":\"b42dcf\",\"runId\":\"" << run_id << "\",\"hypothesisId\":\"" << hypothesis_id
-        << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":\"" << data
-        << "\",\"timestamp\":" << ts << "}\n";
-}
-// #endregion
-}  // namespace
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
@@ -192,34 +174,18 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         if (!x->orders.empty()) {
             for (auto &sv_order : x->orders) {
                 TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
-                // #region agent log
-                debug_log_analyze("run1", "H1", "analyze.cpp:194", "incoming order by",
-                                  "tab=" + order_col.tab_name + ",col=" + order_col.col_name);
-                // #endregion
                 if (!order_col.tab_name.empty() && query->alias2real.count(order_col.tab_name))
                     order_col.tab_name = query->alias2real[order_col.tab_name];
                 order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
                                                  query->aggs, all_cols);
-                // #region agent log
-                debug_log_analyze("run1", "H2", "analyze.cpp:201", "resolved order by",
-                                  "tab=" + order_col.tab_name + ",col=" + order_col.col_name);
-                // #endregion
                 query->orders.emplace_back(order_col, sv_order->orderby_dir);
             }
         } else if (x->order) {
             TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
-            // #region agent log
-            debug_log_analyze("run1", "H1", "analyze.cpp:208", "incoming single order by",
-                              "tab=" + order_col.tab_name + ",col=" + order_col.col_name);
-            // #endregion
             if (!order_col.tab_name.empty() && query->alias2real.count(order_col.tab_name))
                 order_col.tab_name = query->alias2real[order_col.tab_name];
             order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
                                              query->aggs, all_cols);
-            // #region agent log
-            debug_log_analyze("run1", "H2", "analyze.cpp:215", "resolved single order by",
-                              "tab=" + order_col.tab_name + ",col=" + order_col.col_name);
-            // #endregion
             query->orders.emplace_back(order_col, x->order->orderby_dir);
         }
 
@@ -442,20 +408,12 @@ TabCol Analyze::resolve_order_column(TabCol order_col,
                                      const std::vector<TabCol> &group_by_cols,
                                      const std::vector<AggregateInfo> &aggs,
                                      const std::vector<ColMeta> &all_cols) {
-    // #region agent log
-    debug_log_analyze("run1", "H2", "analyze.cpp:438", "resolve_order_column entry",
-                      "tab=" + order_col.tab_name + ",col=" + order_col.col_name);
-    // #endregion
     for (auto &agg : aggs) {
         std::string name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
         if (order_col.col_name == name) {
             TabCol resolved;
             resolved.tab_name = "";
             resolved.col_name = name;
-            // #region agent log
-            debug_log_analyze("run1", "H2", "analyze.cpp:447", "resolve by aggregate alias",
-                              "alias=" + name);
-            // #endregion
             return resolved;
         }
     }

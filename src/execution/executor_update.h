@@ -9,8 +9,6 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
-#include <fstream>
-#include <chrono>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -72,22 +70,6 @@ class UpdateExecutor : public AbstractExecutor {
             memcpy(dest_field, set.rhs.raw->data, col.len);
             return;
         }
-        // #region agent log
-        {
-            std::ofstream ofs("/home/neo/CSC_DB/db2026/.cursor/debug-b42dcf.log", std::ios::app);
-            if (ofs.is_open()) {
-                const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                ofs << "{\"sessionId\":\"b42dcf\",\"runId\":\"run-si-2\",\"hypothesisId\":\"H5\","
-                    << "\"location\":\"executor_update.h:apply_set_value\","
-                    << "\"message\":\"arith update applied\","
-                    << "\"data\":\"lhs=" << set.lhs.col_name << ",rhs_col=" << set.rhs_col
-                    << ",rhs_int=" << set.rhs.int_val << ",neg=" << (set.arith_neg ? 1 : 0) << "\","
-                    << "\"timestamp\":" << ts << "}\n";
-            }
-        }
-        // #endregion
         int base = 0;
         auto rcol = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                  [&](const ColMeta &c) { return c.name == set.rhs_col; });
