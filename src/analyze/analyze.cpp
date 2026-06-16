@@ -312,7 +312,6 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             if (col.type != v.type) {
                 throw IncompatibleTypeError(coltype2str(col.type), coltype2str(v.type));
             }
-            v.init_raw(col.len);
             query->values.push_back(v);
         }
     } else {
