@@ -18,9 +18,15 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "index/ix.h"
+#include <algorithm>
+#include <map>
+#include <set>
+#include <sstream>
+
 #include "record_printer.h"
 #include "analyze/analyze.h"
 #include "explain_plan.h"
+#include "parser/ast.h"
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -148,7 +154,263 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             break;
         }
         }
+    } else if (auto x = std::dynamic_pointer_cast<ExplainPlan>(plan)) {
+        explain_query_plan(x, context);
     }
+}
+
+namespace {
+
+bool plan_has_join(const std::shared_ptr<Plan> &plan) {
+    if (!plan) return false;
+    if (std::dynamic_pointer_cast<JoinPlan>(plan)) return true;
+    if (auto p = std::dynamic_pointer_cast<ProjectionPlan>(plan)) return plan_has_join(p->subplan_);
+    if (auto s = std::dynamic_pointer_cast<SortPlan>(plan)) return plan_has_join(s->subplan_);
+    if (auto l = std::dynamic_pointer_cast<LimitPlan>(plan)) return plan_has_join(l->subplan_);
+    if (auto a = std::dynamic_pointer_cast<AggPlan>(plan)) return plan_has_join(a->subplan_);
+    return false;
+}
+
+std::string join_op_to_string(CompOp op) {
+    switch (op) {
+        case OP_EQ: return "=";
+        case OP_NE: return "<>";
+        case OP_LT: return "<";
+        case OP_GT: return ">";
+        case OP_LE: return "<=";
+        case OP_GE: return ">=";
+    }
+    return "";
+}
+
+std::string join_strings_sorted(std::vector<std::string> values) {
+    std::sort(values.begin(), values.end());
+    std::ostringstream os;
+    for (size_t i = 0; i < values.size(); i++) {
+        if (i) os << ", ";
+        os << values[i];
+    }
+    return os.str();
+}
+
+std::string cond_to_string(const Condition &cond) {
+    return cond.lhs_col.tab_name + "." + cond.lhs_col.col_name + join_op_to_string(cond.op) +
+           cond.rhs_col.tab_name + "." + cond.rhs_col.col_name;
+}
+
+size_t count_scan_rows(SmManager *sm_manager, const ScanPlan &scan) {
+    size_t count = 0;
+    SeqScanExecutor exec(sm_manager, scan.tab_name_, scan.conds_, nullptr);
+    for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) count++;
+    return count;
+}
+
+bool eval_explain_cond(const Condition &cond, const std::vector<ColMeta> &cols, const char *data) {
+    auto lhs_it = std::find_if(cols.begin(), cols.end(), [&](const ColMeta &c) {
+        return c.name == cond.lhs_col.col_name &&
+               (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
+    });
+    if (lhs_it == cols.end()) return false;
+    const char *lhs = data + lhs_it->offset;
+    const char *rhs = nullptr;
+    if (cond.is_rhs_val) {
+        rhs = cond.rhs_val.raw->data;
+    } else {
+        auto rhs_it = std::find_if(cols.begin(), cols.end(), [&](const ColMeta &c) {
+            return c.name == cond.rhs_col.col_name &&
+                   (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
+        });
+        if (rhs_it == cols.end()) return false;
+        rhs = data + rhs_it->offset;
+    }
+    return SeqScanExecutor::compare_value(lhs, rhs, lhs_it->len, lhs_it->type, cond.op);
+}
+
+void collect_plan_tables_conds(const std::shared_ptr<Plan> &plan, std::vector<std::string> &tables,
+                               std::vector<Condition> &conds) {
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        tables.push_back(scan->tab_name_);
+        conds.insert(conds.end(), scan->conds_.begin(), scan->conds_.end());
+    } else if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        collect_plan_tables_conds(join->left_, tables, conds);
+        collect_plan_tables_conds(join->right_, tables, conds);
+        conds.insert(conds.end(), join->conds_.begin(), join->conds_.end());
+    } else if (auto proj = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        collect_plan_tables_conds(proj->subplan_, tables, conds);
+    } else if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        collect_plan_tables_conds(sort->subplan_, tables, conds);
+    } else if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        collect_plan_tables_conds(limit->subplan_, tables, conds);
+    }
+}
+
+size_t product_count_rec(SmManager *sm_manager, const std::vector<std::string> &tables, size_t idx,
+                         const std::vector<Condition> &conds, std::vector<char> &buf,
+                         std::vector<ColMeta> &cols, size_t len) {
+    if (idx == tables.size()) {
+        for (auto &cond : conds) {
+            if (!eval_explain_cond(cond, cols, buf.data())) return 0;
+        }
+        return 1;
+    }
+    const std::string &tab_name = tables[idx];
+    auto fh = sm_manager->fhs_.at(tab_name).get();
+    auto &tab = sm_manager->db_.get_table(tab_name);
+    size_t tuple_len = tab.cols.back().offset + tab.cols.back().len;
+    size_t saved_cols = cols.size();
+    size_t count = 0;
+    for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+        auto rec = fh->get_record(scan.rid(), nullptr);
+        buf.resize(len + tuple_len);
+        memcpy(buf.data() + len, rec->data, tuple_len);
+        cols.resize(saved_cols);
+        for (auto col : tab.cols) {
+            col.offset += len;
+            cols.push_back(col);
+        }
+        count += product_count_rec(sm_manager, tables, idx + 1, conds, buf, cols, len + tuple_len);
+    }
+    cols.resize(saved_cols);
+    buf.resize(len);
+    return count;
+}
+
+size_t count_plan_output(SmManager *sm_manager, const std::shared_ptr<Plan> &plan) {
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) return count_scan_rows(sm_manager, *scan);
+    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        std::vector<std::string> tables;
+        std::vector<Condition> conds;
+        collect_plan_tables_conds(plan, tables, conds);
+        std::vector<char> buf;
+        std::vector<ColMeta> cols;
+        return product_count_rec(sm_manager, tables, 0, conds, buf, cols, 0);
+    }
+    if (auto proj = std::dynamic_pointer_cast<ProjectionPlan>(plan)) return count_plan_output(sm_manager, proj->subplan_);
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) return count_plan_output(sm_manager, sort->subplan_);
+    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        return std::min(limit->limit_, count_plan_output(sm_manager, limit->subplan_));
+    }
+    return 0;
+}
+
+std::set<std::string> plan_table_set(const std::shared_ptr<Plan> &plan) {
+    std::vector<std::string> tables;
+    std::vector<Condition> conds;
+    collect_plan_tables_conds(plan, tables, conds);
+    return std::set<std::string>(tables.begin(), tables.end());
+}
+
+void collect_required_cols(const std::shared_ptr<Query> &query, std::map<std::string, std::set<std::string>> &required) {
+    for (auto &col : query->cols) required[col.tab_name].insert(col.col_name);
+    for (auto &cond : query->conds) {
+        required[cond.lhs_col.tab_name].insert(cond.lhs_col.col_name);
+        if (!cond.is_rhs_val) required[cond.rhs_col.tab_name].insert(cond.rhs_col.col_name);
+    }
+}
+
+std::vector<std::string> sorted_project_cols_for_scan(SmManager *sm_manager, const std::string &tab_name,
+                                                      const std::map<std::string, std::set<std::string>> &required) {
+    std::vector<std::string> cols;
+    auto it = required.find(tab_name);
+    if (it != required.end() && !it->second.empty()) {
+        for (auto &name : it->second) cols.push_back(tab_name + "." + name);
+    } else {
+        for (auto &col : sm_manager->db_.get_table(tab_name).cols) cols.push_back(tab_name + "." + col.name);
+    }
+    std::sort(cols.begin(), cols.end());
+    return cols;
+}
+
+void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &plan,
+                         const std::map<std::string, std::set<std::string>> &required,
+                         int depth, size_t outer_rows, long long forced_rows,
+                         std::vector<std::string> &lines) {
+    if (auto proj = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        render_explain_plan(sm_manager, proj->subplan_, required, depth, outer_rows, forced_rows, lines);
+        return;
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        render_explain_plan(sm_manager, sort->subplan_, required, depth, outer_rows, forced_rows, lines);
+        return;
+    }
+    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        render_explain_plan(sm_manager, limit->subplan_, required, depth, outer_rows, forced_rows, lines);
+        return;
+    }
+    std::string indent(depth, '\t');
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        size_t rows = forced_rows >= 0 ? static_cast<size_t>(forced_rows) : count_scan_rows(sm_manager, *scan) * outer_rows;
+        auto proj_cols = sorted_project_cols_for_scan(sm_manager, scan->tab_name_, required);
+        lines.push_back(indent + "Project(columns=[" + join_strings_sorted(proj_cols) + "], rows=" + std::to_string(rows) + ")");
+        std::string scan_line = std::string(depth + 1, '\t') + "Scan(table=" + scan->tab_name_ + ", type=" +
+                                (scan->tag == T_IndexScan ? "IndexScan" : "SeqScan");
+        if (scan->tag == T_IndexScan && !scan->index_col_names_.empty()) {
+            scan_line += ", using_index=(" + join_strings_sorted(scan->index_col_names_) + ")";
+        }
+        scan_line += ", rows=" + std::to_string(rows) + ")";
+        lines.push_back(scan_line);
+        return;
+    }
+    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        size_t left_rows = count_plan_output(sm_manager, join->left_);
+        size_t join_rows = count_plan_output(sm_manager, plan);
+        auto tables = plan_table_set(plan);
+        std::vector<std::string> table_names(tables.begin(), tables.end());
+        std::vector<std::string> conds;
+        for (auto &cond : join->conds_) conds.push_back(cond_to_string(cond));
+        lines.push_back(indent + "Join(tables=[" + join_strings_sorted(table_names) + "], condition=[" +
+                        join_strings_sorted(conds) + "], rows=" + std::to_string(join_rows) + ")");
+        render_explain_plan(sm_manager, join->left_, required, depth + 1, 1, -1, lines);
+        bool inlj = join->tag == T_IndexNestLoop;
+        render_explain_plan(sm_manager, join->right_, required, depth + 1, left_rows,
+                            inlj ? static_cast<long long>(join_rows) : -1, lines);
+    }
+}
+
+}  // namespace
+
+void QlManager::explain_query_plan(std::shared_ptr<ExplainPlan> plan, Context *context) {
+    bool has_user_alias = false;
+    for (auto &kv : plan->query_->real2alias) {
+        if (kv.first != kv.second) {
+            has_user_alias = true;
+            break;
+        }
+    }
+    if (!plan_has_join(plan->select_plan_) || has_user_alias) {
+        run_explain(plan->query_, context);
+        return;
+    }
+
+    std::map<std::string, std::set<std::string>> required;
+    collect_required_cols(plan->query_, required);
+    size_t rows = count_plan_output(sm_manager_, plan->select_plan_);
+
+    auto select_ast = std::dynamic_pointer_cast<ast::SelectStmt>(plan->query_->parse);
+    std::vector<std::string> root_cols;
+    if (select_ast != nullptr && select_ast->cols.empty() && select_ast->aggs.empty()) {
+        root_cols.push_back("*");
+    } else {
+        for (auto &col : plan->query_->cols) root_cols.push_back(col.tab_name + "." + col.col_name);
+    }
+
+    std::vector<std::string> lines;
+    lines.push_back("Project(columns=[" + join_strings_sorted(root_cols) + "], rows=" + std::to_string(rows) + ")");
+    render_explain_plan(sm_manager_, plan->select_plan_, required, 1, 1, -1, lines);
+
+    std::ostringstream os;
+    for (auto &line : lines) os << line << "\n";
+    std::string out = os.str();
+    if (context->data_send_ && context->offset_) {
+        memcpy(context->data_send_ + *(context->offset_), out.c_str(), out.size());
+        *(context->offset_) += (int)out.size();
+        context->data_send_[*(context->offset_)] = '\0';
+    }
+
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << out;
+    outfile.close();
 }
 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
