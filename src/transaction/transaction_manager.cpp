@@ -61,9 +61,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             auto wit = active_rts_.find(txn->get_read_ts());
             if (wit != active_rts_.end()) active_rts_.erase(wit);
         }
-        // 题10: mvcc chain GC 前置水位(本事务已从 active_rts_ 注销)
-        timestamp_t gc_min_rts = active_rts_.empty()
-            ? std::numeric_limits<timestamp_t>::max() : *active_rts_.begin();
         for (auto *wr : *write_set) {
             auto tit = mvcc_store_.find(wr->GetTableName());
             if (tit == mvcc_store_.end()) continue;
@@ -79,13 +76,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
                 ch.hist.push_back(std::move(v));
                 ch.writer = INVALID_TXN_ID;
                 ch.writer_data.clear();
-                // 题10: 链级水位 GC——终版即堆内容(insert/update 均已写堆)、
-                // 无早于本提交的活跃快照、非删除终版 → 链可整体清除;
-                // mvcc_read 对缺链记录天然回退堆字节(语义不变)。
-                // 删除终版的链保留(堆行仍在,可见性依赖墓碑)。
-                if (cts <= gc_min_rts && !ch.hist.back().is_deleted) {
-                    tit->second.erase(cit);
-                }
             }
         }
         for (auto *wr : *write_set) delete wr;
@@ -330,19 +320,6 @@ void TransactionManager::ser_record_pred(Transaction *txn, const std::string &ta
 }
 
 void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts) {
-    // 题10:水位 GC——已提交且早于所有活跃事务快照、且无 rw 边的 SerInfo 不可能再
-    // 参与危险结构,安全清除(否则巨大数据下 ser_write_check 随历史线性膨胀致二次方)
-    timestamp_t min_rts = active_rts_.empty()
-        ? std::numeric_limits<timestamp_t>::max() : *active_rts_.begin();
-    for (auto pit = ser_.begin(); pit != ser_.end();) {
-        const SerInfo &si = pit->second;
-        if (pit->first != id && si.committed && si.commit_ts <= min_rts &&
-            si.in_rw.empty() && si.out_rw.empty()) {
-            pit = ser_.erase(pit);
-        } else {
-            ++pit;
-        }
-    }
     auto it = ser_.find(id);
     if (it == ser_.end()) return;
     if (committed) {
