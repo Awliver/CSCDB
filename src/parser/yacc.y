@@ -446,6 +446,21 @@ setClause:
     {
         $$ = std::make_shared<SetClause>($1, $3);
     }
+    |   colName '=' colName value
+    {
+        /* 题9：算术增量 v=v+1（词法把 +1/-1 归并为带符号 VALUE_INT，无空格情形） */
+        $$ = std::make_shared<SetClause>($1, $3, $4, false);
+    }
+    |   colName '=' colName '+' value
+    {
+        /* 带空格加号 v = v + 1 */
+        $$ = std::make_shared<SetClause>($1, $3, $5, false);
+    }
+    |   colName '=' colName '-' value
+    {
+        /* 带空格减号 v = v - 1：字面量为正、置 neg 取负 */
+        $$ = std::make_shared<SetClause>($1, $3, $5, true);
+    }
     ;
 
 
