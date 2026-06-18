@@ -127,7 +127,9 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 agg.col = check_column(all_cols, agg.col);
                 agg.arg_type = get_col_type(all_cols, agg.col);
                 if (sv_agg->agg_type != ast::AGG_COUNT &&
-                    agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT) {
+                    agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT &&
+                    !((sv_agg->agg_type == ast::AGG_MIN || sv_agg->agg_type == ast::AGG_MAX) &&
+                      agg.arg_type == TYPE_STRING)) {
                     throw InternalError("failure");
                 }
             } else {
@@ -631,7 +633,10 @@ void Analyze::check_having_clause(const std::vector<std::shared_ptr<ast::BinaryE
                     agg.arg_type = get_col_type(all_cols, agg.col);
                     if (agg_type == ast::AGG_COUNT) {
                         agg.arg_type = TYPE_INT;
-                    } else if (agg_type != ast::AGG_COUNT && agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT) {
+                    } else if (agg_type != ast::AGG_COUNT && agg.arg_type != TYPE_INT &&
+                               agg.arg_type != TYPE_FLOAT &&
+                               !((agg_type == ast::AGG_MIN || agg_type == ast::AGG_MAX) &&
+                                 agg.arg_type == TYPE_STRING)) {
                         throw InternalError("failure");
                     }
                 } else {

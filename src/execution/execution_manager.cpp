@@ -25,8 +25,11 @@ See the Mulan PSL v2 for more details. */
 
 #include "record_printer.h"
 #include "analyze/analyze.h"
+#include "common/output_control.h"
 #include "explain_plan.h"
 #include "parser/ast.h"
+#include "recovery/log_manager.h"
+#include <fstream>
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -407,10 +410,7 @@ void QlManager::explain_query_plan(std::shared_ptr<ExplainPlan> plan, Context *c
         context->data_send_[*(context->offset_)] = '\0';
     }
 
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << out;
-    outfile.close();
+    append_output_file(out);
 }
 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
@@ -442,12 +442,14 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_separator(context);
     // print header into file（框架原始紧凑格式：output.txt 与客户端带框输出是两种格式）
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for(size_t i = 0; i < captions.size(); ++i) {
-        outfile << " " << captions[i] << " |";
+    if (output_file_enabled()) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for(size_t i = 0; i < captions.size(); ++i) {
+            outfile << " " << captions[i] << " |";
+        }
+        outfile << "\n";
     }
-    outfile << "\n";
 
     // Print records
     size_t num_rec = 0;
@@ -472,14 +474,16 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         // print record into buffer
         rec_printer.print_record(columns, context);
         // print record into file
-        outfile << "|";
-        for(size_t i = 0; i < columns.size(); ++i) {
-            outfile << " " << columns[i] << " |";
+        if (outfile.is_open()) {
+            outfile << "|";
+            for(size_t i = 0; i < columns.size(); ++i) {
+                outfile << " " << columns[i] << " |";
+            }
+            outfile << "\n";
         }
-        outfile << "\n";
         num_rec++;
     }
-    outfile.close();
+    if (outfile.is_open()) outfile.close();
     // Print footer + record count into buffer
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
@@ -558,15 +562,15 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
     rec_printer.print_record(row, context);
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(1, context);
-    // 文件侧：框架紧凑格式（表头行+值行）
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for (size_t i = 0; i < n; ++i) outfile << " " << captions[i] << " |";
-    outfile << "\n|";
-    for (size_t i = 0; i < n; ++i) outfile << " " << row[i] << " |";
-    outfile << "\n";
-        outfile.close();
+    if (output_file_enabled()) {
+        std::ostringstream os;
+        os << "|";
+        for (size_t i = 0; i < n; ++i) os << " " << captions[i] << " |";
+        os << "\n|";
+        for (size_t i = 0; i < n; ++i) os << " " << row[i] << " |";
+        os << "\n";
+        append_output_file(os.str());
+    }
 }
 
 // 执行DML语句
@@ -574,14 +578,77 @@ void QlManager::run_dml(std::unique_ptr<AbstractExecutor> exec){
     exec->Next();
 }
 
+namespace {
+
+std::vector<std::string> split_csv_line(const std::string &line) {
+    std::vector<std::string> fields;
+    std::string cur;
+    for (char c : line) {
+        if (c == ',') {
+            fields.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    fields.push_back(cur);
+    return fields;
+}
+
+}  // namespace
+
+void QlManager::run_load(const std::string &file_path, const std::string &tab_name, Context *context) {
+    TabMeta tab = sm_manager_->db_.get_table(tab_name);
+    RmFileHandle *fh = sm_manager_->fhs_.at(tab_name).get();
+    std::ifstream infile(file_path);
+    if (!infile.is_open()) {
+        throw RMDBError("Cannot open load file: " + file_path + "\n");
+    }
+    const int rec_size = fh->get_file_hdr().record_size;
+    std::string line;
+    while (std::getline(infile, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        auto fields = split_csv_line(line);
+        if (fields.size() != tab.cols.size()) {
+            throw RMDBError("Column count mismatch in load file\n");
+        }
+        RmRecord rec(rec_size);
+        memset(rec.data, 0, rec_size);
+        for (size_t i = 0; i < tab.cols.size(); ++i) {
+            auto &col = tab.cols[i];
+            if (col.type == TYPE_INT) {
+                *(int *)(rec.data + col.offset) = std::atoi(fields[i].c_str());
+            } else if (col.type == TYPE_FLOAT) {
+                *(float *)(rec.data + col.offset) = static_cast<float>(std::atof(fields[i].c_str()));
+            } else {
+                size_t cpy = std::min(fields[i].size(), static_cast<size_t>(col.len));
+                memcpy(rec.data + col.offset, fields[i].c_str(), cpy);
+            }
+        }
+        Rid rid = fh->insert_record(rec.data, context);
+        if (context && context->log_mgr_ && context->txn_) {
+            InsertLogRecord lr(context->txn_->get_transaction_id(), rec, rid, tab_name);
+            context->txn_->set_prev_lsn(context->log_mgr_->add_log_to_buffer(&lr));
+        }
+        for (auto &index : tab.indexes) {
+            auto ih = sm_manager_->ihs_.at(
+                sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+            std::vector<char> key(index.col_tot_len);
+            int off = 0;
+            for (auto &idx_col : index.cols) {
+                memcpy(key.data() + off, rec.data + idx_col.offset, idx_col.len);
+                off += idx_col.len;
+            }
+            ih->insert_entry(key.data(), rid, context ? context->txn_ : nullptr);
+        }
+    }
+}
+
 // 题4：EXPLAIN ANALYZE —— 构建优化后计划树、计数执行、输出计划树（不输出结果集）
 void QlManager::run_explain(std::shared_ptr<Query> query, Context *context) {
     std::string tree = explain::run(query.get(), sm_manager_, context);
-    // 写 output.txt（评测产物）
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << tree;
-    outfile.close();
+    append_output_file(tree);
     // 写客户端缓冲（不输出结果集，仅计划树）
     if (context->data_send_ && context->offset_) {
         size_t n = tree.size();

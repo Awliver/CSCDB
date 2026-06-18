@@ -49,6 +49,9 @@ class QlManager {
 
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
 
+    // 性能测试：CSV 批量加载
+    void run_load(const std::string &file_path, const std::string &tab_name, Context *context);
+
     // 题4：EXPLAIN ANALYZE —— 构建优化后的计划树、执行计数、输出计划树（不输出结果集）
     void run_explain(std::shared_ptr<Query> query, Context *context);
     // 题7：基于优化器计划树的 EXPLAIN ANALYZE（NLJ/INLJ）

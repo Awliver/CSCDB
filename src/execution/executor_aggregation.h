@@ -43,6 +43,8 @@ private:
         float float_max = -FLT_MAX;
         int int_min = INT_MAX;
         float float_min = FLT_MAX;
+        std::string str_max;
+        std::string str_min;
         int64_t sum_cnt = 0;
         bool has_value = false;
     };
@@ -219,11 +221,13 @@ Value AggExecutor::get_agg_value(const AggregateInfo &agg, const AggState &st) {
         case ast::AGG_MAX:
             if (!st.has_value) return agg_make_empty();
             if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_max);
-            else return agg_make_float(st.float_max);
+            if (agg.arg_type == TYPE_FLOAT) return agg_make_float(st.float_max);
+            return agg_make_str(st.str_max);
         case ast::AGG_MIN:
             if (!st.has_value) return agg_make_empty();
             if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_min);
-            else return agg_make_float(st.float_min);
+            if (agg.arg_type == TYPE_FLOAT) return agg_make_float(st.float_min);
+            return agg_make_str(st.str_min);
         case ast::AGG_AVG:
             return (st.sum_cnt > 0)
                        ? agg_make_float((agg.arg_type == TYPE_INT)
@@ -388,6 +392,16 @@ void AggExecutor::beginTuple() {
                             st.float_min = std::min(st.float_min, fval);
                         }
                         st.float_sum += fval;
+                    } else if (col_it->type == TYPE_STRING) {
+                        std::string sval((char *)(rec->data + col_it->offset), col_it->len);
+                        sval.resize(strlen(sval.c_str()));
+                        if (!st.has_value) {
+                            st.str_max = st.str_min = sval;
+                            st.has_value = true;
+                        } else {
+                            if (sval > st.str_max) st.str_max = sval;
+                            if (sval < st.str_min) st.str_min = sval;
+                        }
                     }
                     st.sum_cnt++;
                     break;
@@ -473,8 +487,12 @@ void AggExecutor::build_cur() {
                 if (st.has_value) {
                     if (out_type == TYPE_INT) {
                         *(int *)slot = st.int_max;
-                    } else {
+                    } else if (out_type == TYPE_FLOAT) {
                         *(float *)slot = st.float_max;
+                    } else {
+                        memset(slot, 0, cols_[col_idx].len);
+                        size_t cpy = std::min(st.str_max.size(), static_cast<size_t>(cols_[col_idx].len));
+                        memcpy(slot, st.str_max.c_str(), cpy);
                     }
                 }
                 break;
@@ -483,8 +501,12 @@ void AggExecutor::build_cur() {
                 if (st.has_value) {
                     if (out_type == TYPE_INT) {
                         *(int *)slot = st.int_min;
-                    } else {
+                    } else if (out_type == TYPE_FLOAT) {
                         *(float *)slot = st.float_min;
+                    } else {
+                        memset(slot, 0, cols_[col_idx].len);
+                        size_t cpy = std::min(st.str_min.size(), static_cast<size_t>(cols_[col_idx].len));
+                        memcpy(slot, st.str_min.c_str(), cpy);
                     }
                 }
                 break;

@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include <fstream>
 #include "execution_defs.h"
 #include "execution_manager.h"
+#include "common/output_control.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -110,10 +111,7 @@ class InsertExecutor : public AbstractExecutor {
                     }
                 }
                 if (conflict) {
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_file("failure\n");
                     return nullptr;
                 }
                 // 同键记录均已删(不可见)：清掉陈旧索引项，下方再插入新项

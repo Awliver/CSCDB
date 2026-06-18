@@ -440,7 +440,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
         // 聚合列
         for (auto &agg : query->aggs) {
             ColMeta col;
-            col.name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
+            col.name = agg.alias.empty() ? agg.to_string() : agg.alias;
             col.tab_name = agg.col.tab_name;
             if (agg.type == ast::AGG_COUNT) {
                 col.type = TYPE_INT;
@@ -450,8 +450,14 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                 col.len = sizeof(float);
             } else {
                 col.type = agg.arg_type;
-                col.len = (agg.arg_type == TYPE_INT) ? sizeof(int) : 
-                          (agg.arg_type == TYPE_FLOAT) ? sizeof(float) : agg.col.col_name.size();
+                if (agg.arg_type == TYPE_INT) {
+                    col.len = sizeof(int);
+                } else if (agg.arg_type == TYPE_FLOAT) {
+                    col.len = sizeof(float);
+                } else {
+                    auto tab = sm_manager_->db_.get_table(agg.col.tab_name);
+                    col.len = tab.get_col(agg.col.col_name)->len;
+                }
             }
             col.offset = offset;
             offset += col.len;
@@ -467,7 +473,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
         }
         for (auto &agg : query->aggs) {
             if (agg.in_output) {
-                std::string name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
+                std::string name = agg.alias.empty() ? agg.to_string() : agg.alias;
                 sel_cols.push_back({"", name});
             }
         }

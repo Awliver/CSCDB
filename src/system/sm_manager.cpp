@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "sm_manager.h"
 #include "recovery/log_manager.h"
+#include "common/output_control.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -94,6 +95,15 @@ void SmManager::open_db(const std::string& db_name) {
     if (chdir(db_name.c_str()) < 0) {
         throw UnixError();
     }
+    // 目录存在但缺少 db.meta/db.log（如手动 mkdir）时补建，避免恢复/checkpoint 失败
+    if (!disk_manager_->is_file(DB_META_NAME)) {
+        db_.name_ = db_name;
+        std::ofstream ofs(DB_META_NAME);
+        ofs << db_;
+    }
+    if (!disk_manager_->is_file(LOG_FILE_NAME)) {
+        disk_manager_->create_file(LOG_FILE_NAME);
+    }
     // 从 db.meta 反序列化加载元数据到内存
     //    DbMeta 重载了 operator>>，会自动读取所有 TabMeta
     std::ifstream ifs(DB_META_NAME);
@@ -164,8 +174,10 @@ void SmManager::close_db() {
  */
 void SmManager::show_tables(Context* context) {
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "| Tables |\n";
+    if (output_file_enabled()) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "| Tables |\n";
+    }
     RecordPrinter printer(1);
     printer.print_separator(context);
     printer.print_record({"Tables"}, context);
@@ -173,10 +185,10 @@ void SmManager::show_tables(Context* context) {
     for (auto &entry : db_.tabs_) {
         auto &tab = entry.second;
         printer.print_record({tab.name}, context);
-        outfile << "| " << tab.name << " |\n";
+        if (outfile.is_open()) outfile << "| " << tab.name << " |\n";
     }
     printer.print_separator(context);
-    outfile.close();
+    if (outfile.is_open()) outfile.close();
 }
 
 /**
@@ -197,8 +209,9 @@ void SmManager::show_indexes(const std::string& tab_name, Context* context) {
     TabMeta& tab = db_.tabs_[tab_name];
 
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
+    if (output_file_enabled()) outfile.open("output.txt", std::ios::out | std::ios::app);
     for (auto& index : tab.indexes) {
+        if (!outfile.is_open()) continue;
         outfile << "| " << tab_name << " | unique | (";
         for (size_t i = 0; i < index.cols.size(); ++i) {
             if (i > 0) outfile << ",";
@@ -206,7 +219,7 @@ void SmManager::show_indexes(const std::string& tab_name, Context* context) {
         }
         outfile << ") |\n";
     }
-    outfile.close();
+    if (outfile.is_open()) outfile.close();
 }
 
 void SmManager::desc_table(const std::string& tab_name, Context* context) {

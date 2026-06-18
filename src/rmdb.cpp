@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include "portal.h"
 #include "analyze/analyze.h"
 #include "parser/ast.h"
+#include "common/output_control.h"
 #include <cctype>
 
 #define SOCK_PORT 8765
@@ -161,6 +162,35 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_insert(const char *s) {
     return std::make_shared<ast::InsertStmt>(tab, vals);
 }
 
+// load ../../path/file.csv into table_name;
+static bool try_parse_load(const char *s, std::string &file_path, std::string &tab_name) {
+    const char *p = s;
+    auto skipws = [&]() { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p; };
+    auto kw = [&](const char *k) -> bool {
+        skipws();
+        const char *q = p;
+        for (; *k; ++k, ++q)
+            if (tolower((unsigned char)*q) != *k) return false;
+        p = q;
+        return true;
+    };
+    if (!kw("load")) return false;
+    skipws();
+    const char *fs = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') ++p;
+    if (p == fs) return false;
+    file_path.assign(fs, p - fs);
+    if (!kw("into")) return false;
+    skipws();
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return false;
+    const char *ts = p;
+    while (isalnum((unsigned char)*p) || *p == '_') ++p;
+    tab_name.assign(ts, p - ts);
+    skipws();
+    if (*p == ';') { ++p; skipws(); }
+    return *p == '\0';
+}
+
 void *client_handler(void *sock_fd) {
     int fd = (int)(intptr_t)sock_fd;
     pthread_mutex_unlock(sockfd_mutex);
@@ -229,6 +259,13 @@ void *client_handler(void *sock_fd) {
             continue;
         }
 
+        // 性能测试：关闭 output.txt 写入（无分号）
+        if (parse_set_output_file_off(stmt)) {
+            data_send[0] = '\0';
+            if (!write_all(fd, data_send, 1)) break;
+            continue;
+        }
+
         // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
         {
             IsolationLevel new_iso;
@@ -236,6 +273,46 @@ void *client_handler(void *sock_fd) {
                 sess_iso = new_iso;
                 data_send[0] = '\0';
                 if (!write_all(fd, data_send, 1)) break;
+                continue;
+            }
+        }
+
+        // 性能测试：CSV 批量加载（绕过 yacc）
+        {
+            std::string load_file, load_tab;
+            if (try_parse_load(stmt, load_file, load_tab)) {
+                data_send[0] = '\0';
+                offset = 0;
+                Context context_obj(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+                Context *context = &context_obj;
+                context->txn_mgr_ = txn_manager.get();
+                SetTransaction(&txn_id, context, sess_iso);
+                try {
+                    ql_manager->run_load(load_file, load_tab, context);
+                } catch (RMDBError &e) {
+                    std::cerr << e.what() << std::endl;
+                    memcpy(data_send, e.what(), e.get_msg_len());
+                    data_send[e.get_msg_len()] = '\n';
+                    data_send[e.get_msg_len() + 1] = '\0';
+                    offset = e.get_msg_len() + 1;
+                    append_output_file("failure\n");
+                    txn_manager->abort(context->txn_, log_manager.get());
+                    if (!write_all(fd, data_send, offset + 1)) break;
+                    continue;
+                } catch (std::exception &e) {
+                    std::cerr << e.what() << std::endl;
+                    memcpy(data_send, "failure\n", 8);
+                    data_send[8] = '\0';
+                    offset = 8;
+                    append_output_file("failure\n");
+                    txn_manager->abort(context->txn_, log_manager.get());
+                    if (!write_all(fd, data_send, offset + 1)) break;
+                    continue;
+                }
+                if (context->txn_->get_txn_mode() == false) {
+                    txn_manager->commit(context->txn_, context->log_mgr_);
+                }
+                if (!write_all(fd, data_send, offset + 1)) break;
                 continue;
             }
         }
@@ -278,10 +355,7 @@ void *client_handler(void *sock_fd) {
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << str;
-                    outfile.close();
+                    append_output_file(str);
                 } catch (RMDBError &e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
@@ -291,11 +365,7 @@ void *client_handler(void *sock_fd) {
                     data_send[e.get_msg_len() + 1] = '\0';
                     offset = e.get_msg_len() + 1;
 
-                    // 将报错信息写入output.txt
-                    std::fstream outfile;
-                    outfile.open("output.txt",std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_file("failure\n");
                 } catch (std::exception &e) {
                     // 题10：任何未预期异常不得终止服务进程
                     if (!finish_analyze) {
@@ -308,20 +378,14 @@ void *client_handler(void *sock_fd) {
                     data_send[8] = '\0';
                     offset = 8;
 
-                    std::fstream outfile;
-                    outfile.open("output.txt",std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_file("failure\n");
                 }
             }
         } else {
             yy_delete_buffer(buf);
             finish_analyze = true;
             pthread_mutex_unlock(buffer_mutex);
-            std::fstream outfile;
-            outfile.open("output.txt", std::ios::out | std::ios::app);
-            outfile << "failure\n";
-            outfile.close();
+            append_output_file("failure\n");
         }
         if(finish_analyze == false) {
             yy_delete_buffer(buf);

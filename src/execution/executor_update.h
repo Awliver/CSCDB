@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include "execution_defs.h"
+#include "common/output_control.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
@@ -157,10 +158,7 @@ class UpdateExecutor : public AbstractExecutor {
                     }
                 }
                 if (violated) {
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_file("failure\n");
                     continue;  // 跳过这条 rid 的更新
                 }
             }
