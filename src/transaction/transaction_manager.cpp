@@ -14,28 +14,10 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "index/ix.h"
 #include <algorithm>
-#include <chrono>
 #include <cstring>
-#include <fstream>
 #include <limits>
 
 namespace {
-// #region agent log
-void dbg_abort_log(const char *hypothesisId, const char *location, const char *message,
-                   const std::string &tab, WType wt, bool idx_rollback, bool key_changed = false) {
-    std::ofstream f("/home/neo/CSC_DB/db2026/.cursor/debug-cb1fc9.log", std::ios::app);
-    if (!f) return;
-    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::system_clock::now().time_since_epoch())
-                  .count();
-    f << "{\"sessionId\":\"cb1fc9\",\"hypothesisId\":\"" << hypothesisId
-      << "\",\"location\":\"" << location << "\",\"message\":\"" << message
-      << "\",\"data\":{\"tab\":\"" << tab << "\",\"wtype\":" << static_cast<int>(wt)
-      << ",\"idx_rollback\":" << (idx_rollback ? "true" : "false")
-      << ",\"key_changed\":" << (key_changed ? "true" : "false")
-      << "},\"timestamp\":" << ts << "}\n";
-}
-// #endregion
 
 void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const Rid &rid,
                              WType wtype, const std::string &old_data, const std::string &new_data) {
@@ -58,6 +40,25 @@ void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const R
                    memcmp(old_key.data(), new_key.data(), index.col_tot_len) != 0) {
             ih->delete_entry(new_key.data(), nullptr);
             ih->insert_entry(old_key.data(), rid, nullptr);
+        }
+    }
+}
+
+void restore_index_if_missing(SmManager *sm, const std::string &tab_name, const Rid &rid,
+                              const std::string &data) {
+    if (sm == nullptr || data.empty()) return;
+    TabMeta &tab = sm->db_.get_table(tab_name);
+    for (auto &index : tab.indexes) {
+        auto ih = sm->ihs_.at(sm->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        std::vector<char> key(index.col_tot_len);
+        int off = 0;
+        for (auto &idx_col : index.cols) {
+            memcpy(key.data() + off, data.data() + idx_col.offset, idx_col.len);
+            off += idx_col.len;
+        }
+        std::vector<Rid> found;
+        if (!ih->get_value(key.data(), &found, nullptr)) {
+            ih->insert_entry(key.data(), rid, nullptr);
         }
     }
 }
@@ -164,7 +165,8 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             if (ch.writer != txn->get_transaction_id()) continue;
             WType wtype = wr->GetWriteType();
             std::string old_data, new_data;
-            bool key_changed = false;
+            // 同事务内 insert 后再 delete 时 write_set 仍只有 INSERT，但 writer_data 已被清空
+            bool insert_then_deleted = (wtype == WType::INSERT_TUPLE && ch.writer_del);
             if (wtype == WType::INSERT_TUPLE) {
                 new_data = ch.writer_data;
             } else if (wtype == WType::UPDATE_TUPLE && !ch.hist.empty() && !ch.writer_del) {
@@ -179,13 +181,14 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                 // 本事务新插入回滚 → 保留堆槽作为不可见墓碑：hist 为空且 writer 已清，
                 // mvcc_read 判定不可见(SeqScan 跳过)。不物理删除、不复用槽位——否则后续 insert
                 // 复用空槽，使 select * 行序与标准(全程 MVCC,中止插入行不复用槽,新行恒在末尾)不一致。
-                // 差分测试 seed16 已复现该分歧。fh 在此分支不再使用。
-                (void)fh;
+                // 差分测试 seed16 已复现该分歧。
+                if (new_data.empty() && insert_then_deleted && fh->is_record(wr->GetRid())) {
+                    auto rec = fh->get_record(wr->GetRid(), nullptr);
+                    new_data.assign(rec->data, (size_t)fh->get_file_hdr().record_size);
+                }
                 if (!new_data.empty()) {
                     rollback_index_on_abort(sm_manager_, wr->GetTableName(), wr->GetRid(),
                                             WType::INSERT_TUPLE, old_data, new_data);
-                    dbg_abort_log("A", "abort:insert", "index rollback on insert abort",
-                                  wr->GetTableName(), wtype, true);
                 }
             } else {
                 // update/delete 回滚：把堆恢复为最新已提交版本（供无事务快路径读取一致）
@@ -194,24 +197,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                     fh->update_record(wr->GetRid(), (char *)last.data.data(), nullptr);
                 }
                 if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty()) {
-                    TabMeta &tab = sm_manager_->db_.get_table(wr->GetTableName());
-                    for (auto &index : tab.indexes) {
-                        std::vector<char> ok(index.col_tot_len), nk(index.col_tot_len);
-                        int off = 0;
-                        for (auto &c : index.cols) {
-                            memcpy(ok.data() + off, old_data.data() + c.offset, c.len);
-                            memcpy(nk.data() + off, new_data.data() + c.offset, c.len);
-                            off += c.len;
-                        }
-                        if (memcmp(ok.data(), nk.data(), index.col_tot_len) != 0) {
-                            key_changed = true;
-                            break;
-                        }
-                    }
                     rollback_index_on_abort(sm_manager_, wr->GetTableName(), wr->GetRid(),
                                             WType::UPDATE_TUPLE, old_data, new_data);
-                    dbg_abort_log("B", "abort:update", "index rollback on update abort",
-                                  wr->GetTableName(), wtype, true, key_changed);
+                } else if (wtype == WType::DELETE_TUPLE && !last.is_deleted && !last.data.empty()) {
+                    restore_index_if_missing(sm_manager_, wr->GetTableName(), wr->GetRid(), last.data);
                 }
             }
         }
