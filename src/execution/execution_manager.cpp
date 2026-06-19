@@ -613,6 +613,15 @@ void QlManager::run_load(const std::string &file_path, const std::string &tab_na
         if (fields.size() != tab.cols.size()) {
             throw RMDBError("Column count mismatch in load file\n");
         }
+        // CSV 首行常为列名表头（如 w_id,w_name,...），跳过以免多插入一行
+        bool is_header = true;
+        for (size_t i = 0; i < tab.cols.size(); ++i) {
+            if (fields[i] != tab.cols[i].name) {
+                is_header = false;
+                break;
+            }
+        }
+        if (is_header) continue;
         RmRecord rec(rec_size);
         memset(rec.data, 0, rec_size);
         for (size_t i = 0; i < tab.cols.size(); ++i) {
