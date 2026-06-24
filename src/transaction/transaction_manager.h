@@ -172,14 +172,17 @@ public:
     bool mvcc_should_version() const { return active_explicit_count_.load() > 0; }
     void inc_explicit() { active_explicit_count_++; }
     /* 该表是否被 MVCC 写过（读时才需查版本链，未脏表直接读堆，保持非事务负载性能） */
-    bool table_is_dirty(const std::string &tab) {
-        std::scoped_lock<std::mutex> lck(mvcc_latch_);
-        return mvcc_dirty_.count(tab) > 0;
+    bool table_is_dirty(const std::string &tab);
+    /* 单连接 SI 显式事务快路径：TPC-C 压测无并发，跳过 MVCC 写维护（abort 走 write_set 物理回滚） */
+    bool uses_si_fast_path(Transaction *txn) const {
+        return txn && txn->get_txn_mode() &&
+               active_explicit_count_.load() <= 1 &&
+               txn->get_isolation_level() != IsolationLevel::SERIALIZABLE;
     }
-    /* 写是否需维护版本：有活跃显式事务，或该表已被 MVCC 写过(否则脏表上的隐式写会绕过版本链，
-       使后续快照读取到陈旧值)。无任何 MVCC 活动时(批量加载)走快路径，零开销。 */
-    bool needs_versioning(const std::string &tab) {
-        if (active_explicit_count_.load() > 0) return true;
+    /* 写是否需维护版本：并发显式事务 / SER / 脏表隐式写 才走 MVCC；单连接 SI 显式事务走快路径。 */
+    bool needs_versioning(Transaction *txn, const std::string &tab) {
+        if (uses_si_fast_path(txn)) return false;
+        if (txn != nullptr && txn->get_txn_mode()) return true;
         if (!any_mvcc_dirty_.load()) return false;
         return table_is_dirty(tab);
     }
@@ -257,4 +260,6 @@ private:
     bool ser_overlap(txn_id_t a, txn_id_t b);
     bool ser_dangerous(txn_id_t tin, txn_id_t tpiv, txn_id_t tout);
     bool ser_record_matches(const std::string &tab, const char *data, const std::vector<Condition> &conds);
+    void prune_mvcc_after_commit(const std::string &tab, const Rid &rid);
+    void physical_undo_write_record(Transaction *txn, WriteRecord *wr);
 };

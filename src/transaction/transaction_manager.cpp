@@ -124,8 +124,29 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
                 ch.hist.push_back(std::move(v));
                 ch.writer = INVALID_TXN_ID;
                 ch.writer_data.clear();
+                prune_mvcc_after_commit(wr->GetTableName(), wr->GetRid());
             }
         }
+        // 表上若无未提交写/墓碑链，清除脏标记，后续 SeqScan 直接读堆
+        for (auto it = mvcc_dirty_.begin(); it != mvcc_dirty_.end(); ) {
+            auto sit = mvcc_store_.find(*it);
+            if (sit == mvcc_store_.end() || sit->second.empty()) {
+                it = mvcc_dirty_.erase(it);
+            } else {
+                bool still = false;
+                for (auto &kv : sit->second) {
+                    if (kv.second.writer != INVALID_TXN_ID || kv.second.hist.empty()) {
+                        still = true;
+                        break;
+                    }
+                }
+                if (!still) {
+                    mvcc_store_.erase(sit);
+                    it = mvcc_dirty_.erase(it);
+                } else ++it;
+            }
+        }
+        any_mvcc_dirty_.store(!mvcc_dirty_.empty());
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
         ser_finish(txn->get_transaction_id(), true, cts);   // 题9 SER：记录提交序，保留信息供并发事务判定
@@ -156,13 +177,14 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         auto write_set = txn->get_write_set();
         for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
             WriteRecord *wr = *it;
+            bool undone = false;
             auto tit = mvcc_store_.find(wr->GetTableName());
-            if (tit == mvcc_store_.end()) continue;
-            auto &chains = tit->second;
-            auto cit = chains.find(mvcc_key(wr->GetRid()));
-            if (cit == chains.end()) continue;
+            if (tit != mvcc_store_.end()) {
+            auto cit = tit->second.find(mvcc_key(wr->GetRid()));
+            if (cit != tit->second.end()) {
             MvccChain &ch = cit->second;
-            if (ch.writer != txn->get_transaction_id()) continue;
+            if (ch.writer == txn->get_transaction_id()) {
+            undone = true;
             WType wtype = wr->GetWriteType();
             std::string old_data, new_data;
             // 同事务内 insert 后再 delete 时 write_set 仍只有 INSERT，但 writer_data 已被清空
@@ -203,6 +225,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                     restore_index_if_missing(sm_manager_, wr->GetTableName(), wr->GetRid(), last.data);
                 }
             }
+            }
+            }
+            }
+            if (!undone) physical_undo_write_record(txn, wr);
         }
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
@@ -226,6 +252,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
 bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
                                    const char *heap_data, int len, std::string &out) {
+    if (!any_mvcc_dirty_.load()) {
+        out.assign(heap_data, len);
+        return true;
+    }
     std::scoped_lock<std::mutex> lck(mvcc_latch_);
     auto tit = mvcc_store_.find(tab);
     if (tit == mvcc_store_.end()) { out.assign(heap_data, len); return true; }
@@ -517,4 +547,84 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
         }
     }
     return dangerous;
+}
+
+bool TransactionManager::table_is_dirty(const std::string &tab) {
+    if (!any_mvcc_dirty_.load()) return false;
+    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    auto tit = mvcc_store_.find(tab);
+    if (tit == mvcc_store_.end() || tit->second.empty()) return false;
+    for (auto &kv : tit->second) {
+        const MvccChain &ch = kv.second;
+        if (ch.writer != INVALID_TXN_ID) return true;
+        if (ch.hist.empty()) return true;
+    }
+    return false;
+}
+
+void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid) {
+    auto tit = mvcc_store_.find(tab);
+    if (tit == mvcc_store_.end()) return;
+    auto cit = tit->second.find(mvcc_key(rid));
+    if (cit == tit->second.end()) return;
+    MvccChain &ch = cit->second;
+    if (ch.writer != INVALID_TXN_ID || ch.hist.empty() || ch.hist.back().is_deleted) return;
+    RmFileHandle *fh = sm_manager_->fhs_.at(tab).get();
+    if (!fh->is_record(rid)) return;
+    auto heap_rec = fh->get_record(rid, nullptr);
+    const MvccVer &last = ch.hist.back();
+    if ((int)last.data.size() == heap_rec->size &&
+        memcmp(heap_rec->data, last.data.data(), heap_rec->size) == 0) {
+        tit->second.erase(cit);
+        if (tit->second.empty()) mvcc_store_.erase(tit);
+    }
+}
+
+void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecord *wr) {
+    (void)txn;
+    const std::string &tab_name = wr->GetTableName();
+    Rid rid = wr->GetRid();
+    RmFileHandle *fh = sm_manager_->fhs_.at(tab_name).get();
+    int rsz = (int)fh->get_file_hdr().record_size;
+    WType wt = wr->GetWriteType();
+    if (wt == WType::INSERT_TUPLE) {
+        std::string new_data;
+        RmRecord &rec = wr->GetRecord();
+        if (rec.size > 0) new_data.assign(rec.data, rec.size);
+        else if (fh->is_record(rid)) {
+            auto hrec = fh->get_record(rid, nullptr);
+            new_data.assign(hrec->data, rsz);
+        }
+        if (!new_data.empty())
+            rollback_index_on_abort(sm_manager_, tab_name, rid, WType::INSERT_TUPLE, "", new_data);
+        MvccChain &ch = mvcc_store_[tab_name][mvcc_key(rid)];
+        ch.hist.clear();
+        ch.writer = INVALID_TXN_ID;
+        ch.writer_del = false;
+        ch.writer_data.clear();
+        mvcc_dirty_.insert(tab_name);
+        any_mvcc_dirty_.store(true);
+    } else if (wt == WType::UPDATE_TUPLE) {
+        RmRecord &old_rec = wr->GetRecord();
+        std::string new_data;
+        if (fh->is_record(rid)) {
+            auto cur = fh->get_record(rid, nullptr);
+            new_data.assign(cur->data, rsz);
+            fh->update_record(rid, old_rec.data, nullptr);
+        }
+        rollback_index_on_abort(sm_manager_, tab_name, rid, WType::UPDATE_TUPLE,
+                                std::string(old_rec.data, rsz), new_data);
+    } else if (wt == WType::DELETE_TUPLE) {
+        RmRecord &old_rec = wr->GetRecord();
+        restore_index_if_missing(sm_manager_, tab_name, rid, std::string(old_rec.data, rsz));
+        if (!fh->is_record(rid)) {
+            RmPageHandle ph = fh->fetch_page_handle(rid.page_no);
+            Bitmap::set(ph.bitmap, rid.slot_no);
+            ph.page_hdr->num_records++;
+            memcpy(ph.get_slot(rid.slot_no), old_rec.data, rsz);
+            sm_manager_->get_bpm()->unpin_page(ph.page->get_page_id(), true);
+        } else {
+            fh->update_record(rid, old_rec.data, nullptr);
+        }
+    }
 }

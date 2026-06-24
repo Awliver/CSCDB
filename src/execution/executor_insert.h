@@ -59,7 +59,7 @@ class InsertExecutor : public AbstractExecutor {
 
         // 题9 删-插写写冲突：插入的逻辑记录(按首列键)在本事务快照内可见、且正被并发删除
         // (未提交删或快照后已提交删) → 与该删除基于同一旧版本 → first-updater-wins → abort
-        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_) &&
+        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_) &&
             !tab_.cols.empty()) {
             auto &kcol = tab_.cols[0];
             if (context_->txn_mgr_->mvcc_insert_key_conflict(context_->txn_, tab_name_,
@@ -84,7 +84,7 @@ class InsertExecutor : public AbstractExecutor {
             if (ih->get_value(key.data(), &existing, context_ ? context_->txn_ : nullptr)) {
                 bool conflict = true;
                 bool mvcc = context_ && context_->txn_mgr_ && context_->txn_ &&
-                            context_->txn_mgr_->needs_versioning(tab_name_);
+                            context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
                 if (mvcc) {
                     conflict = false;
                     bool other_writer = false;
@@ -129,7 +129,7 @@ class InsertExecutor : public AbstractExecutor {
         }
 
         // 题9：有活跃显式事务时，登记为未提交插入版本（提交后才对他人可见，回滚则物理删除）
-        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_)) {
+        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_)) {
             context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,
                                             (int)fh_->get_file_hdr().record_size);
             // 题9 SER：新插入记录 vs 其他事务谓词读 → rw 反依赖；成 SSI 危险结构则 abort
@@ -137,20 +137,22 @@ class InsertExecutor : public AbstractExecutor {
                 context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid_, rec.data)) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
             }
+        } else if (context_ && context_->txn_ && context_->txn_mgr_ &&
+                   context_->txn_mgr_->uses_si_fast_path(context_->txn_)) {
+            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, rec));
         }
 
         // Insert into index
-        for(size_t i = 0; i < tab_.indexes.size(); ++i) {
+        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            char* key = new char[index.col_tot_len];
+            std::vector<char> key(index.col_tot_len);
             int offset = 0;
-            for(size_t i = 0; i < index.col_num; ++i) {
-                memcpy(key + offset, rec.data + index.cols[i].offset, index.cols[i].len);
-                offset += index.cols[i].len;
+            for (size_t j = 0; j < index.cols.size(); ++j) {
+                memcpy(key.data() + offset, rec.data + index.cols[j].offset, index.cols[j].len);
+                offset += index.cols[j].len;
             }
-            ih->insert_entry(key, rid_, context_->txn_);
-            delete[] key;
+            ih->insert_entry(key.data(), rid_, context_->txn_);
         }
         }   // 题9：多行 insert 行循环结束
         return nullptr;

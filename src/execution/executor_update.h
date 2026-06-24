@@ -88,7 +88,7 @@ class UpdateExecutor : public AbstractExecutor {
             char *slot = get_slot_ptr(rid);
 
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
-            if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(tab_name_)) {
+            if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_)) {
                 std::vector<char> mv_old(slot, slot + record_size_);
                 std::vector<char> mv_new = mv_old;
                 for (const auto &set : set_clauses_) {
@@ -201,6 +201,13 @@ class UpdateExecutor : public AbstractExecutor {
                 Rid r = rid;
                 UpdateLogRecord lr(context_->txn_->get_transaction_id(), old_rec, new_rec, r, tab_name_);
                 context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+            }
+
+            if (context_ && context_->txn_ && context_->txn_mgr_ &&
+                context_->txn_mgr_->uses_si_fast_path(context_->txn_)) {
+                RmRecord wr_old(record_size_);
+                memcpy(wr_old.data, orig_rec.data(), record_size_);
+                context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, wr_old));
             }
 
             // 第二遍：把新 key 插回受影响的索引
