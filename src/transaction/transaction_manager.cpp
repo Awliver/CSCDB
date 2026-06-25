@@ -457,8 +457,11 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
             }
         }
     }
-    // 首次触及预先存在(未跟踪)的记录：以堆当前值作为基础已提交版本(commit_ts=0)
-    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID) {
+    // 首次触及预先存在(未跟踪)的记录：以堆当前值作为基础已提交版本(commit_ts=0)。
+    // 注意：若该 rid 只是本事务上一条语句释放到 overlay 的未提交写（典型 insert 后再 delete/update），
+    // 不能伪造基础已提交版本，否则 abort 时会把该行当成已提交数据保留下来。
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID &&
+        txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr) {
         MvccVer base;
         base.data.assign(old_data, len);
         base.commit_ts = 0;
