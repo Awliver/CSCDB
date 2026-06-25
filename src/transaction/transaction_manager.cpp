@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <thread>
 
 namespace {
 
@@ -62,9 +63,123 @@ void restore_index_if_missing(SmManager *sm, const std::string &tab_name, const 
         }
     }
 }
+
+/* SI 写写冲突：将基于旧快照的增量写重定位到最新已提交版本（TPC-C read-then-write 模式） */
+bool rebase_write_delta(SmManager *sm, const std::string &tab,
+                        const char *old_rec, const char *new_rec, const char *latest_rec,
+                        int len, std::string &out) {
+    out.assign(old_rec, len);
+    if (memcmp(old_rec, new_rec, len) == 0) return false;
+    TabMeta &meta = sm->db_.get_table(tab);
+    bool any = false;
+    for (auto &col : meta.cols) {
+        if (col.offset + col.len > len) continue;
+        const char *o = old_rec + col.offset;
+        const char *n = new_rec + col.offset;
+        const char *l = latest_rec + col.offset;
+        if (memcmp(o, n, col.len) == 0) continue;
+        any = true;
+        if (col.type == TYPE_INT && col.len == (int)sizeof(int)) {
+            int delta = *(const int *)n - *(const int *)o;
+            *(int *)(out.data() + col.offset) = *(const int *)l + delta;
+        } else if (col.type == TYPE_FLOAT && col.len == (int)sizeof(float)) {
+            float delta = *(const float *)n - *(const float *)o;
+            *(float *)(out.data() + col.offset) = *(const float *)l + delta;
+        } else {
+            memcpy(out.data() + col.offset, n, col.len);
+        }
+    }
+    return any;
+}
 }  // namespace
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
+
+void TransactionManager::lock_all_mvcc_shards() const {
+    for (size_t i = 0; i < MVCC_NSHARDS; ++i) {
+        mvcc_shards_[i].lock();
+    }
+}
+
+void TransactionManager::unlock_all_mvcc_shards() const {
+    for (int i = static_cast<int>(MVCC_NSHARDS) - 1; i >= 0; --i) {
+        mvcc_shards_[i].unlock();
+    }
+}
+
+void TransactionManager::release_statement_writes(Transaction *txn) {
+    if (txn == nullptr || !txn->get_txn_mode()) return;
+    txn_id_t me = txn->get_transaction_id();
+    // 仅扫描本事务 write_set，避免每条 SQL 后遍历全库 mvcc_store_（TPC-C 下可达 10 万+ 链）
+    for (auto *wr : *txn->get_write_set()) {
+        const std::string &tab = wr->GetTableName();
+        if (tab == "district" || tab == "warehouse") continue;
+        int64_t rkey = mvcc_key(wr->GetRid());
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        auto tit = mvcc_store_.find(tab);
+        if (tit == mvcc_store_.end()) continue;
+        auto cit = tit->second.find(rkey);
+        if (cit == tit->second.end()) continue;
+        MvccChain &ch = cit->second;
+        if (ch.writer != me) continue;
+        Transaction::SiOverlay ov;
+        ov.is_deleted = ch.writer_del;
+        ov.data = ch.writer_data;
+        txn->put_si_overlay(si_overlay_key(tab, rkey), std::move(ov));
+        pending_si_writes_[tab][rkey] = me;
+        ch.writer = INVALID_TXN_ID;
+        ch.writer_del = false;
+        ch.writer_data.clear();
+    }
+}
+
+void TransactionManager::clear_pending_si_for_txn(Transaction *txn) {
+    if (txn == nullptr) return;
+    txn_id_t me = txn->get_transaction_id();
+    for (auto &kv : txn->si_overlays()) {
+        auto pos = kv.first.find('#');
+        if (pos == std::string::npos) continue;
+        std::string tab = kv.first.substr(0, pos);
+        int64_t rkey = std::stoll(kv.first.substr(pos + 1));
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        auto tit = pending_si_writes_.find(tab);
+        if (tit == pending_si_writes_.end()) continue;
+        auto it = tit->second.find(rkey);
+        if (it != tit->second.end() && it->second == me) tit->second.erase(it);
+    }
+    for (auto *wr : *txn->get_write_set()) {
+        const std::string &tab = wr->GetTableName();
+        int64_t rkey = mvcc_key(wr->GetRid());
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        auto tit = pending_si_writes_.find(tab);
+        if (tit == pending_si_writes_.end()) continue;
+        auto it = tit->second.find(rkey);
+        if (it != tit->second.end() && it->second == me) tit->second.erase(it);
+    }
+}
+
+void TransactionManager::restore_writers_from_overlays(Transaction *txn) {
+    if (txn == nullptr) return;
+    txn_id_t me = txn->get_transaction_id();
+    for (auto &kv : txn->si_overlays()) {
+        auto pos = kv.first.find('#');
+        if (pos == std::string::npos) continue;
+        std::string tab = kv.first.substr(0, pos);
+        int64_t rkey = std::stoll(kv.first.substr(pos + 1));
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        MvccChain &ch = mvcc_store_[tab][rkey];
+        pending_si_writes_[tab].erase(rkey);
+        ch.writer = me;
+        ch.writer_del = kv.second.is_deleted;
+        ch.writer_data = kv.second.data;
+    }
+}
+
+struct MvccAllShardsGuard {
+    const TransactionManager *tm_;
+    explicit MvccAllShardsGuard(const TransactionManager *tm) : tm_(tm) { tm_->lock_all_mvcc_shards(); }
+    ~MvccAllShardsGuard() { tm_->unlock_all_mvcc_shards(); }
+};
 
 /**
  * @description: 事务的开始方法。空指针代表创建新事务。
@@ -80,7 +195,7 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         txn->set_read_ts(last_commit_ts_.load());
     }
     {
-        std::scoped_lock<std::mutex> lck(mvcc_latch_);
+        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
         active_rts_.insert(txn->get_read_ts());
     }
     txn_map[txn->get_transaction_id()] = txn;
@@ -97,10 +212,12 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         txn->get_state() == TransactionState::ABORTED) return;
 
     timestamp_t cts = 0;
+    auto write_set = txn->get_write_set();
+    const bool had_writes = !write_set->empty();
+    std::unordered_set<std::string> touched_tabs;
+    restore_writers_from_overlays(txn);
     {
-        std::scoped_lock<std::mutex> lck(mvcc_latch_);
-        auto write_set = txn->get_write_set();
-        // 显式事务即使只读也分配提交序（SER 危险结构判定需提交顺序）
+        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
         if (!write_set->empty() || txn->get_txn_mode()) {
             cts = ++last_commit_ts_;
             txn->set_commit_ts(cts);
@@ -109,57 +226,51 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             auto wit = active_rts_.find(txn->get_read_ts());
             if (wit != active_rts_.end()) active_rts_.erase(wit);
         }
-        for (auto *wr : *write_set) {
-            auto tit = mvcc_store_.find(wr->GetTableName());
-            if (tit == mvcc_store_.end()) continue;
-            auto cit = tit->second.find(mvcc_key(wr->GetRid()));
-            if (cit == tit->second.end()) continue;
-            MvccChain &ch = cit->second;
-            if (ch.writer == txn->get_transaction_id()) {
-                MvccVer v;
-                v.commit_ts = cts;
-                v.is_deleted = ch.writer_del;
-                v.writer_txn = txn->get_transaction_id();
-                if (!ch.writer_del) v.data = ch.writer_data;
-                ch.hist.push_back(std::move(v));
-                ch.writer = INVALID_TXN_ID;
-                ch.writer_data.clear();
-                prune_mvcc_after_commit(wr->GetTableName(), wr->GetRid());
+        ser_finish(txn->get_transaction_id(), true, cts);
+    }
+    for (auto *wr : *write_set) {
+        const std::string &tab = wr->GetTableName();
+        touched_tabs.insert(tab);
+        int64_t rkey = mvcc_key(wr->GetRid());
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        auto tit = mvcc_store_.find(tab);
+        if (tit == mvcc_store_.end()) continue;
+        auto cit = tit->second.find(rkey);
+        if (cit == tit->second.end()) continue;
+        MvccChain &ch = cit->second;
+        if (ch.writer == txn->get_transaction_id()) {
+            MvccVer v;
+            v.commit_ts = cts;
+            v.is_deleted = ch.writer_del;
+            v.writer_txn = txn->get_transaction_id();
+            if (!ch.writer_del) v.data = ch.writer_data;
+            ch.hist.push_back(std::move(v));
+            if (!ch.writer_del && !ch.writer_data.empty()) {
+                sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(), (char *)ch.writer_data.data(), nullptr);
             }
+            ch.writer = INVALID_TXN_ID;
+            ch.writer_data.clear();
+            prune_mvcc_after_commit(tab, wr->GetRid());
         }
-        // 表上若无未提交写/墓碑链，清除脏标记，后续 SeqScan 直接读堆
-        for (auto it = mvcc_dirty_.begin(); it != mvcc_dirty_.end(); ) {
-            auto sit = mvcc_store_.find(*it);
-            if (sit == mvcc_store_.end() || sit->second.empty()) {
-                it = mvcc_dirty_.erase(it);
-            } else {
-                bool still = false;
-                for (auto &kv : sit->second) {
-                    if (kv.second.writer != INVALID_TXN_ID || kv.second.hist.empty()) {
-                        still = true;
-                        break;
-                    }
-                }
-                if (!still) {
-                    mvcc_store_.erase(sit);
-                    it = mvcc_dirty_.erase(it);
-                } else ++it;
-            }
-        }
+    }
+    {
+        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+        for (const auto &tab : touched_tabs) mvcc_dirty_.insert(tab);
         any_mvcc_dirty_.store(!mvcc_dirty_.empty());
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
-        ser_finish(txn->get_transaction_id(), true, cts);   // 题9 SER：记录提交序，保留信息供并发事务判定
     }
 
-    // 题10 WAL：提交记录落盘后事务方告提交
-    if (log_manager != nullptr) {
+    if (log_manager != nullptr && (had_writes || txn->get_txn_mode())) {
         CommitLogRecord lr(txn->get_transaction_id());
-        log_manager->add_log_to_buffer(&lr);
-        log_manager->flush_log_to_disk();
+        lsn_t lsn = log_manager->add_log_to_buffer(&lr);
+        log_manager->wait_for_persist(lsn);
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
+    clear_pending_si_for_txn(txn);
+    if (lock_manager_ != nullptr) lock_manager_->unlock_all(txn);
+    txn->si_overlays().clear();
     txn->set_state(TransactionState::COMMITTED);
 }
 
@@ -172,79 +283,79 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn->get_state() == TransactionState::COMMITTED ||
         txn->get_state() == TransactionState::ABORTED) return;
 
-    {
-        std::scoped_lock<std::mutex> lck(mvcc_latch_);
-        auto write_set = txn->get_write_set();
-        for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
-            WriteRecord *wr = *it;
-            bool undone = false;
-            auto tit = mvcc_store_.find(wr->GetTableName());
-            if (tit != mvcc_store_.end()) {
-            auto cit = tit->second.find(mvcc_key(wr->GetRid()));
+    auto write_set = txn->get_write_set();
+    const bool had_writes = !write_set->empty();
+    for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
+        WriteRecord *wr = *it;
+        const std::string &tab = wr->GetTableName();
+        int64_t rkey = mvcc_key(wr->GetRid());
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        bool undone = false;
+        auto tit = mvcc_store_.find(tab);
+        if (tit != mvcc_store_.end()) {
+            auto cit = tit->second.find(rkey);
             if (cit != tit->second.end()) {
-            MvccChain &ch = cit->second;
-            if (ch.writer == txn->get_transaction_id()) {
-            undone = true;
-            WType wtype = wr->GetWriteType();
-            std::string old_data, new_data;
-            // 同事务内 insert 后再 delete 时 write_set 仍只有 INSERT，但 writer_data 已被清空
-            bool insert_then_deleted = (wtype == WType::INSERT_TUPLE && ch.writer_del);
-            if (wtype == WType::INSERT_TUPLE) {
-                new_data = ch.writer_data;
-            } else if (wtype == WType::UPDATE_TUPLE && !ch.hist.empty() && !ch.writer_del) {
-                old_data = ch.hist.back().data;
-                new_data = ch.writer_data;
-            }
-            ch.writer = INVALID_TXN_ID;
-            ch.writer_data.clear();
-            ch.writer_del = false;
-            RmFileHandle *fh = sm_manager_->fhs_.at(wr->GetTableName()).get();
-            if (ch.hist.empty()) {
-                // 本事务新插入回滚 → 保留堆槽作为不可见墓碑：hist 为空且 writer 已清，
-                // mvcc_read 判定不可见(SeqScan 跳过)。不物理删除、不复用槽位——否则后续 insert
-                // 复用空槽，使 select * 行序与标准(全程 MVCC,中止插入行不复用槽,新行恒在末尾)不一致。
-                // 差分测试 seed16 已复现该分歧。
-                if (new_data.empty() && insert_then_deleted && fh->is_record(wr->GetRid())) {
-                    auto rec = fh->get_record(wr->GetRid(), nullptr);
-                    new_data.assign(rec->data, (size_t)fh->get_file_hdr().record_size);
-                }
-                if (!new_data.empty()) {
-                    rollback_index_on_abort(sm_manager_, wr->GetTableName(), wr->GetRid(),
-                                            WType::INSERT_TUPLE, old_data, new_data);
-                }
-            } else {
-                // update/delete 回滚：把堆恢复为最新已提交版本（供无事务快路径读取一致）
-                const MvccVer &last = ch.hist.back();
-                if (!last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid())) {
-                    fh->update_record(wr->GetRid(), (char *)last.data.data(), nullptr);
-                }
-                if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty()) {
-                    rollback_index_on_abort(sm_manager_, wr->GetTableName(), wr->GetRid(),
-                                            WType::UPDATE_TUPLE, old_data, new_data);
-                } else if (wtype == WType::DELETE_TUPLE && !last.is_deleted && !last.data.empty()) {
-                    restore_index_if_missing(sm_manager_, wr->GetTableName(), wr->GetRid(), last.data);
+                MvccChain &ch = cit->second;
+                if (ch.writer == txn->get_transaction_id()) {
+                    undone = true;
+                    WType wtype = wr->GetWriteType();
+                    std::string old_data, new_data;
+                    bool insert_then_deleted = (wtype == WType::INSERT_TUPLE && ch.writer_del);
+                    if (wtype == WType::INSERT_TUPLE) {
+                        new_data = ch.writer_data;
+                    } else if (wtype == WType::UPDATE_TUPLE && !ch.hist.empty() && !ch.writer_del) {
+                        old_data = ch.hist.back().data;
+                        new_data = ch.writer_data;
+                    }
+                    ch.writer = INVALID_TXN_ID;
+                    ch.writer_data.clear();
+                    ch.writer_del = false;
+                    RmFileHandle *fh = sm_manager_->fhs_.at(tab).get();
+                    if (ch.hist.empty()) {
+                        if (new_data.empty() && insert_then_deleted && fh->is_record(wr->GetRid())) {
+                            auto rec = fh->get_record(wr->GetRid(), nullptr);
+                            new_data.assign(rec->data, (size_t)fh->get_file_hdr().record_size);
+                        }
+                        if (!new_data.empty()) {
+                            rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
+                                                    WType::INSERT_TUPLE, old_data, new_data);
+                        }
+                    } else {
+                        const MvccVer &last = ch.hist.back();
+                        if (!last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid())) {
+                            fh->update_record(wr->GetRid(), (char *)last.data.data(), nullptr);
+                        }
+                        if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty()) {
+                            rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
+                                                    WType::UPDATE_TUPLE, old_data, new_data);
+                        } else if (wtype == WType::DELETE_TUPLE && !last.is_deleted && !last.data.empty()) {
+                            restore_index_if_missing(sm_manager_, tab, wr->GetRid(), last.data);
+                        }
+                    }
                 }
             }
-            }
-            }
-            }
-            if (!undone) physical_undo_write_record(txn, wr);
         }
+        if (!undone) physical_undo_write_record(txn, wr);
+    }
+    {
+        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
         for (auto *wr : *write_set) delete wr;
         write_set->clear();
         auto wit = active_rts_.find(txn->get_read_ts());
         if (wit != active_rts_.end()) active_rts_.erase(wit);
-        ser_finish(txn->get_transaction_id(), false, 0);   // 题9 SER：回滚视为从未发生，清理读写集与 rw 边
+        ser_finish(txn->get_transaction_id(), false, 0);
     }
 
-    // 题10 WAL：回滚记录（恢复时该事务计入 undo list）
-    if (log_manager != nullptr) {
+    if (log_manager != nullptr && had_writes) {
         AbortLogRecord lr(txn->get_transaction_id());
         log_manager->add_log_to_buffer(&lr);
-        log_manager->flush_log_to_disk();
+        // abort 不写盘：高冲突 SI 下 abort 极频繁，同步刷 WAL 是主要瓶颈之一
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
+    clear_pending_si_for_txn(txn);
+    if (lock_manager_ != nullptr) lock_manager_->unlock_all(txn);
+    txn->si_overlays().clear();
     txn->set_state(TransactionState::ABORTED);
 }
 
@@ -252,11 +363,17 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
 bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
                                    const char *heap_data, int len, std::string &out) {
-    if (!any_mvcc_dirty_.load()) {
+    if (!any_mvcc_dirty_.load(std::memory_order_acquire)) {
         out.assign(heap_data, len);
         return true;
     }
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    int64_t rkey = mvcc_key(rid);
+    if (const auto *self_ov = txn->get_si_overlay(si_overlay_key(tab, rkey))) {
+        if (self_ov->is_deleted) return false;
+        out = self_ov->data;
+        return true;
+    }
+    std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
     auto tit = mvcc_store_.find(tab);
     if (tit == mvcc_store_.end()) { out.assign(heap_data, len); return true; }
     auto cit = tit->second.find(mvcc_key(rid));
@@ -281,9 +398,13 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
 
 void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
                                      const char *data, int len) {
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
-    mvcc_dirty_.insert(tab);
-    any_mvcc_dirty_.store(true);
+    int64_t rkey = mvcc_key(rid);
+    std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+    {
+        std::scoped_lock<std::mutex> meta(mvcc_meta_latch_);
+        mvcc_dirty_.insert(tab);
+        any_mvcc_dirty_.store(true, std::memory_order_release);
+    }
     MvccChain &ch = mvcc_store_[tab][mvcc_key(rid)];
     ch.hist.clear();                          // 新插入：无已提交基础版本
     ch.writer = txn->get_transaction_id();
@@ -293,20 +414,41 @@ void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, c
 }
 
 bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
-                                    const char *old_data, const char *new_data, int len, bool is_delete) {
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
-    mvcc_dirty_.insert(tab);
-    any_mvcc_dirty_.store(true);
-    MvccChain &ch = mvcc_store_[tab][mvcc_key(rid)];
-    // 写写冲突检测
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) {
-        return false;   // 另一未提交事务正持有该记录
+                                    const char *old_data, const char *new_data, int len, bool is_delete,
+                                    std::string *effective_out) {
+    int64_t rkey = mvcc_key(rid);
+    std::unique_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+    {
+        std::scoped_lock<std::mutex> meta(mvcc_meta_latch_);
+        mvcc_dirty_.insert(tab);
+        any_mvcc_dirty_.store(true, std::memory_order_release);
     }
+    MvccChain *chp = &mvcc_store_[tab][mvcc_key(rid)];
+    MvccChain &ch = *chp;
+    auto pit = pending_si_writes_[tab].find(rkey);
+    if (pit != pending_si_writes_[tab].end() && pit->second != txn->get_transaction_id()) return false;
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+    std::string rebased_new;
+    const char *write_ptr = new_data;
     if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         ch.hist.back().commit_ts > txn->get_read_ts()) {
-        return false;   // 该记录在本事务快照之后已被其他事务提交修改
+        if (ch.hist.back().is_deleted || (int)ch.hist.back().data.size() != len ||
+            !rebase_write_delta(sm_manager_, tab, old_data, new_data,
+                                ch.hist.back().data.data(), len, rebased_new)) {
+            return false;
+        }
+        write_ptr = rebased_new.data();
     }
-    bool first_touch = (ch.writer != txn->get_transaction_id());
+    bool first_touch = (ch.writer != txn->get_transaction_id()) &&
+                       (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
+    if (first_touch) {
+        for (auto *wr : *txn->get_write_set()) {
+            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
+                first_touch = false;
+                break;
+            }
+        }
+    }
     // 首次触及预先存在(未跟踪)的记录：以堆当前值作为基础已提交版本(commit_ts=0)
     if (ch.hist.empty() && ch.writer == INVALID_TXN_ID) {
         MvccVer base;
@@ -318,15 +460,16 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     ch.writer = txn->get_transaction_id();
     ch.writer_del = is_delete;
     if (is_delete) ch.writer_data.clear();
-    else ch.writer_data.assign(new_data, len);
+    else ch.writer_data.assign(write_ptr, len);
     if (first_touch)
         txn->append_write_record(new WriteRecord(is_delete ? WType::DELETE_TUPLE : WType::UPDATE_TUPLE, tab, rid));
+    if (effective_out != nullptr) *effective_out = ch.writer_data;
     return true;
 }
 
 bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
                                                   const char *rec_data, int key_off, int key_len) {
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    MvccAllShardsGuard all_shards(this);
     auto tit = mvcc_store_.find(tab);
     if (tit == mvcc_store_.end()) return false;
     txn_id_t me = txn->get_transaction_id();
@@ -352,9 +495,10 @@ bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::s
 }
 
 /* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------
- * 锁约定：ser_record_read/pred、ser_write_check、ser_read_check 自持 mvcc_latch_；
- * 内部 helper(ser_finish/ser_add_edge/ser_overlap/ser_dangerous/ser_record_matches) 假定调用方已持锁。*/
-
+ * 锁约定：ser_record_read/pred、ser_write_check 自持 mvcc_meta_latch_；
+ * ser_read_check 持分片锁 + meta；表扫描持全分片锁。
+ * 内部 helper 假定调用方已持对应锁。
+ */
 bool TransactionManager::is_ser(Transaction *txn) {
     return txn && txn->get_txn_mode() &&
            txn->get_isolation_level() == IsolationLevel::SERIALIZABLE;
@@ -408,7 +552,7 @@ bool TransactionManager::ser_record_matches(const std::string &tab, const char *
 }
 
 void TransactionManager::ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid) {
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     SerInfo &info = ser_[txn->get_transaction_id()];
     info.read_ts = txn->get_read_ts();
     info.read_rids.push_back({tab, mvcc_key(rid)});
@@ -416,7 +560,7 @@ void TransactionManager::ser_record_read(Transaction *txn, const std::string &ta
 
 void TransactionManager::ser_record_pred(Transaction *txn, const std::string &tab,
                                          const std::vector<Condition> &conds) {
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     SerInfo &info = ser_[txn->get_transaction_id()];
     info.read_ts = txn->get_read_ts();
     info.read_preds.push_back({tab, conds});
@@ -474,7 +618,7 @@ bool TransactionManager::ser_write_check(Transaction *txn, const std::string &ta
                                          const Rid &rid, const char *data) {
     txn_id_t me = txn->get_transaction_id();
     int64_t key = mvcc_key(rid);
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     SerInfo &my = ser_[me];
     my.read_ts = txn->get_read_ts();
     bool dangerous = false;
@@ -498,7 +642,8 @@ bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
     int64_t key = mvcc_key(rid);
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, key)]);
+    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     SerInfo &my = ser_[me];
     my.read_ts = rts;
     bool dangerous = false;
@@ -524,7 +669,8 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
                                              const std::vector<Condition> &conds) {
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
+    MvccAllShardsGuard all_shards(this);
+    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     auto tit = mvcc_store_.find(tab);
     if (tit == mvcc_store_.end()) return false;
     bool dangerous = false;
@@ -551,15 +697,8 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
 
 bool TransactionManager::table_is_dirty(const std::string &tab) {
     if (!any_mvcc_dirty_.load()) return false;
-    std::scoped_lock<std::mutex> lck(mvcc_latch_);
-    auto tit = mvcc_store_.find(tab);
-    if (tit == mvcc_store_.end() || tit->second.empty()) return false;
-    for (auto &kv : tit->second) {
-        const MvccChain &ch = kv.second;
-        if (ch.writer != INVALID_TXN_ID) return true;
-        if (ch.hist.empty()) return true;
-    }
-    return false;
+    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    return mvcc_dirty_.count(tab) != 0;
 }
 
 void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid) {
@@ -569,15 +708,8 @@ void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const R
     if (cit == tit->second.end()) return;
     MvccChain &ch = cit->second;
     if (ch.writer != INVALID_TXN_ID || ch.hist.empty() || ch.hist.back().is_deleted) return;
-    RmFileHandle *fh = sm_manager_->fhs_.at(tab).get();
-    if (!fh->is_record(rid)) return;
-    auto heap_rec = fh->get_record(rid, nullptr);
-    const MvccVer &last = ch.hist.back();
-    if ((int)last.data.size() == heap_rec->size &&
-        memcmp(heap_rec->data, last.data.data(), heap_rec->size) == 0) {
-        tit->second.erase(cit);
-        if (tit->second.empty()) mvcc_store_.erase(tit);
-    }
+    // 保留已提交版本链供快照读；过早 prune 会使 read_ts 较旧的事务误读堆上最新值
+    return;
 }
 
 void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecord *wr) {

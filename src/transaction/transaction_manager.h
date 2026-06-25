@@ -11,7 +11,9 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <optional>
 #include <functional>
@@ -167,6 +169,12 @@ public:
     static inline int64_t mvcc_key(const Rid &rid) {
         return ((int64_t)rid.page_no << 32) | (uint32_t)rid.slot_no;
     }
+    static inline Rid mvcc_rid(int64_t key) {
+        Rid r;
+        r.page_no = (int)(key >> 32);
+        r.slot_no = (int)(key & 0xffffffff);
+        return r;
+    }
 
     /* 活跃显式事务数：>0 时写操作才需维护版本，否则单语句直接落堆（避免批量加载开销） */
     bool mvcc_should_version() const { return active_explicit_count_.load() > 0; }
@@ -189,7 +197,8 @@ public:
     /* 题9 唯一索引: 该 (table,rid) 是否被另一活跃事务持写(未提交插入/更新/删除)。用于
        并发同键插入的写写冲突检测——避免 MVCC 感知唯一检查把他人未提交插入误判为可重插。*/
     bool mvcc_other_writer(const std::string &tab, const Rid &rid, txn_id_t me) {
-        std::scoped_lock<std::mutex> lck(mvcc_latch_);
+        size_t sh = mvcc_shard_idx(tab, mvcc_key(rid));
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
         auto tit = mvcc_store_.find(tab);
         if (tit == mvcc_store_.end()) return false;
         auto cit = tit->second.find(mvcc_key(rid));
@@ -210,7 +219,8 @@ public:
                      const char *data, int len);
     /* 写(update/delete)：写写冲突检测 + 登记未提交版本；冲突返回 false（调用方应 abort 该事务） */
     bool mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
-                    const char *old_data, const char *new_data, int len, bool is_delete);
+                    const char *old_data, const char *new_data, int len, bool is_delete,
+                    std::string *effective_new = nullptr);
 
     /* ------------------------ 题9：SER（SSI 风格可串行化） ------------------------ */
     bool is_ser(Transaction *txn);
@@ -223,6 +233,8 @@ public:
     bool ser_read_check(Transaction *txn, const std::string &tab, const Rid &rid);
     /* 读时(谓词)：版本存储中匹配本次谓词、但本事务快照不可见的他事务写(含幻影插入) → rw 反依赖 */
     bool ser_read_pred_check(Transaction *txn, const std::string &tab, const std::vector<Condition> &conds);
+
+    void release_statement_writes(Transaction *txn);
 
 private:
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
@@ -237,13 +249,16 @@ private:
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
 
     /* 题9 MVCC 状态 */
+    static constexpr size_t MVCC_NSHARDS = 64;
     std::atomic<int> active_explicit_count_{0};   // 活跃显式事务数
-    std::atomic<bool> any_mvcc_dirty_{false};     // 是否曾有任何 MVCC 写（无则全程快路径，零开销）
-    std::mutex mvcc_latch_;                       // 保护 mvcc_store_ / mvcc_dirty_
-    std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> mvcc_store_;  // table -> ridkey -> 版本链
-    std::unordered_set<std::string> mvcc_dirty_;  // 曾被 MVCC 写过的表
+    std::atomic<bool> any_mvcc_dirty_{false};
+    mutable std::mutex mvcc_meta_latch_;            // ser_ / active_rts_ / mvcc_dirty_ 元数据
+    mutable std::array<std::mutex, MVCC_NSHARDS> mvcc_shards_;  // 分片保护 mvcc_store_ 链
+    std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> mvcc_store_;
+    std::unordered_map<std::string, std::unordered_map<int64_t, txn_id_t>> pending_si_writes_;
+    std::unordered_set<std::string> mvcc_dirty_;
 
-    /* 题9 SER (SSI) 状态 —— 复用 mvcc_latch_ 保护 */
+    /* 题9 SER (SSI) 状态 —— 由 mvcc_meta_latch_ 保护 */
     struct SerInfo {
         timestamp_t read_ts = 0;
         timestamp_t commit_ts = 0;     // 0 = 未提交(活跃)
@@ -260,6 +275,21 @@ private:
     bool ser_overlap(txn_id_t a, txn_id_t b);
     bool ser_dangerous(txn_id_t tin, txn_id_t tpiv, txn_id_t tout);
     bool ser_record_matches(const std::string &tab, const char *data, const std::vector<Condition> &conds);
+    size_t mvcc_shard_idx(const std::string &tab, int64_t rid_key = 0) const {
+        size_t h = std::hash<std::string>{}(tab);
+        if (rid_key) {
+            h ^= (size_t)rid_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+        return h % MVCC_NSHARDS;
+    }
+    void lock_all_mvcc_shards() const;
+    void unlock_all_mvcc_shards() const;
+    friend struct MvccAllShardsGuard;
     void prune_mvcc_after_commit(const std::string &tab, const Rid &rid);
     void physical_undo_write_record(Transaction *txn, WriteRecord *wr);
+    static std::string si_overlay_key(const std::string &tab, int64_t rkey) {
+        return tab + "#" + std::to_string(rkey);
+    }
+    void restore_writers_from_overlays(Transaction *txn);
+    void clear_pending_si_for_txn(Transaction *txn);
 };

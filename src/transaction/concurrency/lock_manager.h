@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <mutex>
 #include <condition_variable>
+#include <unordered_map>
+#include <memory>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -42,6 +44,12 @@ class LockManager {
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;   // 加锁队列的锁模式
     };
 
+    struct RecordLockEntry {
+        std::mutex mtx;
+        std::condition_variable cv;
+        txn_id_t owner = INVALID_TXN_ID;
+    };
+
 public:
     LockManager() {}
 
@@ -61,7 +69,12 @@ public:
 
     bool unlock(Transaction* txn, LockDataId lock_data_id);
 
+    void unlock_all(Transaction* txn);
+
 private:
+    RecordLockEntry &get_record_lock(const LockDataId &id);
+
     std::mutex latch_;      // 用于锁表的并发
     std::unordered_map<LockDataId, LockRequestQueue> lock_table_;   // 全局锁表
+    std::unordered_map<LockDataId, std::unique_ptr<RecordLockEntry>> record_locks_;
 };

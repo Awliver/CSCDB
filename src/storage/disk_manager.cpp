@@ -236,3 +236,10 @@ void DiskManager::write_log(char *log_data, int size) {
         remain -= (int)n;
     }
 }
+
+void DiskManager::sync_log() {
+    if (log_fd_ == -1) return;
+    if (fdatasync(log_fd_) != 0) {
+        throw UnixError();
+    }
+}

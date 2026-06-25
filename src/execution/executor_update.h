@@ -86,10 +86,24 @@ class UpdateExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> Next() override {
         for (const auto &rid : rids_) {
             char *slot = get_slot_ptr(rid);
+            std::vector<char> orig_rec(slot, slot + record_size_);
+            const bool mvcc_path = context_ && context_->txn_mgr_ && context_->txn_ &&
+                                   context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
+            std::string mvcc_effective;
 
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
-            if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_)) {
-                std::vector<char> mv_old(slot, slot + record_size_);
+            if (mvcc_path) {
+                if (context_->lock_mgr_ && (tab_name_ == "district" || tab_name_ == "warehouse")) {
+                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+                }
+                std::vector<char> mv_old(record_size_);
+                std::string visible;
+                if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid,
+                                                     slot, record_size_, visible)) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+                }
+                memcpy(mv_old.data(), visible.data(), record_size_);
                 std::vector<char> mv_new = mv_old;
                 for (const auto &set : set_clauses_) {
                     auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
@@ -98,11 +112,12 @@ class UpdateExecutor : public AbstractExecutor {
                     apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
                 }
                 if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
-                                                    mv_old.data(), mv_new.data(), record_size_, false)) {
+                                                    mv_old.data(), mv_new.data(), record_size_, false,
+                                                    &mvcc_effective)) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
-                // 题9 SER：旧记录 + 新记录 vs 其他事务读 → rw 反依赖；成 SSI 危险结构则 abort
+                // 未提交版本仅存 MVCC 链/overlay；堆在 commit 时物化，避免 overlay 释放后脏堆暴露
                 if (context_->txn_mgr_->is_ser(context_->txn_)) {
                     bool d1 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mv_old.data());
                     bool d2 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mv_new.data());
@@ -110,23 +125,29 @@ class UpdateExecutor : public AbstractExecutor {
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                         AbortReason::DEADLOCK_PREVENTION);
                 }
+                // district/warehouse 行锁保持到 commit/abort（unlock_all），避免 writer 未清时写写冲突 abort
             }
 
-            // 题3：先识别 SET 受影响的索引列；保存旧记录用于构造旧 key
+            // 题3：先识别 SET 受影响的索引列
             std::vector<char> old_data;
             bool need_index_sync = !tab_.indexes.empty();
             if (need_index_sync) {
-                old_data.assign(slot, slot + record_size_);
+                old_data = orig_rec;
             }
 
             // 题3 测试点 3：先模拟应用 SET 到 new_data，检查唯一索引违反
             if (need_index_sync) {
-                std::vector<char> new_data = old_data;  // 拷贝
-                for (const auto &set : set_clauses_) {
-                    auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
-                                               [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
-                    if (col_it == tab_.cols.end()) continue;
-                    apply_set_value(old_data.data(), new_data.data() + col_it->offset, set, *col_it);
+                std::vector<char> new_data;
+                if (mvcc_path) {
+                    new_data.assign(mvcc_effective.data(), mvcc_effective.data() + record_size_);
+                } else {
+                    new_data = old_data;
+                    for (const auto &set : set_clauses_) {
+                        auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                                   [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                        if (col_it == tab_.cols.end()) continue;
+                        apply_set_value(old_data.data(), new_data.data() + col_it->offset, set, *col_it);
+                    }
                 }
                 bool violated = false;
                 for (auto &index : tab_.indexes) {
@@ -184,20 +205,22 @@ class UpdateExecutor : public AbstractExecutor {
                 ih->delete_entry(old_key.data(), context_ ? context_->txn_ : nullptr);
             }
 
-            // 应用 SET 子句到 slot（原地写）。算术增量从更新前的原始记录读基值。
-            std::vector<char> orig_rec(slot, slot + record_size_);
+            // 应用 SET 子句到 slot（非 MVCC 路径）
+            if (!mvcc_path) {
             for (const auto &set : set_clauses_) {
                 auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                            [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                 if (col_it == tab_.cols.end()) continue;
                 apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
             }
+            }
 
             // 题10 WAL：记录更新前后镜像
             if (context_ && context_->log_mgr_ && context_->txn_) {
                 RmRecord old_rec(record_size_), new_rec(record_size_);
                 memcpy(old_rec.data, orig_rec.data(), record_size_);
-                memcpy(new_rec.data, slot, record_size_);
+                if (mvcc_path) memcpy(new_rec.data, mvcc_effective.data(), record_size_);
+                else memcpy(new_rec.data, slot, record_size_);
                 Rid r = rid;
                 UpdateLogRecord lr(context_->txn_->get_transaction_id(), old_rec, new_rec, r, tab_name_);
                 context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
@@ -223,7 +246,8 @@ class UpdateExecutor : public AbstractExecutor {
                 std::vector<char> new_key(index.col_tot_len);
                 int offset = 0;
                 for (auto &idx_col : index.cols) {
-                    memcpy(new_key.data() + offset, slot + idx_col.offset, idx_col.len);
+                    const char *src = mvcc_path ? mvcc_effective.data() : slot;
+                    memcpy(new_key.data() + offset, src + idx_col.offset, idx_col.len);
                     offset += idx_col.len;
                 }
                 auto ih = sm_manager_->ihs_.at(

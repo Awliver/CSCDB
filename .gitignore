@@ -108,6 +108,6 @@ scratch/
 notes/personal/
 
 # ============================================
-# local_test
+# local test suites (do not upload)
 # ============================================
-tests/local
+tests/

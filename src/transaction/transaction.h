@@ -103,6 +103,17 @@ class Transaction {
     inline void set_commit_ts(timestamp_t commit_ts) { commit_ts_ = commit_ts; }
     inline void set_isolation_level(IsolationLevel level) { isolation_level_ = level; }
 
+    struct SiOverlay {
+        std::string data;
+        bool is_deleted = false;
+    };
+    void put_si_overlay(const std::string &key, SiOverlay val) { si_overlay_[key] = std::move(val); }
+    const SiOverlay *get_si_overlay(const std::string &key) const {
+        auto it = si_overlay_.find(key);
+        return it == si_overlay_.end() ? nullptr : &it->second;
+    }
+    std::unordered_map<std::string, SiOverlay> &si_overlays() { return si_overlay_; }
+
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
         std::scoped_lock<std::mutex> lck(latch_);
@@ -149,6 +160,7 @@ class Transaction {
   * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。
   */
   std::vector<UndoLog> undo_logs_;
+  std::unordered_map<std::string, SiOverlay> si_overlay_;
   /** 用于访问事务级撤销日志的锁。 */
   std::mutex latch_;
 };

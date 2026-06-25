@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <vector>
 #include <iostream>
 #include "log_defs.h"
@@ -340,10 +342,12 @@ public:
 /* 日志管理器，负责把日志写入日志缓冲区，以及把日志缓冲区中的内容写入磁盘中 */
 class LogManager {
 public:
-    LogManager(DiskManager* disk_manager) { disk_manager_ = disk_manager; }
+    LogManager(DiskManager* disk_manager);
+    ~LogManager();
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
     void flush_log_to_disk();
+    void wait_for_persist(lsn_t target_lsn);
 
     LogBuffer* get_log_buffer() { return &log_buffer_; }
 
@@ -360,9 +364,15 @@ public:
 
 private:
     void flush_nolock();
+    void flush_worker();
 
     std::atomic<lsn_t> global_lsn_{0};  // 全局lsn，递增，用于为每条记录分发lsn
     std::mutex latch_;                  // 用于对log_buffer_的互斥访问
+    std::condition_variable cv_;
+    std::condition_variable persist_cv_;
+    std::thread flush_thread_;
+    bool stop_{false};
+    bool flush_requested_{false};
     LogBuffer log_buffer_;              // 日志缓冲区
     lsn_t persist_lsn_ = INVALID_LSN;   // 记录已经持久化到磁盘中的最后一条日志的日志号
     long total_offset_ = 0;             // 题10：日志文件逻辑总长（磁盘已刷 + 缓冲未刷）

@@ -26,9 +26,10 @@ See the Mulan PSL v2 for more details. */
 #include "parser/ast.h"
 #include "common/output_control.h"
 #include <cctype>
+#include <cstring>
 
 #define SOCK_PORT 8765
-#define MAX_CONN_LIMIT 8
+#define MAX_CONN_LIMIT 32
 
 static bool should_exit = false;
 
@@ -98,6 +99,245 @@ static bool write_all(int fd, const char *buf, int len) {
         len -= (int)n;
     }
     return true;
+}
+
+/* ---------- TPC-C 热路径 SQL 快解析（绕过全局 yacc 锁） ---------- */
+static const char *fp_skipws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    return p;
+}
+
+static bool fp_kw(const char *&p, const char *k) {
+    p = fp_skipws(p);
+    const char *q = p;
+    for (; *k; ++k, ++q)
+        if (tolower((unsigned char)*q) != *k) return false;
+    p = q;
+    return true;
+}
+
+static bool fp_ident(const char *&p, std::string &out) {
+    p = fp_skipws(p);
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return false;
+    const char *s = p;
+    while (isalnum((unsigned char)*p) || *p == '_') ++p;
+    out.assign(s, p - s);
+    return true;
+}
+
+static bool fp_trailing_ok(const char *&p) {
+    p = fp_skipws(p);
+    if (*p == ';') { ++p; p = fp_skipws(p); }
+    return *p == '\0';
+}
+
+static bool fp_parse_number(const char *&p, std::shared_ptr<ast::Value> &val) {
+    p = fp_skipws(p);
+    bool neg = false;
+    if (*p == '-') { neg = true; ++p; }
+    else if (*p == '+') ++p;
+    const char *s = p;
+    if (!isdigit((unsigned char)*p)) return false;
+    while (isdigit((unsigned char)*p)) ++p;
+    bool is_float = false;
+    if (*p == '.') {
+        is_float = true;
+        ++p;
+        if (!isdigit((unsigned char)*p)) return false;
+        while (isdigit((unsigned char)*p)) ++p;
+    }
+    std::string num(s, p - s);
+    if (neg) num = "-" + num;
+    if (is_float) val = std::make_shared<ast::FloatLit>((float)atof(num.c_str()));
+    else val = std::make_shared<ast::IntLit>(atoi(num.c_str()));
+    return true;
+}
+
+static bool fp_parse_string(const char *&p, std::shared_ptr<ast::Value> &val) {
+    p = fp_skipws(p);
+    if (*p != '\'') return false;
+    ++p;
+    const char *s = p;
+    while (*p && *p != '\'') ++p;
+    if (*p != '\'') return false;
+    val = std::make_shared<ast::StringLit>(std::string(s, p - s));
+    ++p;
+    return true;
+}
+
+static bool fp_parse_value(const char *&p, std::shared_ptr<ast::Value> &val) {
+    p = fp_skipws(p);
+    if (*p == '\'') return fp_parse_string(p, val);
+    return fp_parse_number(p, val);
+}
+
+static bool fp_parse_uint(const char *&p, int &out) {
+    p = fp_skipws(p);
+    if (!isdigit((unsigned char)*p)) return false;
+    int v = 0;
+    while (isdigit((unsigned char)*p)) {
+        v = v * 10 + (*p - '0');
+        ++p;
+    }
+    out = v;
+    return true;
+}
+
+static bool fp_parse_where_eq(const char *&p, std::vector<std::shared_ptr<ast::BinaryExpr>> &conds) {
+    if (!fp_kw(p, "where")) return true;
+    while (true) {
+        std::string col;
+        if (!fp_ident(p, col)) return false;
+        if (!fp_kw(p, "=")) return false;
+        std::shared_ptr<ast::Value> val;
+        if (!fp_parse_value(p, val)) return false;
+        auto lhs = std::make_shared<ast::Col>("", col);
+        conds.push_back(std::make_shared<ast::BinaryExpr>(lhs, ast::SV_OP_EQ, val));
+        p = fp_skipws(p);
+        if (fp_kw(p, "and")) continue;
+        break;
+    }
+    return true;
+}
+
+static std::shared_ptr<ast::TreeNode> try_fast_parse_txn(const char *s) {
+    const char *p = s;
+    if (fp_kw(p, "begin") && fp_trailing_ok(p)) return std::make_shared<ast::TxnBegin>();
+    p = s;
+    if (fp_kw(p, "commit") && fp_trailing_ok(p)) return std::make_shared<ast::TxnCommit>();
+    p = s;
+    if (fp_kw(p, "abort") && fp_trailing_ok(p)) return std::make_shared<ast::TxnAbort>();
+    return nullptr;
+}
+
+static std::shared_ptr<ast::TreeNode> try_fast_parse_select(const char *s) {
+    const char *p = s;
+    if (!fp_kw(p, "select")) return nullptr;
+
+    std::vector<std::shared_ptr<ast::Col>> cols;
+    std::vector<std::shared_ptr<ast::AggExpr>> aggs;
+    const char *q = fp_skipws(p);
+    if (tolower((unsigned char)*q) == 'c' && strncasecmp(q, "count", 5) == 0) {
+        p = q + 5;
+        p = fp_skipws(p);
+        if (*p != '(') return nullptr;
+        ++p;
+        p = fp_skipws(p);
+        if (*p != '*') return nullptr;
+        ++p;
+        p = fp_skipws(p);
+        if (*p != ')') return nullptr;
+        ++p;
+        aggs.push_back(std::make_shared<ast::AggExpr>(ast::AGG_COUNT, nullptr, "", true));
+    } else {
+        while (true) {
+            std::string col;
+            if (!fp_ident(p, col)) return nullptr;
+            cols.push_back(std::make_shared<ast::Col>("", col));
+            p = fp_skipws(p);
+            if (*p == ',') { ++p; continue; }
+            break;
+        }
+    }
+
+    if (!fp_kw(p, "from")) return nullptr;
+    std::string tab;
+    if (!fp_ident(p, tab)) return nullptr;
+
+    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
+    if (!fp_parse_where_eq(p, conds)) return nullptr;
+
+    std::vector<std::shared_ptr<ast::OrderBy>> orders;
+    bool has_limit = false;
+    int limit_count = 0;
+    if (fp_kw(p, "order")) {
+        if (!fp_kw(p, "by")) return nullptr;
+        std::string order_col;
+        if (!fp_ident(p, order_col)) return nullptr;
+        ast::OrderByDir dir = ast::OrderBy_DEFAULT;
+        if (fp_kw(p, "asc")) dir = ast::OrderBy_ASC;
+        else if (fp_kw(p, "desc")) dir = ast::OrderBy_DESC;
+        orders.push_back(std::make_shared<ast::OrderBy>(std::make_shared<ast::Col>("", order_col), dir));
+    }
+    if (fp_kw(p, "limit")) {
+        if (!fp_parse_uint(p, limit_count)) return nullptr;
+        has_limit = true;
+    }
+    if (!fp_trailing_ok(p)) return nullptr;
+
+    return std::make_shared<ast::SelectStmt>(
+        cols, aggs, std::vector<std::string>{tab}, conds,
+        std::vector<std::shared_ptr<ast::Col>>{}, std::vector<std::shared_ptr<ast::BinaryExpr>>{},
+        orders, has_limit, limit_count);
+}
+
+static std::shared_ptr<ast::TreeNode> try_fast_parse_update(const char *s) {
+    const char *p = s;
+    if (!fp_kw(p, "update")) return nullptr;
+    std::string tab;
+    if (!fp_ident(p, tab)) return nullptr;
+    if (!fp_kw(p, "set")) return nullptr;
+
+    std::vector<std::shared_ptr<ast::SetClause>> sets;
+    while (true) {
+        std::string col;
+        if (!fp_ident(p, col)) return nullptr;
+        if (!fp_kw(p, "=")) return nullptr;
+        std::string rhs_col;
+        const char *peek = fp_skipws(p);
+        if (isalpha((unsigned char)*peek) || *peek == '_') {
+            const char *save = p;
+            if (fp_ident(p, rhs_col)) {
+                p = fp_skipws(p);
+                if (*p == '+' || *p == '-') {
+                    bool neg = (*p == '-');
+                    ++p;
+                    std::shared_ptr<ast::Value> delta;
+                    if (!fp_parse_number(p, delta)) return nullptr;
+                    sets.push_back(std::make_shared<ast::SetClause>(col, rhs_col, delta, neg));
+                    p = fp_skipws(p);
+                    if (*p == ',') { ++p; continue; }
+                    break;
+                }
+            }
+            p = save;
+        }
+        std::shared_ptr<ast::Value> val;
+        if (!fp_parse_value(p, val)) return nullptr;
+        sets.push_back(std::make_shared<ast::SetClause>(col, val));
+        p = fp_skipws(p);
+        if (*p == ',') { ++p; continue; }
+        break;
+    }
+
+    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
+    if (!fp_parse_where_eq(p, conds)) return nullptr;
+    if (!fp_trailing_ok(p)) return nullptr;
+
+    return std::make_shared<ast::UpdateStmt>(tab, sets, conds);
+}
+
+static std::shared_ptr<ast::TreeNode> try_fast_parse_delete(const char *s) {
+    const char *p = s;
+    if (!fp_kw(p, "delete")) return nullptr;
+    if (!fp_kw(p, "from")) return nullptr;
+    std::string tab;
+    if (!fp_ident(p, tab)) return nullptr;
+    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
+    if (!fp_parse_where_eq(p, conds)) return nullptr;
+    if (!fp_trailing_ok(p)) return nullptr;
+    return std::make_shared<ast::DeleteStmt>(tab, conds);
+}
+
+static std::shared_ptr<ast::TreeNode> try_fast_parse_insert(const char *s);
+
+static std::shared_ptr<ast::TreeNode> try_fast_parse_sql(const char *s) {
+    if (auto t = try_fast_parse_txn(s)) return t;
+    if (auto t = try_fast_parse_select(s)) return t;
+    if (auto t = try_fast_parse_update(s)) return t;
+    if (auto t = try_fast_parse_delete(s)) return t;
+    if (auto t = try_fast_parse_insert(s)) return t;
+    return nullptr;
 }
 
 // 简单单元组 INSERT 的手写快路径解析:仅识别 `insert into <表> values (字面量,...)`，
@@ -328,11 +568,46 @@ void *client_handler(void *sock_fd) {
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
+        std::shared_ptr<ast::TreeNode> fast_tree = try_fast_parse_sql(stmt);
+        if (fast_tree != nullptr) {
+            try {
+                std::shared_ptr<Query> query = analyze->do_analyze(fast_tree);
+                finish_analyze = true;
+                std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+                std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
+                portal->run(portalStmt, ql_manager.get(), &txn_id, context);
+                portal->drop();
+                if (context->txn_->get_txn_mode() &&
+                    context->txn_->get_state() != TransactionState::COMMITTED &&
+                    context->txn_->get_state() != TransactionState::ABORTED) {
+                    txn_manager->release_statement_writes(context->txn_);
+                }
+            } catch (TransactionAbortException &e) {
+                std::string str = "abort\n";
+                memcpy(data_send, str.c_str(), str.length());
+                data_send[str.length()] = '\0';
+                offset = str.length();
+                txn_manager->abort(context->txn_, log_manager.get());
+                std::cout << e.GetInfo() << std::endl;
+                append_output_file(str);
+            } catch (RMDBError &e) {
+                std::cerr << e.what() << std::endl;
+                memcpy(data_send, e.what(), e.get_msg_len());
+                data_send[e.get_msg_len()] = '\n';
+                data_send[e.get_msg_len() + 1] = '\0';
+                offset = e.get_msg_len() + 1;
+                append_output_file("failure\n");
+            } catch (std::exception &e) {
+                std::cerr << e.what() << std::endl;
+                memcpy(data_send, "failure\n", 8);
+                data_send[8] = '\0';
+                offset = 8;
+                append_output_file("failure\n");
+            }
+        } else {
         pthread_mutex_lock(buffer_mutex);
         YY_BUFFER_STATE buf = yy_scan_string(stmt);
-        std::shared_ptr<ast::TreeNode> fast_tree = try_fast_parse_insert(stmt);
-        if (fast_tree != nullptr) ast::parse_tree = fast_tree;
-        if (fast_tree != nullptr || yyparse() == 0) {
+        if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
                     // analyze and rewrite
@@ -344,6 +619,11 @@ void *client_handler(void *sock_fd) {
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context);
                     portal->drop();
+                    if (context->txn_->get_txn_mode() &&
+                        context->txn_->get_state() != TransactionState::COMMITTED &&
+                        context->txn_->get_state() != TransactionState::ABORTED) {
+                        txn_manager->release_statement_writes(context->txn_);
+                    }
                 } catch (TransactionAbortException &e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     std::string str = "abort\n";
@@ -391,6 +671,7 @@ void *client_handler(void *sock_fd) {
             yy_delete_buffer(buf);
             pthread_mutex_unlock(buffer_mutex);
         }
+        }  // end yacc path
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务。
         // 必须先提交（WAL 落盘）再回复客户端：回复即持久，否则 ack 后崩溃会丢已确认语句
         if(context->txn_->get_txn_mode() == false)
@@ -405,6 +686,20 @@ void *client_handler(void *sock_fd) {
             break;
         }
         txn_manager->reap(context->txn_);
+    }
+
+    // 客户端断开时回滚显式事务并释放行锁，避免热行锁泄漏拖死后续连接
+    if (txn_id != INVALID_TXN_ID) {
+        Transaction *t = txn_manager->get_transaction(txn_id);
+        if (t != nullptr) {
+            if (t->get_txn_mode() &&
+                t->get_state() != TransactionState::COMMITTED &&
+                t->get_state() != TransactionState::ABORTED) {
+                txn_manager->abort(t, log_manager.get());
+            } else {
+                txn_manager->reap(t);
+            }
+        }
     }
 
     // Clear

@@ -34,7 +34,6 @@ bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
 void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id) {
     if (page->is_dirty_)
     {
-        if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(page->id_.fd, page->id_.page_no,
                                   page->data_, PAGE_SIZE);
         page->is_dirty_ = false;
@@ -56,24 +55,69 @@ void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t n
  * @param {PageId} page_id 需要获取的页的PageId
  */
 Page* BufferPoolManager::fetch_page(PageId page_id) {
-    std::scoped_lock lock{latch_};
-    auto it = page_table_.find(page_id);
-    if (it != page_table_.end()) {
-        frame_id_t frame_id = it->second;
-        if (pages_[frame_id].pin_count_ == 0)
-        {
-            replacer_->pin(frame_id);
+    PageId old_page_id{-1, INVALID_PAGE_ID};
+    frame_id_t frame_id = INVALID_FRAME_ID;
+    bool need_flush_old = false;
+    while (true) {
+        std::unique_lock<std::mutex> lock(latch_);
+        auto it = page_table_.find(page_id);
+        if (it != page_table_.end()) {
+            frame_id_t hit_frame = it->second;
+            if (frame_io_inflight_[hit_frame]) {
+                io_cv_.wait(lock, [&] { return !frame_io_inflight_[hit_frame]; });
+                continue;
+            }
+            if (pages_[hit_frame].pin_count_ == 0) {
+                replacer_->pin(hit_frame);
+            }
+            pages_[hit_frame].pin_count_++;
+            return &pages_[hit_frame];
         }
-        pages_[frame_id].pin_count_++;
-        return &pages_[frame_id];
+        if (page_io_inflight_.count(page_id)) {
+            io_cv_.wait(lock, [&] { return page_io_inflight_.count(page_id) == 0; });
+            continue;
+        }
+        if (!find_victim_page(&frame_id)) return nullptr;
+        Page &victim = pages_[frame_id];
+        old_page_id = victim.id_;
+        need_flush_old = victim.is_dirty_;
+        if (old_page_id.page_no != INVALID_PAGE_ID) {
+            page_table_.erase(old_page_id);
+        }
+        victim.pin_count_ = 1;  // 预占该 frame，避免并发 victim 选中
+        replacer_->pin(frame_id);
+        frame_io_inflight_[frame_id] = true;
+        page_io_inflight_.insert(page_id);
+        break;
     }
-    frame_id_t frame_id;
-    if (!find_victim_page(&frame_id)) return nullptr;
-    update_page(&pages_[frame_id], page_id, frame_id);
-    disk_manager_->read_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
-    pages_[frame_id].pin_count_ = 1;
-    replacer_->pin(frame_id);
-    return &pages_[frame_id];
+    try {
+        if (need_flush_old) {
+            disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+        }
+        disk_manager_->read_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+    } catch (...) {
+        std::scoped_lock<std::mutex> lock{latch_};
+        Page &victim = pages_[frame_id];
+        victim.id_ = PageId{-1, INVALID_PAGE_ID};
+        victim.pin_count_ = 0;
+        victim.is_dirty_ = false;
+        frame_io_inflight_[frame_id] = false;
+        page_io_inflight_.erase(page_id);
+        free_list_.push_back(frame_id);
+        io_cv_.notify_all();
+        throw;
+    }
+    {
+        std::scoped_lock<std::mutex> lock{latch_};
+        Page &victim = pages_[frame_id];
+        victim.id_ = page_id;
+        victim.is_dirty_ = false;
+        page_table_[page_id] = frame_id;
+        frame_io_inflight_[frame_id] = false;
+        page_io_inflight_.erase(page_id);
+        io_cv_.notify_all();
+        return &victim;
+    }
 }
 
 /**
@@ -105,8 +149,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) return false;
     frame_id_t frame_id = it->second;
-    if (g_log_manager) g_log_manager->flush_log_to_disk();
-        disk_manager_->write_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+    disk_manager_->write_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
     pages_[frame_id].is_dirty_ = false;
     return true;
 }
@@ -140,7 +183,6 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     Page& page = pages_[frame_id];
     if (page.pin_count_ != 0) return false;
     if (page.is_dirty_) {
-        if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(page.id_.fd, page.id_.page_no, page.data_, PAGE_SIZE);
     }
     page_table_.erase(it);
@@ -163,7 +205,6 @@ void BufferPoolManager::flush_all_pages(int fd) {
         const PageId& pid = entry.first;
         if (pid.fd != fd) continue;
         frame_id_t frame_id = entry.second;
-        if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(pid.fd, pid.page_no, pages_[frame_id].data_, PAGE_SIZE);
         pages_[frame_id].is_dirty_ = false;
     }
@@ -181,8 +222,7 @@ void BufferPoolManager::delete_all_pages(int fd) {
         frame_id_t frame_id = it->second;
         Page& page = pages_[frame_id];
         if (page.is_dirty_) {
-            if (g_log_manager) g_log_manager->flush_log_to_disk();
-        disk_manager_->write_page(pid.fd, pid.page_no, page.data_, PAGE_SIZE);
+            disk_manager_->write_page(pid.fd, pid.page_no, page.data_, PAGE_SIZE);
         }
         // 重置帧元数据
         page.id_ = PageId{-1, INVALID_PAGE_ID};
