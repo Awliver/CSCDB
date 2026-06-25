@@ -261,7 +261,11 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         write_set->clear();
     }
 
-    if (log_manager != nullptr && (had_writes || txn->get_txn_mode())) {
+    // 自动提交的 insert 等会直接写 WAL（设置 prev_lsn）但不进 write_set（非 versioning 路径），
+    // 此时 had_writes 为假。若仅凭 had_writes/txn_mode 判定，会漏写 commit 记录 → 恢复时该事务
+    // 被当作 loser 撤销，已提交数据丢失。凡产生过 redo 日志（prev_lsn 有效）必须落 commit 记录。
+    const bool wrote_log = txn->get_prev_lsn() != INVALID_LSN;
+    if (log_manager != nullptr && (had_writes || txn->get_txn_mode() || wrote_log)) {
         CommitLogRecord lr(txn->get_transaction_id());
         lsn_t lsn = log_manager->add_log_to_buffer(&lr);
         log_manager->wait_for_persist(lsn);
@@ -285,6 +289,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
     auto write_set = txn->get_write_set();
     const bool had_writes = !write_set->empty();
+    // 与 commit 对称：每条语句后 release_statement_writes 已把未提交写移入 overlay 并清空
+    // ch.writer，回滚前必须先恢复，否则下方按 ch.writer==me 的正常 MVCC 撤销路径全部落空，
+    // 转入 physical_undo_write_record 用空 WriteRecord 数据覆写堆 → 崩溃/脏数据。
+    restore_writers_from_overlays(txn);
     for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
         WriteRecord *wr = *it;
         const std::string &tab = wr->GetTableName();

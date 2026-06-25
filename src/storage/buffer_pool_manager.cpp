@@ -34,6 +34,7 @@ bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
 void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t new_frame_id) {
     if (page->is_dirty_)
     {
+        if (g_log_manager) g_log_manager->flush_log_to_disk();   // WAL：脏数据页落盘前先刷日志
         disk_manager_->write_page(page->id_.fd, page->id_.page_no,
                                   page->data_, PAGE_SIZE);
         page->is_dirty_ = false;
@@ -92,6 +93,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     }
     try {
         if (need_flush_old) {
+            if (g_log_manager) g_log_manager->flush_log_to_disk();   // WAL：淘汰脏页落盘前先刷日志
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
         }
         disk_manager_->read_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
@@ -149,6 +151,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) return false;
     frame_id_t frame_id = it->second;
+    if (g_log_manager) g_log_manager->flush_log_to_disk();   // WAL：数据页落盘前先刷日志
     disk_manager_->write_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
     pages_[frame_id].is_dirty_ = false;
     return true;
@@ -183,6 +186,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     Page& page = pages_[frame_id];
     if (page.pin_count_ != 0) return false;
     if (page.is_dirty_) {
+        if (g_log_manager) g_log_manager->flush_log_to_disk();   // WAL：脏页落盘前先刷日志
         disk_manager_->write_page(page.id_.fd, page.id_.page_no, page.data_, PAGE_SIZE);
     }
     page_table_.erase(it);
@@ -201,6 +205,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
  */
 void BufferPoolManager::flush_all_pages(int fd) {
     std::scoped_lock lock{latch_};
+    if (g_log_manager) g_log_manager->flush_log_to_disk();   // WAL：批量刷脏页前先把日志全部落盘
     for (auto& entry : page_table_) {
         const PageId& pid = entry.first;
         if (pid.fd != fd) continue;
@@ -216,6 +221,7 @@ void BufferPoolManager::flush_all_pages(int fd) {
  */
 void BufferPoolManager::delete_all_pages(int fd) {
     std::scoped_lock lock{latch_};
+    if (g_log_manager) g_log_manager->flush_log_to_disk();   // WAL：刷脏页前先把日志全部落盘
     for (auto it = page_table_.begin(); it != page_table_.end(); ) {
         const PageId& pid = it->first;
         if (pid.fd != fd) { ++it; continue; }
