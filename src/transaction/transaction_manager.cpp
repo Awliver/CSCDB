@@ -14,41 +14,16 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "index/ix.h"
 #include <algorithm>
-#include <chrono>
 #include <cstring>
-#include <fstream>
 #include <limits>
-#include <mutex>
 #include <unordered_set>
 
 namespace {
 
-// #region agent log
-static bool dbg_tpcc_tab(const std::string &tab) {
-    return tab == "district" || tab == "warehouse" || tab == "orders" ||
-           tab == "new_orders" || tab == "order_line" || tab == "stock" || tab == "history";
-}
-
-static int dbg_district_next_oid(const std::string &data) {
+static int district_next_oid(const std::string &data) {
     if (data.size() < 101) return -1;
     return *reinterpret_cast<const int *>(data.data() + 97);
 }
-
-static std::mutex dbg_log_mutex;
-
-static void dbg_log(const char *hypothesisId, const char *location, const char *message,
-                    const std::string &data_json) {
-    using clock = std::chrono::system_clock;
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
-    std::lock_guard<std::mutex> guard(dbg_log_mutex);
-    std::ofstream f("/home/neo/CSC_DB/db2026/.cursor/debug-2b3fe6.log", std::ios::app);
-    if (!f) return;
-    f << "{\"sessionId\":\"2b3fe6\",\"hypothesisId\":\"" << hypothesisId
-      << "\",\"location\":\"" << location << "\",\"message\":\"" << message
-      << "\",\"data\":" << data_json << ",\"timestamp\":" << ms << "}\n";
-}
-// #endregion
-
 
 void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const Rid &rid,
                              WType wtype, const std::string &old_data, const std::string &new_data) {
@@ -276,16 +251,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             if (!ch.writer_del) v.data = ch.writer_data;
             // district 计数器在并发 SI 下必须严格单调递增，禁止陈旧写覆盖新值
             if (tab == "district" && !ch.writer_del && !v.data.empty() && !ch.hist.empty()) {
-                int back_n = dbg_district_next_oid(ch.hist.back().data);
-                int new_n = dbg_district_next_oid(v.data);
+                int back_n = district_next_oid(ch.hist.back().data);
+                int new_n = district_next_oid(v.data);
                 if (new_n <= back_n) {
-                    // #region agent log
-                    dbg_log("H10", "transaction_manager.cpp:commit",
-                            "district_commit_clamp",
-                            "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                                ",\"was\":" + std::to_string(new_n) +
-                                ",\"back\":" + std::to_string(back_n) + "}");
-                    // #endregion
                     *(int *)(v.data.data() + 97) = back_n + 1;
                     ch.writer_data = v.data;
                 }
@@ -294,26 +262,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             if (!ch.writer_del && !ch.writer_data.empty()) {
                 sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(), (char *)ch.writer_data.data(), nullptr);
             }
-            // #region agent log
-            if (tab == "district") {
-                dbg_log("H6", "transaction_manager.cpp:commit",
-                        "district_commit",
-                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                            ",\"cts\":" + std::to_string(cts) +
-                            ",\"next\":" + std::to_string(dbg_district_next_oid(ch.writer_data)) + "}");
-            }
-            // #endregion
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
             prune_mvcc_after_commit(tab, wr->GetRid());
-        } else if (tab == "district") {
-            // #region agent log
-            dbg_log("H10", "transaction_manager.cpp:commit",
-                    "district_commit_skipped",
-                    "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                        ",\"writer\":" + std::to_string(
-                            (cit != tit->second.end()) ? ch.writer : -1) + "}");
-            // #endregion
         }
     }
     {
@@ -352,14 +303,6 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
     auto write_set = txn->get_write_set();
     const bool had_writes = !write_set->empty();
-    // #region agent log
-    if (!had_writes && !txn->si_overlays().empty()) {
-        dbg_log("H2", "transaction_manager.cpp:abort",
-                "abort_empty_write_set_with_overlays",
-                "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                    ",\"overlays\":" + std::to_string(txn->si_overlays().size()) + "}");
-    }
-    // #endregion
     // 与 commit 对称：每条语句后 release_statement_writes 已把未提交写移入 overlay 并清空
     // ch.writer，回滚前必须先恢复，否则下方按 ch.writer==me 的正常 MVCC 撤销路径全部落空，
     // 转入 physical_undo_write_record 用空 WriteRecord 数据覆写堆 → 崩溃/脏数据。
@@ -406,31 +349,13 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                         bool restore_heap = !last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid());
                         if (restore_heap && tab == "district") {
                             auto cur = fh->get_record(wr->GetRid(), nullptr);
-                            int heap_next = dbg_district_next_oid(
+                            int heap_next = district_next_oid(
                                 std::string(cur->data, (size_t)fh->get_file_hdr().record_size));
-                            int restore_next = dbg_district_next_oid(last.data);
-                            if (heap_next > restore_next) {
-                                // #region agent log
-                                dbg_log("H9", "transaction_manager.cpp:abort",
-                                        "district_abort_skip_stomp",
-                                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                                            ",\"heap_next\":" + std::to_string(heap_next) +
-                                            ",\"restore_next\":" + std::to_string(restore_next) + "}");
-                                // #endregion
-                                restore_heap = false;
-                            }
+                            int restore_next = district_next_oid(last.data);
+                            if (heap_next > restore_next) restore_heap = false;
                         }
                         if (restore_heap) {
                             fh->update_record(wr->GetRid(), (char *)last.data.data(), nullptr);
-                            // #region agent log
-                            if (tab == "district") {
-                                dbg_log("H6", "transaction_manager.cpp:abort",
-                                        "district_abort_restore",
-                                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                                            ",\"next\":" + std::to_string(dbg_district_next_oid(last.data)) +
-                                            "}");
-                            }
-                            // #endregion
                         }
                         if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty()) {
                             rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
@@ -445,15 +370,6 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         }
         if (!undone) {
             if (mvcc_undone_keys.count(undo_key)) continue;
-            // #region agent log
-            if (dbg_tpcc_tab(tab)) {
-                dbg_log("H1", "transaction_manager.cpp:abort",
-                        "physical_undo_fallback",
-                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                            ",\"tab\":\"" + tab + "\",\"wtype\":" +
-                            std::to_string(static_cast<int>(wr->GetWriteType())) + "}");
-            }
-            // #endregion
             physical_undo_write_record(txn, wr);
         }
     }
@@ -558,18 +474,6 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
             return false;
         }
         write_ptr = rebased_new.data();
-        // #region agent log
-        if (tab == "district") {
-            int want = dbg_district_next_oid(std::string(new_data, len));
-            int got = dbg_district_next_oid(rebased_new);
-            if (want != got) {
-                dbg_log("H7", "transaction_manager.cpp:mvcc_write",
-                        "district_rebase",
-                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                            ",\"want\":" + std::to_string(want) + ",\"got\":" + std::to_string(got) + "}");
-            }
-        }
-        // #endregion
     }
     bool first_touch = (ch.writer != txn->get_transaction_id()) &&
                        (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
@@ -591,14 +495,6 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
         base.commit_ts = 0;
         base.is_deleted = false;
         ch.hist.push_back(std::move(base));
-    } else if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && had_overlay && dbg_tpcc_tab(tab)) {
-        // #region agent log
-        dbg_log("H4", "transaction_manager.cpp:mvcc_write",
-                "synthetic_base_skipped_overlay",
-                "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
-                    ",\"tab\":\"" + tab + "\",\"delete\":" +
-                    (is_delete ? "true" : "false") + "}");
-        // #endregion
     }
     ch.writer = txn->get_transaction_id();
     ch.writer_del = is_delete;
