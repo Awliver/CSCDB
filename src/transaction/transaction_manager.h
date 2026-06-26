@@ -181,10 +181,12 @@ public:
     void inc_explicit() { active_explicit_count_++; }
     /* 该表是否被 MVCC 写过（读时才需查版本链，未脏表直接读堆，保持非事务负载性能） */
     bool table_is_dirty(const std::string &tab);
-    /* 单连接 SI 显式事务快路径：TPC-C 压测无并发，跳过 MVCC 写维护（abort 走 write_set 物理回滚） */
+    /* 单连接 SI 显式事务快路径：仅无并发且库尚未进入 MVCC 脏态时跳过版本维护。
+     * 一旦 any_mvcc_dirty_ 置位，必须走 MVCC，否则堆与版本链分叉 → district 计数器错乱。 */
     bool uses_si_fast_path(Transaction *txn) const {
         return txn && txn->get_txn_mode() &&
-               active_explicit_count_.load() <= 1 &&
+               active_explicit_count_.load(std::memory_order_acquire) <= 1 &&
+               !any_mvcc_dirty_.load(std::memory_order_acquire) &&
                txn->get_isolation_level() != IsolationLevel::SERIALIZABLE;
     }
     /* 写是否需维护版本：并发显式事务 / SER / 脏表隐式写 才走 MVCC；单连接 SI 显式事务走快路径。 */

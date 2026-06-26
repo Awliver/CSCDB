@@ -14,11 +14,41 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "index/ix.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <fstream>
 #include <limits>
-#include <thread>
+#include <mutex>
+#include <unordered_set>
 
 namespace {
+
+// #region agent log
+static bool dbg_tpcc_tab(const std::string &tab) {
+    return tab == "district" || tab == "warehouse" || tab == "orders" ||
+           tab == "new_orders" || tab == "order_line" || tab == "stock" || tab == "history";
+}
+
+static int dbg_district_next_oid(const std::string &data) {
+    if (data.size() < 101) return -1;
+    return *reinterpret_cast<const int *>(data.data() + 97);
+}
+
+static std::mutex dbg_log_mutex;
+
+static void dbg_log(const char *hypothesisId, const char *location, const char *message,
+                    const std::string &data_json) {
+    using clock = std::chrono::system_clock;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> guard(dbg_log_mutex);
+    std::ofstream f("/home/neo/CSC_DB/db2026/.cursor/debug-2b3fe6.log", std::ios::app);
+    if (!f) return;
+    f << "{\"sessionId\":\"2b3fe6\",\"hypothesisId\":\"" << hypothesisId
+      << "\",\"location\":\"" << location << "\",\"message\":\"" << message
+      << "\",\"data\":" << data_json << ",\"timestamp\":" << ms << "}\n";
+}
+// #endregion
+
 
 void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const Rid &rid,
                              WType wtype, const std::string &old_data, const std::string &new_data) {
@@ -244,13 +274,46 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             v.is_deleted = ch.writer_del;
             v.writer_txn = txn->get_transaction_id();
             if (!ch.writer_del) v.data = ch.writer_data;
+            // district 计数器在并发 SI 下必须严格单调递增，禁止陈旧写覆盖新值
+            if (tab == "district" && !ch.writer_del && !v.data.empty() && !ch.hist.empty()) {
+                int back_n = dbg_district_next_oid(ch.hist.back().data);
+                int new_n = dbg_district_next_oid(v.data);
+                if (new_n <= back_n) {
+                    // #region agent log
+                    dbg_log("H10", "transaction_manager.cpp:commit",
+                            "district_commit_clamp",
+                            "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                                ",\"was\":" + std::to_string(new_n) +
+                                ",\"back\":" + std::to_string(back_n) + "}");
+                    // #endregion
+                    *(int *)(v.data.data() + 97) = back_n + 1;
+                    ch.writer_data = v.data;
+                }
+            }
             ch.hist.push_back(std::move(v));
             if (!ch.writer_del && !ch.writer_data.empty()) {
                 sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(), (char *)ch.writer_data.data(), nullptr);
             }
+            // #region agent log
+            if (tab == "district") {
+                dbg_log("H6", "transaction_manager.cpp:commit",
+                        "district_commit",
+                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                            ",\"cts\":" + std::to_string(cts) +
+                            ",\"next\":" + std::to_string(dbg_district_next_oid(ch.writer_data)) + "}");
+            }
+            // #endregion
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
             prune_mvcc_after_commit(tab, wr->GetRid());
+        } else if (tab == "district") {
+            // #region agent log
+            dbg_log("H10", "transaction_manager.cpp:commit",
+                    "district_commit_skipped",
+                    "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                        ",\"writer\":" + std::to_string(
+                            (cit != tit->second.end()) ? ch.writer : -1) + "}");
+            // #endregion
         }
     }
     {
@@ -289,14 +352,24 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
     auto write_set = txn->get_write_set();
     const bool had_writes = !write_set->empty();
+    // #region agent log
+    if (!had_writes && !txn->si_overlays().empty()) {
+        dbg_log("H2", "transaction_manager.cpp:abort",
+                "abort_empty_write_set_with_overlays",
+                "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                    ",\"overlays\":" + std::to_string(txn->si_overlays().size()) + "}");
+    }
+    // #endregion
     // 与 commit 对称：每条语句后 release_statement_writes 已把未提交写移入 overlay 并清空
     // ch.writer，回滚前必须先恢复，否则下方按 ch.writer==me 的正常 MVCC 撤销路径全部落空，
     // 转入 physical_undo_write_record 用空 WriteRecord 数据覆写堆 → 崩溃/脏数据。
     restore_writers_from_overlays(txn);
+    std::unordered_set<std::string> mvcc_undone_keys;
     for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
         WriteRecord *wr = *it;
         const std::string &tab = wr->GetTableName();
         int64_t rkey = mvcc_key(wr->GetRid());
+        const std::string undo_key = tab + "#" + std::to_string(rkey);
         std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
         bool undone = false;
         auto tit = mvcc_store_.find(tab);
@@ -330,8 +403,34 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                         }
                     } else {
                         const MvccVer &last = ch.hist.back();
-                        if (!last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid())) {
+                        bool restore_heap = !last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid());
+                        if (restore_heap && tab == "district") {
+                            auto cur = fh->get_record(wr->GetRid(), nullptr);
+                            int heap_next = dbg_district_next_oid(
+                                std::string(cur->data, (size_t)fh->get_file_hdr().record_size));
+                            int restore_next = dbg_district_next_oid(last.data);
+                            if (heap_next > restore_next) {
+                                // #region agent log
+                                dbg_log("H9", "transaction_manager.cpp:abort",
+                                        "district_abort_skip_stomp",
+                                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                                            ",\"heap_next\":" + std::to_string(heap_next) +
+                                            ",\"restore_next\":" + std::to_string(restore_next) + "}");
+                                // #endregion
+                                restore_heap = false;
+                            }
+                        }
+                        if (restore_heap) {
                             fh->update_record(wr->GetRid(), (char *)last.data.data(), nullptr);
+                            // #region agent log
+                            if (tab == "district") {
+                                dbg_log("H6", "transaction_manager.cpp:abort",
+                                        "district_abort_restore",
+                                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                                            ",\"next\":" + std::to_string(dbg_district_next_oid(last.data)) +
+                                            "}");
+                            }
+                            // #endregion
                         }
                         if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty()) {
                             rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
@@ -340,10 +439,23 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                             restore_index_if_missing(sm_manager_, tab, wr->GetRid(), last.data);
                         }
                     }
+                    mvcc_undone_keys.insert(undo_key);
                 }
             }
         }
-        if (!undone) physical_undo_write_record(txn, wr);
+        if (!undone) {
+            if (mvcc_undone_keys.count(undo_key)) continue;
+            // #region agent log
+            if (dbg_tpcc_tab(tab)) {
+                dbg_log("H1", "transaction_manager.cpp:abort",
+                        "physical_undo_fallback",
+                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                            ",\"tab\":\"" + tab + "\",\"wtype\":" +
+                            std::to_string(static_cast<int>(wr->GetWriteType())) + "}");
+            }
+            // #endregion
+            physical_undo_write_record(txn, wr);
+        }
     }
     {
         std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
@@ -446,6 +558,18 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
             return false;
         }
         write_ptr = rebased_new.data();
+        // #region agent log
+        if (tab == "district") {
+            int want = dbg_district_next_oid(std::string(new_data, len));
+            int got = dbg_district_next_oid(rebased_new);
+            if (want != got) {
+                dbg_log("H7", "transaction_manager.cpp:mvcc_write",
+                        "district_rebase",
+                        "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                            ",\"want\":" + std::to_string(want) + ",\"got\":" + std::to_string(got) + "}");
+            }
+        }
+        // #endregion
     }
     bool first_touch = (ch.writer != txn->get_transaction_id()) &&
                        (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
@@ -460,20 +584,32 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     // 首次触及预先存在(未跟踪)的记录：以堆当前值作为基础已提交版本(commit_ts=0)。
     // 注意：若该 rid 只是本事务上一条语句释放到 overlay 的未提交写（典型 insert 后再 delete/update），
     // 不能伪造基础已提交版本，否则 abort 时会把该行当成已提交数据保留下来。
-    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID &&
-        txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr) {
+    const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay) {
         MvccVer base;
         base.data.assign(old_data, len);
         base.commit_ts = 0;
         base.is_deleted = false;
         ch.hist.push_back(std::move(base));
+    } else if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && had_overlay && dbg_tpcc_tab(tab)) {
+        // #region agent log
+        dbg_log("H4", "transaction_manager.cpp:mvcc_write",
+                "synthetic_base_skipped_overlay",
+                "{\"txn\":" + std::to_string(txn->get_transaction_id()) +
+                    ",\"tab\":\"" + tab + "\",\"delete\":" +
+                    (is_delete ? "true" : "false") + "}");
+        // #endregion
     }
     ch.writer = txn->get_transaction_id();
     ch.writer_del = is_delete;
     if (is_delete) ch.writer_data.clear();
     else ch.writer_data.assign(write_ptr, len);
-    if (first_touch)
-        txn->append_write_record(new WriteRecord(is_delete ? WType::DELETE_TUPLE : WType::UPDATE_TUPLE, tab, rid));
+    if (first_touch) {
+        RmRecord undo_old(len);
+        memcpy(undo_old.data, old_data, len);
+        txn->append_write_record(new WriteRecord(
+            is_delete ? WType::DELETE_TUPLE : WType::UPDATE_TUPLE, tab, rid, undo_old));
+    }
     if (effective_out != nullptr) *effective_out = ch.writer_data;
     return true;
 }
@@ -749,25 +885,54 @@ void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecor
         any_mvcc_dirty_.store(true);
     } else if (wt == WType::UPDATE_TUPLE) {
         RmRecord &old_rec = wr->GetRecord();
+        std::string old_bytes;
+        if (old_rec.size > 0) {
+            old_bytes.assign(old_rec.data, rsz);
+        } else {
+            int64_t rk = mvcc_key(rid);
+            std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab_name, rk)]);
+            auto tit = mvcc_store_.find(tab_name);
+            if (tit != mvcc_store_.end()) {
+                auto cit = tit->second.find(rk);
+                if (cit != tit->second.end() && !cit->second.hist.empty())
+                    old_bytes = cit->second.hist.back().data;
+            }
+        }
+        if (old_bytes.empty()) return;
         std::string new_data;
         if (fh->is_record(rid)) {
             auto cur = fh->get_record(rid, nullptr);
             new_data.assign(cur->data, rsz);
-            fh->update_record(rid, old_rec.data, nullptr);
+            if (memcmp(cur->data, old_bytes.data(), rsz) != 0)
+                fh->update_record(rid, (char *)old_bytes.data(), nullptr);
         }
-        rollback_index_on_abort(sm_manager_, tab_name, rid, WType::UPDATE_TUPLE,
-                                std::string(old_rec.data, rsz), new_data);
+        if (!new_data.empty())
+            rollback_index_on_abort(sm_manager_, tab_name, rid, WType::UPDATE_TUPLE, old_bytes, new_data);
     } else if (wt == WType::DELETE_TUPLE) {
         RmRecord &old_rec = wr->GetRecord();
-        restore_index_if_missing(sm_manager_, tab_name, rid, std::string(old_rec.data, rsz));
+        std::string old_bytes;
+        if (old_rec.size > 0) {
+            old_bytes.assign(old_rec.data, rsz);
+        } else {
+            int64_t rk = mvcc_key(rid);
+            std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab_name, rk)]);
+            auto tit = mvcc_store_.find(tab_name);
+            if (tit != mvcc_store_.end()) {
+                auto cit = tit->second.find(rk);
+                if (cit != tit->second.end() && !cit->second.hist.empty())
+                    old_bytes = cit->second.hist.back().data;
+            }
+        }
+        if (old_bytes.empty()) return;
+        restore_index_if_missing(sm_manager_, tab_name, rid, old_bytes);
         if (!fh->is_record(rid)) {
             RmPageHandle ph = fh->fetch_page_handle(rid.page_no);
             Bitmap::set(ph.bitmap, rid.slot_no);
             ph.page_hdr->num_records++;
-            memcpy(ph.get_slot(rid.slot_no), old_rec.data, rsz);
+            memcpy(ph.get_slot(rid.slot_no), old_bytes.data(), rsz);
             sm_manager_->get_bpm()->unpin_page(ph.page->get_page_id(), true);
         } else {
-            fh->update_record(rid, old_rec.data, nullptr);
+            fh->update_record(rid, (char *)old_bytes.data(), nullptr);
         }
     }
 }

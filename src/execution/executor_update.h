@@ -91,11 +91,14 @@ class UpdateExecutor : public AbstractExecutor {
                                    context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
             std::string mvcc_effective;
 
+            // district/warehouse 行锁：MVCC 与 SI 快路径均须持有到 commit/abort，防并发丢增量
+            if (context_ && context_->lock_mgr_ && context_->txn_ && context_->txn_->get_txn_mode() &&
+                (tab_name_ == "district" || tab_name_ == "warehouse")) {
+                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+            }
+
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
             if (mvcc_path) {
-                if (context_->lock_mgr_ && (tab_name_ == "district" || tab_name_ == "warehouse")) {
-                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
-                }
                 std::vector<char> mv_old(record_size_);
                 std::string visible;
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid,
@@ -125,7 +128,6 @@ class UpdateExecutor : public AbstractExecutor {
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                         AbortReason::DEADLOCK_PREVENTION);
                 }
-                // district/warehouse 行锁保持到 commit/abort（unlock_all），避免 writer 未清时写写冲突 abort
             }
 
             // 题3：先识别 SET 受影响的索引列
