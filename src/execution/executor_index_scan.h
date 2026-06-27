@@ -211,6 +211,9 @@ class IndexScanExecutor : public AbstractExecutor {
     void position_to_match() {
         while (!range_exhausted_ && !scan_->is_end()) {
             rid_ = scan_->rid();
+            if (scan_->is_end() || rid_.page_no < 0 || rid_.slot_no < 0) {
+                break;
+            }
 
             // Fast path：range 已精确，且无残余 cond，直接返回匹配
             if (!need_eval_ && !need_prefix_check_) {

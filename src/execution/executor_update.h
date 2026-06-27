@@ -71,13 +71,18 @@ class UpdateExecutor : public AbstractExecutor {
             memcpy(dest_field, set.rhs.raw->data, col.len);
             return;
         }
-        int base = 0;
         auto rcol = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                  [&](const ColMeta &c) { return c.name == set.rhs_col; });
-        if (rcol != tab_.cols.end() && rcol->type == TYPE_INT)
-            base = *(const int *)(base_rec + rcol->offset);
-        int delta = set.arith_neg ? -set.rhs.int_val : set.rhs.int_val;  // 带空格减号需取负
-        *(int *)dest_field = base + delta;
+        if (rcol == tab_.cols.end()) return;
+        if (rcol->type == TYPE_FLOAT) {
+            float base = *(const float *)(base_rec + rcol->offset);
+            float delta = set.arith_neg ? -set.rhs.float_val : set.rhs.float_val;
+            *(float *)dest_field = base + delta;
+        } else {
+            int base = *(const int *)(base_rec + rcol->offset);
+            int delta = set.arith_neg ? -set.rhs.int_val : set.rhs.int_val;
+            *(int *)dest_field = base + delta;
+        }
     }
 
     /**
@@ -113,6 +118,14 @@ class UpdateExecutor : public AbstractExecutor {
                                                [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                     if (col_it == tab_.cols.end()) continue;
                     apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
+                }
+                // 并发 NewOrder：客户端用旧快照发绝对 d_next_o_id，须钳制为 > 当前可见值
+                if (tab_name_ == "district" && (int)mv_new.size() > 97) {
+                    int visible = *reinterpret_cast<int *>(mv_old.data() + 97);
+                    int proposed = *reinterpret_cast<int *>(mv_new.data() + 97);
+                    if (proposed <= visible) {
+                        *reinterpret_cast<int *>(mv_new.data() + 97) = visible + 1;
+                    }
                 }
                 if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
                                                     mv_old.data(), mv_new.data(), record_size_, false,
@@ -214,6 +227,11 @@ class UpdateExecutor : public AbstractExecutor {
                                            [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                 if (col_it == tab_.cols.end()) continue;
                 apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
+            }
+            if (tab_name_ == "district" && record_size_ > 97) {
+                int visible = *reinterpret_cast<int *>(orig_rec.data() + 97);
+                int *nxt = reinterpret_cast<int *>(slot + 97);
+                if (*nxt <= visible) *nxt = visible + 1;
             }
             }
 

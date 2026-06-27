@@ -201,8 +201,9 @@ public:
     bool mvcc_other_writer(const std::string &tab, const Rid &rid, txn_id_t me) {
         size_t sh = mvcc_shard_idx(tab, mvcc_key(rid));
         std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
-        auto tit = mvcc_store_.find(tab);
-        if (tit == mvcc_store_.end()) return false;
+        auto &store = mvcc_shard_data_[sh].store;
+        auto tit = store.find(tab);
+        if (tit == store.end()) return false;
         auto cit = tit->second.find(mvcc_key(rid));
         if (cit == tit->second.end()) return false;
         txn_id_t w = cit->second.writer;
@@ -254,10 +255,19 @@ private:
     static constexpr size_t MVCC_NSHARDS = 64;
     std::atomic<int> active_explicit_count_{0};   // 活跃显式事务数
     std::atomic<bool> any_mvcc_dirty_{false};
-    mutable std::mutex mvcc_meta_latch_;            // ser_ / active_rts_ / mvcc_dirty_ 元数据
-    mutable std::array<std::mutex, MVCC_NSHARDS> mvcc_shards_;  // 分片保护 mvcc_store_ 链
-    std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> mvcc_store_;
-    std::unordered_map<std::string, std::unordered_map<int64_t, txn_id_t>> pending_si_writes_;
+    mutable std::mutex mvcc_meta_latch_;            // ser_ / active_rts_ 元数据
+    mutable std::array<std::mutex, MVCC_NSHARDS> mvcc_shards_;  // mvcc_shards_[i] 保护 mvcc_shard_data_[i]
+    // 每个分片拥有独立的版本存储/挂起写映射。(tab,rkey) 经 mvcc_shard_idx 固定映射到唯一分片，
+    // 故同表不同 rkey 落在不同分片各自的 map，杜绝跨分片对同一 unordered_map 的并发结构改写
+    // （此前 mvcc_store_[tab] 内层 map 被多分片锁并发 rehash → 堆破坏崩溃）。
+    struct MvccShardData {
+        std::unordered_map<std::string, std::unordered_map<int64_t, MvccChain>> store;
+        std::unordered_map<std::string, std::unordered_map<int64_t, txn_id_t>> pending;
+    };
+    std::array<MvccShardData, MVCC_NSHARDS> mvcc_shard_data_;
+    // mvcc_dirty_ 仅增不减（表一旦被 MVCC 写过即永久脏）。用专用读写锁，使扫描打开时
+    // 的 table_is_dirty 走共享锁并发判定，与 SER/active_rts_ 的 mvcc_meta_latch_ 解耦。
+    mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
 
     /* 题9 SER (SSI) 状态 —— 由 mvcc_meta_latch_ 保护 */

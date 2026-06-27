@@ -31,6 +31,9 @@ class IxScan : public RecScan {
 
     void release_cached() const;
     void ensure_cached(int page_no) const;
+    void normalize_position() const;
+    void advance_to_next_leaf() const;
+    bool page_no_valid(int page_no) const;
 
    public:
     IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
@@ -40,7 +43,10 @@ class IxScan : public RecScan {
 
     void next() override;
 
-    bool is_end() const override { return iid_ == end_; }
+    bool is_end() const override {
+        normalize_position();
+        return iid_ == end_;
+    }
 
     Rid rid() const override;
 

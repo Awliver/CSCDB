@@ -243,10 +243,12 @@ IxNodeHandle *IxIndexHandle::split(IxNodeHandle *node) {
         node->set_next_leaf(new_node->get_page_no());
 
         // 更新原 next 节点的 prev_leaf（可能是普通 leaf 或 leaf_header）
-        IxNodeHandle *next_node = fetch_node(old_next);
-        next_node->set_prev_leaf(new_node->get_page_no());
-        buffer_pool_manager_->unpin_page(next_node->get_page_id(), true);
-        delete next_node;
+        if (old_next > IX_NO_PAGE) {
+            IxNodeHandle *next_node = fetch_node(old_next);
+            next_node->set_prev_leaf(new_node->get_page_no());
+            buffer_pool_manager_->unpin_page(next_node->get_page_id(), true);
+            delete next_node;
+        }
 
         // 如果 node 之前是 last_leaf，更新 last_leaf
         if (node->get_page_no() == file_hdr_->last_leaf_) {
@@ -724,10 +726,14 @@ Iid IxIndexHandle::leaf_begin() const {
  * @note pin the page, remember to unpin it outside!
  */
 IxNodeHandle *IxIndexHandle::fetch_node(int page_no) const {
+    if (page_no <= IX_NO_PAGE || page_no >= file_hdr_->num_pages_) {
+        throw InternalError("IxIndexHandle::fetch_node: invalid page " + std::to_string(page_no));
+    }
     Page *page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
-    IxNodeHandle *node = new IxNodeHandle(file_hdr_, page);
-    
-    return node;
+    if (page == nullptr) {
+        throw InternalError("IxIndexHandle::fetch_node: buffer pool full for page " + std::to_string(page_no));
+    }
+    return new IxNodeHandle(file_hdr_, page);
 }
 
 /**
@@ -747,6 +753,9 @@ IxNodeHandle *IxIndexHandle::create_node() {
     PageId new_page_id = {.fd = fd_, .page_no = INVALID_PAGE_ID};
     // 从3开始分配page_no，第一次分配之后，new_page_id.page_no=3，file_hdr_.num_pages=4
     Page *page = buffer_pool_manager_->new_page(&new_page_id);
+    if (page == nullptr) {
+        throw InternalError("IxIndexHandle::create_node: buffer pool full");
+    }
     node = new IxNodeHandle(file_hdr_, page);
     return node;
 }
@@ -785,13 +794,20 @@ void IxIndexHandle::maintain_parent(IxNodeHandle *node) {
 void IxIndexHandle::erase_leaf(IxNodeHandle *leaf) {
     assert(leaf->is_leaf_page());
 
-    IxNodeHandle *prev = fetch_node(leaf->get_prev_leaf());
-    prev->set_next_leaf(leaf->get_next_leaf());
-    buffer_pool_manager_->unpin_page(prev->get_page_id(), true);
-
-    IxNodeHandle *next = fetch_node(leaf->get_next_leaf());
-    next->set_prev_leaf(leaf->get_prev_leaf());  // 注意此处是SetPrevLeaf()
-    buffer_pool_manager_->unpin_page(next->get_page_id(), true);
+    page_id_t prev_no = leaf->get_prev_leaf();
+    page_id_t next_no = leaf->get_next_leaf();
+    if (prev_no > IX_NO_PAGE) {
+        IxNodeHandle *prev = fetch_node(prev_no);
+        prev->set_next_leaf(next_no);
+        buffer_pool_manager_->unpin_page(prev->get_page_id(), true);
+        delete prev;
+    }
+    if (next_no > IX_NO_PAGE) {
+        IxNodeHandle *next = fetch_node(next_no);
+        next->set_prev_leaf(prev_no);
+        buffer_pool_manager_->unpin_page(next->get_page_id(), true);
+        delete next;
+    }
 }
 
 /**

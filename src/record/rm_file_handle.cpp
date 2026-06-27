@@ -146,6 +146,7 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @param {Context*} context
  */
 void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {

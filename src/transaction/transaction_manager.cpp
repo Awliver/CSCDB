@@ -120,9 +120,11 @@ void TransactionManager::release_statement_writes(Transaction *txn) {
         const std::string &tab = wr->GetTableName();
         if (tab == "district" || tab == "warehouse") continue;
         int64_t rkey = mvcc_key(wr->GetRid());
-        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
-        auto tit = mvcc_store_.find(tab);
-        if (tit == mvcc_store_.end()) continue;
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
+        auto &store = mvcc_shard_data_[sh].store;
+        auto tit = store.find(tab);
+        if (tit == store.end()) continue;
         auto cit = tit->second.find(rkey);
         if (cit == tit->second.end()) continue;
         MvccChain &ch = cit->second;
@@ -131,7 +133,7 @@ void TransactionManager::release_statement_writes(Transaction *txn) {
         ov.is_deleted = ch.writer_del;
         ov.data = ch.writer_data;
         txn->put_si_overlay(si_overlay_key(tab, rkey), std::move(ov));
-        pending_si_writes_[tab][rkey] = me;
+        mvcc_shard_data_[sh].pending[tab][rkey] = me;
         ch.writer = INVALID_TXN_ID;
         ch.writer_del = false;
         ch.writer_data.clear();
@@ -146,18 +148,22 @@ void TransactionManager::clear_pending_si_for_txn(Transaction *txn) {
         if (pos == std::string::npos) continue;
         std::string tab = kv.first.substr(0, pos);
         int64_t rkey = std::stoll(kv.first.substr(pos + 1));
-        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
-        auto tit = pending_si_writes_.find(tab);
-        if (tit == pending_si_writes_.end()) continue;
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
+        auto &pending = mvcc_shard_data_[sh].pending;
+        auto tit = pending.find(tab);
+        if (tit == pending.end()) continue;
         auto it = tit->second.find(rkey);
         if (it != tit->second.end() && it->second == me) tit->second.erase(it);
     }
     for (auto *wr : *txn->get_write_set()) {
         const std::string &tab = wr->GetTableName();
         int64_t rkey = mvcc_key(wr->GetRid());
-        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
-        auto tit = pending_si_writes_.find(tab);
-        if (tit == pending_si_writes_.end()) continue;
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
+        auto &pending = mvcc_shard_data_[sh].pending;
+        auto tit = pending.find(tab);
+        if (tit == pending.end()) continue;
         auto it = tit->second.find(rkey);
         if (it != tit->second.end() && it->second == me) tit->second.erase(it);
     }
@@ -171,9 +177,10 @@ void TransactionManager::restore_writers_from_overlays(Transaction *txn) {
         if (pos == std::string::npos) continue;
         std::string tab = kv.first.substr(0, pos);
         int64_t rkey = std::stoll(kv.first.substr(pos + 1));
-        std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
-        MvccChain &ch = mvcc_store_[tab][rkey];
-        pending_si_writes_[tab].erase(rkey);
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
+        MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
+        mvcc_shard_data_[sh].pending[tab].erase(rkey);
         ch.writer = me;
         ch.writer_del = kv.second.is_deleted;
         ch.writer_data = kv.second.data;
@@ -233,13 +240,22 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         }
         ser_finish(txn->get_transaction_id(), true, cts);
     }
+    struct HeapFlush {
+        std::string tab;
+        Rid rid;
+        std::string data;
+    };
+    std::vector<HeapFlush> heap_flushes;
+    heap_flushes.reserve(write_set->size());
     for (auto *wr : *write_set) {
         const std::string &tab = wr->GetTableName();
         touched_tabs.insert(tab);
         int64_t rkey = mvcc_key(wr->GetRid());
-        std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
-        auto tit = mvcc_store_.find(tab);
-        if (tit == mvcc_store_.end()) continue;
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
+        auto &store = mvcc_shard_data_[sh].store;
+        auto tit = store.find(tab);
+        if (tit == store.end()) continue;
         auto cit = tit->second.find(rkey);
         if (cit == tit->second.end()) continue;
         MvccChain &ch = cit->second;
@@ -260,20 +276,23 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             }
             ch.hist.push_back(std::move(v));
             if (!ch.writer_del && !ch.writer_data.empty()) {
-                sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(), (char *)ch.writer_data.data(), nullptr);
+                heap_flushes.push_back({tab, wr->GetRid(), ch.writer_data});
             }
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
             prune_mvcc_after_commit(tab, wr->GetRid());
         }
     }
-    {
-        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    for (const auto &hf : heap_flushes) {
+        sm_manager_->fhs_.at(hf.tab)->update_record(hf.rid, (char *)hf.data.data(), nullptr);
+    }
+    if (!touched_tabs.empty()) {
+        std::unique_lock<std::shared_mutex> lck(mvcc_dirty_mutex_);
         for (const auto &tab : touched_tabs) mvcc_dirty_.insert(tab);
         any_mvcc_dirty_.store(!mvcc_dirty_.empty());
-        for (auto *wr : *write_set) delete wr;
-        write_set->clear();
     }
+    for (auto *wr : *write_set) delete wr;   // write_set 为事务私有，无需全局锁
+    write_set->clear();
 
     // 自动提交的 insert 等会直接写 WAL（设置 prev_lsn）但不进 write_set（非 versioning 路径），
     // 此时 had_writes 为假。若仅凭 had_writes/txn_mode 判定，会漏写 commit 记录 → 恢复时该事务
@@ -313,10 +332,12 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         const std::string &tab = wr->GetTableName();
         int64_t rkey = mvcc_key(wr->GetRid());
         const std::string undo_key = tab + "#" + std::to_string(rkey);
-        std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
         bool undone = false;
-        auto tit = mvcc_store_.find(tab);
-        if (tit != mvcc_store_.end()) {
+        auto &store = mvcc_shard_data_[sh].store;
+        auto tit = store.find(tab);
+        if (tit != store.end()) {
             auto cit = tit->second.find(rkey);
             if (cit != tit->second.end()) {
                 MvccChain &ch = cit->second;
@@ -409,9 +430,11 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
         out = self_ov->data;
         return true;
     }
-    std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
-    auto tit = mvcc_store_.find(tab);
-    if (tit == mvcc_store_.end()) { out.assign(heap_data, len); return true; }
+    size_t sh = mvcc_shard_idx(tab, rkey);
+    std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
+    auto &store = mvcc_shard_data_[sh].store;
+    auto tit = store.find(tab);
+    if (tit == store.end()) { out.assign(heap_data, len); return true; }
     auto cit = tit->second.find(mvcc_key(rid));
     if (cit == tit->second.end()) { out.assign(heap_data, len); return true; }  // 未跟踪 = 基础数据，对所有事务可见
     MvccChain &ch = cit->second;
@@ -435,13 +458,14 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
 void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
                                      const char *data, int len) {
     int64_t rkey = mvcc_key(rid);
-    std::scoped_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+    size_t sh = mvcc_shard_idx(tab, rkey);
+    std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
     {
-        std::scoped_lock<std::mutex> meta(mvcc_meta_latch_);
+        std::unique_lock<std::shared_mutex> meta(mvcc_dirty_mutex_);
         mvcc_dirty_.insert(tab);
         any_mvcc_dirty_.store(true, std::memory_order_release);
     }
-    MvccChain &ch = mvcc_store_[tab][mvcc_key(rid)];
+    MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
     ch.hist.clear();                          // 新插入：无已提交基础版本
     ch.writer = txn->get_transaction_id();
     ch.writer_del = false;
@@ -453,16 +477,18 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
                                     const char *old_data, const char *new_data, int len, bool is_delete,
                                     std::string *effective_out) {
     int64_t rkey = mvcc_key(rid);
-    std::unique_lock<std::mutex> lck(mvcc_shards_[mvcc_shard_idx(tab, rkey)]);
+    size_t sh = mvcc_shard_idx(tab, rkey);
+    std::unique_lock<std::mutex> lck(mvcc_shards_[sh]);
     {
-        std::scoped_lock<std::mutex> meta(mvcc_meta_latch_);
+        std::unique_lock<std::shared_mutex> meta(mvcc_dirty_mutex_);
         mvcc_dirty_.insert(tab);
         any_mvcc_dirty_.store(true, std::memory_order_release);
     }
-    MvccChain *chp = &mvcc_store_[tab][mvcc_key(rid)];
+    auto &pending = mvcc_shard_data_[sh].pending;
+    MvccChain *chp = &mvcc_shard_data_[sh].store[tab][rkey];
     MvccChain &ch = *chp;
-    auto pit = pending_si_writes_[tab].find(rkey);
-    if (pit != pending_si_writes_[tab].end() && pit->second != txn->get_transaction_id()) return false;
+    auto pit = pending[tab].find(rkey);
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
     if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
     std::string rebased_new;
     const char *write_ptr = new_data;
@@ -513,26 +539,29 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
 bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
                                                   const char *rec_data, int key_off, int key_len) {
     MvccAllShardsGuard all_shards(this);
-    auto tit = mvcc_store_.find(tab);
-    if (tit == mvcc_store_.end()) return false;
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
     const char *key = rec_data + key_off;
-    for (auto &kv : tit->second) {
-        MvccChain &ch = kv.second;
-        // 本事务快照可见的最新已提交版本
-        const MvccVer *vis = nullptr;
-        for (const auto &v : ch.hist) {          // commit_ts 升序
-            if (v.commit_ts <= rts) vis = &v;
-            else break;
+    // 该表的版本链按 rkey 分散在所有分片，逐分片扫描
+    for (auto &sd : mvcc_shard_data_) {
+        auto tit = sd.store.find(tab);
+        if (tit == sd.store.end()) continue;
+        for (auto &kv : tit->second) {
+            MvccChain &ch = kv.second;
+            // 本事务快照可见的最新已提交版本
+            const MvccVer *vis = nullptr;
+            for (const auto &v : ch.hist) {          // commit_ts 升序
+                if (v.commit_ts <= rts) vis = &v;
+                else break;
+            }
+            if (vis == nullptr || vis->is_deleted) continue;   // 快照内无该记录 → 插入不基于旧版本
+            if ((int)vis->data.size() < key_off + key_len) continue;
+            if (memcmp(vis->data.data() + key_off, key, key_len) != 0) continue;  // 键不同
+            // 快照可见同键旧版本：被并发删除(未提交或快照后已提交) → 写写冲突
+            if (ch.writer != INVALID_TXN_ID && ch.writer != me && ch.writer_del) return true;
+            if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+                ch.hist.back().commit_ts > rts && ch.hist.back().is_deleted) return true;
         }
-        if (vis == nullptr || vis->is_deleted) continue;   // 快照内无该记录 → 插入不基于旧版本
-        if ((int)vis->data.size() < key_off + key_len) continue;
-        if (memcmp(vis->data.data() + key_off, key, key_len) != 0) continue;  // 键不同
-        // 快照可见同键旧版本：被并发删除(未提交或快照后已提交) → 写写冲突
-        if (ch.writer != INVALID_TXN_ID && ch.writer != me && ch.writer_del) return true;
-        if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
-            ch.hist.back().commit_ts > rts && ch.hist.back().is_deleted) return true;
     }
     return false;
 }
@@ -685,13 +714,15 @@ bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
     int64_t key = mvcc_key(rid);
-    std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab, key)]);
+    size_t sh = mvcc_shard_idx(tab, key);
+    std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
     std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     SerInfo &my = ser_[me];
     my.read_ts = rts;
     bool dangerous = false;
-    auto tit = mvcc_store_.find(tab);
-    if (tit == mvcc_store_.end()) return false;
+    auto &store = mvcc_shard_data_[sh].store;
+    auto tit = store.find(tab);
+    if (tit == store.end()) return false;
     auto cit = tit->second.find(key);
     if (cit == tit->second.end()) return false;
     MvccChain &ch = cit->second;
@@ -714,24 +745,27 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
     timestamp_t rts = txn->get_read_ts();
     MvccAllShardsGuard all_shards(this);
     std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
-    auto tit = mvcc_store_.find(tab);
-    if (tit == mvcc_store_.end()) return false;
     bool dangerous = false;
-    for (auto &kv : tit->second) {
-        MvccChain &ch = kv.second;
-        // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
-        if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
-            !ch.writer_data.empty() && ser_.count(ch.writer) && ser_overlap(me, ch.writer) &&
-            ser_record_matches(tab, ch.writer_data.data(), conds)) {
-            if (ser_add_edge(me, ch.writer)) dangerous = true;
-        }
-        // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
-        for (auto &v : ch.hist) {
-            if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
-                v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
-                ser_.count(v.writer_txn) && ser_overlap(me, v.writer_txn) &&
-                ser_record_matches(tab, v.data.data(), conds)) {
-                if (ser_add_edge(me, v.writer_txn)) dangerous = true;
+    // 该表的版本链按 rkey 分散在所有分片，逐分片扫描
+    for (auto &sd : mvcc_shard_data_) {
+        auto tit = sd.store.find(tab);
+        if (tit == sd.store.end()) continue;
+        for (auto &kv : tit->second) {
+            MvccChain &ch = kv.second;
+            // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
+            if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
+                !ch.writer_data.empty() && ser_.count(ch.writer) && ser_overlap(me, ch.writer) &&
+                ser_record_matches(tab, ch.writer_data.data(), conds)) {
+                if (ser_add_edge(me, ch.writer)) dangerous = true;
+            }
+            // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
+            for (auto &v : ch.hist) {
+                if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
+                    v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
+                    ser_.count(v.writer_txn) && ser_overlap(me, v.writer_txn) &&
+                    ser_record_matches(tab, v.data.data(), conds)) {
+                    if (ser_add_edge(me, v.writer_txn)) dangerous = true;
+                }
             }
         }
     }
@@ -740,13 +774,15 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
 
 bool TransactionManager::table_is_dirty(const std::string &tab) {
     if (!any_mvcc_dirty_.load()) return false;
-    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    std::shared_lock<std::shared_mutex> lck(mvcc_dirty_mutex_);
     return mvcc_dirty_.count(tab) != 0;
 }
 
 void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid) {
-    auto tit = mvcc_store_.find(tab);
-    if (tit == mvcc_store_.end()) return;
+    // 调用方(commit)已持 mvcc_shards_[mvcc_shard_idx(tab, rkey)]
+    auto &store = mvcc_shard_data_[mvcc_shard_idx(tab, mvcc_key(rid))].store;
+    auto tit = store.find(tab);
+    if (tit == store.end()) return;
     auto cit = tit->second.find(mvcc_key(rid));
     if (cit == tit->second.end()) return;
     MvccChain &ch = cit->second;
@@ -772,23 +808,28 @@ void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecor
         }
         if (!new_data.empty())
             rollback_index_on_abort(sm_manager_, tab_name, rid, WType::INSERT_TUPLE, "", new_data);
-        MvccChain &ch = mvcc_store_[tab_name][mvcc_key(rid)];
+        // 调用方(abort)已持 mvcc_shards_[mvcc_shard_idx(tab_name, mvcc_key(rid))]
+        MvccChain &ch = mvcc_shard_data_[mvcc_shard_idx(tab_name, mvcc_key(rid))].store[tab_name][mvcc_key(rid)];
         ch.hist.clear();
         ch.writer = INVALID_TXN_ID;
         ch.writer_del = false;
         ch.writer_data.clear();
-        mvcc_dirty_.insert(tab_name);
-        any_mvcc_dirty_.store(true);
+        {
+            std::unique_lock<std::shared_mutex> meta(mvcc_dirty_mutex_);
+            mvcc_dirty_.insert(tab_name);
+            any_mvcc_dirty_.store(true);
+        }
     } else if (wt == WType::UPDATE_TUPLE) {
         RmRecord &old_rec = wr->GetRecord();
         std::string old_bytes;
         if (old_rec.size > 0) {
             old_bytes.assign(old_rec.data, rsz);
         } else {
+            // 调用方(abort)已持本 (tab_name,rk) 分片锁，直接读本分片版本链（勿重锁同一 mutex）
             int64_t rk = mvcc_key(rid);
-            std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab_name, rk)]);
-            auto tit = mvcc_store_.find(tab_name);
-            if (tit != mvcc_store_.end()) {
+            auto &store = mvcc_shard_data_[mvcc_shard_idx(tab_name, rk)].store;
+            auto tit = store.find(tab_name);
+            if (tit != store.end()) {
                 auto cit = tit->second.find(rk);
                 if (cit != tit->second.end() && !cit->second.hist.empty())
                     old_bytes = cit->second.hist.back().data;
@@ -810,10 +851,11 @@ void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecor
         if (old_rec.size > 0) {
             old_bytes.assign(old_rec.data, rsz);
         } else {
+            // 调用方(abort)已持本 (tab_name,rk) 分片锁，直接读本分片版本链（勿重锁同一 mutex）
             int64_t rk = mvcc_key(rid);
-            std::scoped_lock<std::mutex> shlk(mvcc_shards_[mvcc_shard_idx(tab_name, rk)]);
-            auto tit = mvcc_store_.find(tab_name);
-            if (tit != mvcc_store_.end()) {
+            auto &store = mvcc_shard_data_[mvcc_shard_idx(tab_name, rk)].store;
+            auto tit = store.find(tab_name);
+            if (tit != store.end()) {
                 auto cit = tit->second.find(rk);
                 if (cit != tit->second.end() && !cit->second.hist.empty())
                     old_bytes = cit->second.hist.back().data;

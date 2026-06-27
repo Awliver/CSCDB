@@ -441,8 +441,9 @@ void *client_handler(void *sock_fd) {
     int recv_len = 0;
     std::vector<char> stmt_buf(BUFFER_LENGTH);
     char *stmt = stmt_buf.data();
-    // 需要返回给客户端的结果
-    char *data_send = new char[BUFFER_LENGTH];
+    // 需要返回给客户端的结果（RAII：随线程退出自动释放，避免每连接泄漏）
+    std::vector<char> data_send_buf(BUFFER_LENGTH);
+    char *data_send = data_send_buf.data();
     // 需要返回给客户端的结果的长度
     int offset = 0;
     // 记录客户端当前正在执行的事务ID

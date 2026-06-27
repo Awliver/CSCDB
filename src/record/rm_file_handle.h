@@ -76,7 +76,9 @@ class RmFileHandle {
     /* 判断指定位置上是否已经存在一条记录，通过Bitmap来判断 */
     bool is_record(const Rid &rid) const {
         RmPageHandle page_handle = fetch_page_handle(rid.page_no);
-        return Bitmap::is_set(page_handle.bitmap, rid.slot_no);  // page的slot_no位置上是否有record
+        bool exists = Bitmap::is_set(page_handle.bitmap, rid.slot_no);
+        buffer_pool_manager_->unpin_page({fd_, rid.page_no}, false);
+        return exists;
     }
 
     std::unique_ptr<RmRecord> get_record(const Rid &rid, Context *context) const;

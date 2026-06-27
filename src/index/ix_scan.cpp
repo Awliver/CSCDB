@@ -19,29 +19,73 @@ void IxScan::release_cached() const {
     }
 }
 
+bool IxScan::page_no_valid(int page_no) const {
+    return page_no > IX_NO_PAGE && page_no < ih_->file_hdr_->num_pages_;
+}
+
 void IxScan::ensure_cached(int page_no) const {
+    if (!page_no_valid(page_no)) {
+        const_cast<IxScan *>(this)->iid_ = end_;
+        release_cached();
+        return;
+    }
     if (page_no != cached_page_no_) {
         release_cached();
         cached_node_ = ih_->fetch_node(page_no);
         cached_page_no_ = page_no;
-        cached_size_ = cached_node_->get_size();
+    }
+    cached_size_ = cached_node_->get_size();
+}
+
+void IxScan::advance_to_next_leaf() const {
+    auto *self = const_cast<IxScan *>(this);
+    page_id_t next_pg = IX_NO_PAGE;
+    if (cached_node_) {
+        next_pg = cached_node_->get_next_leaf();
+    }
+    release_cached();
+    if (!page_no_valid(next_pg)) {
+        self->iid_ = end_;
+        return;
+    }
+    self->iid_.page_no = next_pg;
+    self->iid_.slot_no = 0;
+}
+
+void IxScan::normalize_position() const {
+    auto *self = const_cast<IxScan *>(this);
+    while (self->iid_ != self->end_) {
+        if (!page_no_valid(self->iid_.page_no)) {
+            self->iid_ = end_;
+            release_cached();
+            return;
+        }
+        ensure_cached(self->iid_.page_no);
+        if (self->iid_ == end_) return;
+        if (self->iid_.slot_no < cached_size_) return;
+        advance_to_next_leaf();
     }
 }
 
 void IxScan::next() {
-    assert(!is_end());
-    ensure_cached(iid_.page_no);
-    assert(cached_node_->is_leaf_page());
-    assert(iid_.slot_no < cached_size_);
+    normalize_position();
+    if (iid_ == end_) return;
     iid_.slot_no++;
-    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == cached_size_) {
-        // 跨叶时记录下一页的 page_no（下次 ensure_cached 会切）
-        iid_.slot_no = 0;
-        iid_.page_no = cached_node_->get_next_leaf();
+    ensure_cached(iid_.page_no);
+    if (iid_ == end_) return;
+    if (iid_.slot_no >= cached_size_) {
+        advance_to_next_leaf();
     }
 }
 
 Rid IxScan::rid() const {
+    normalize_position();
+    if (iid_ == end_) {
+        return Rid{-1, -1};
+    }
     ensure_cached(iid_.page_no);
+    if (iid_ == end_ || iid_.slot_no < 0 || iid_.slot_no >= cached_size_) {
+        return Rid{-1, -1};
+    }
     return *cached_node_->get_rid(iid_.slot_no);
 }
