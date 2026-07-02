@@ -31,29 +31,41 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     size_t hit_idx_ = 0;
     bool isend_ = true;
 
-    bool is_right_index_col(const TabCol &col) const {
-        return col.tab_name == right_table_ && col.col_name == index_meta_.cols[0].name;
-    }
-
     bool build_lookup_key(std::vector<char> &key) {
-        for (auto &cond : join_conds_) {
-            if (cond.op != OP_EQ || cond.is_rhs_val) continue;
-            TabCol left_col;
-            bool matched = false;
-            if (is_right_index_col(cond.lhs_col)) {
-                left_col = cond.rhs_col;
-                matched = true;
-            } else if (is_right_index_col(cond.rhs_col)) {
-                left_col = cond.lhs_col;
-                matched = true;
+        key.assign(index_meta_.col_tot_len, 0);
+        size_t key_off = 0;
+        for (auto &idx_col : index_meta_.cols) {
+            bool filled = false;
+            for (auto &cond : right_conds_) {
+                if (cond.op != OP_EQ || !cond.is_rhs_val) continue;
+                if (cond.lhs_col.tab_name != right_table_ || cond.lhs_col.col_name != idx_col.name) continue;
+                memcpy(key.data() + key_off, cond.rhs_val.raw->data, idx_col.len);
+                filled = true;
+                break;
             }
-            if (!matched) continue;
-            auto left_it = get_col(left_->cols(), left_col);
-            key.assign(index_meta_.col_tot_len, 0);
-            memcpy(key.data(), left_rec_->data + left_it->offset, index_meta_.cols[0].len);
-            return true;
+            if (!filled) {
+                for (auto &cond : join_conds_) {
+                    if (cond.op != OP_EQ || cond.is_rhs_val) continue;
+                    TabCol left_col;
+                    bool matched = false;
+                    if (cond.lhs_col.tab_name == right_table_ && cond.lhs_col.col_name == idx_col.name) {
+                        left_col = cond.rhs_col;
+                        matched = true;
+                    } else if (cond.rhs_col.tab_name == right_table_ && cond.rhs_col.col_name == idx_col.name) {
+                        left_col = cond.lhs_col;
+                        matched = true;
+                    }
+                    if (!matched) continue;
+                    auto left_it = get_col(left_->cols(), left_col);
+                    memcpy(key.data() + key_off, left_rec_->data + left_it->offset, idx_col.len);
+                    filled = true;
+                    break;
+                }
+            }
+            if (!filled) return false;
+            key_off += idx_col.len;
         }
-        return false;
+        return true;
     }
 
     bool eval_joined_conds(const RmRecord *right_rec) {

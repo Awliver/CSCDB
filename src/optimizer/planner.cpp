@@ -71,23 +71,58 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
     return true;
 }
 
-bool Planner::get_join_index_cols(const std::string &right_table, const std::vector<Condition> &join_conds,
+bool Planner::get_join_index_cols(const std::string &right_table, const std::vector<Condition> &scan_conds,
+                                  const std::vector<Condition> &join_conds,
                                   std::vector<std::string> &index_col_names) {
     index_col_names.clear();
     TabMeta &tab = sm_manager_->db_.get_table(right_table);
-    for (auto &index : tab.indexes) {
-        if (index.cols.empty()) continue;
-        const std::string &first_col = index.cols[0].name;
+
+    auto is_join_eq_on_col = [&](const std::string &col_name) {
         for (auto &cond : join_conds) {
             if (cond.op != OP_EQ || cond.is_rhs_val) continue;
-            bool matches = (cond.lhs_col.tab_name == right_table && cond.lhs_col.col_name == first_col) ||
-                           (cond.rhs_col.tab_name == right_table && cond.rhs_col.col_name == first_col);
-            if (!matches) continue;
-            for (auto &col : index.cols) index_col_names.push_back(col.name);
-            return true;
+            if ((cond.lhs_col.tab_name == right_table && cond.lhs_col.col_name == col_name) ||
+                (cond.rhs_col.tab_name == right_table && cond.rhs_col.col_name == col_name)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int best_match_len = 0;
+    const IndexMeta *best_index = nullptr;
+    for (auto &index : tab.indexes) {
+        int match_len = 0;
+        for (auto &idx_col : index.cols) {
+            bool matched = false;
+            for (auto &cond : scan_conds) {
+                if (!cond.is_rhs_val || cond.op != OP_EQ) continue;
+                if (cond.lhs_col.tab_name != right_table) continue;
+                if (cond.lhs_col.col_name != idx_col.name) continue;
+                matched = true;
+                break;
+            }
+            if (!matched) matched = is_join_eq_on_col(idx_col.name);
+            if (!matched) break;
+            match_len++;
+        }
+        if (match_len > best_match_len) {
+            best_match_len = match_len;
+            best_index = &index;
         }
     }
-    return false;
+
+    if (best_match_len == 0 || best_index == nullptr) return false;
+    bool has_join_key = false;
+    for (auto &col : best_index->cols) {
+        if (is_join_eq_on_col(col.name)) {
+            has_join_key = true;
+            break;
+        }
+    }
+    if (!has_join_key) return false;
+
+    for (auto &col : best_index->cols) index_col_names.push_back(col.name);
+    return true;
 }
 
 std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
@@ -95,7 +130,7 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
     auto right_scan = std::dynamic_pointer_cast<ScanPlan>(right);
     if (right_scan != nullptr) {
         std::vector<std::string> index_col_names;
-        if (get_join_index_cols(right_scan->tab_name_, join_conds, index_col_names)) {
+        if (get_join_index_cols(right_scan->tab_name_, right_scan->conds_, join_conds, index_col_names)) {
             right_scan->tag = T_IndexScan;
             right_scan->index_col_names_ = std::move(index_col_names);
             return std::make_shared<JoinPlan>(T_IndexNestLoop, std::move(left), std::move(right), std::move(join_conds));

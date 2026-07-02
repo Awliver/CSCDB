@@ -57,7 +57,8 @@ class Planner {
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     bool get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names);
-    bool get_join_index_cols(const std::string &right_table, const std::vector<Condition> &join_conds,
+    bool get_join_index_cols(const std::string &right_table, const std::vector<Condition> &scan_conds,
+                             const std::vector<Condition> &join_conds,
                              std::vector<std::string> &index_col_names);
     std::shared_ptr<Plan> make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
                                          std::vector<Condition> join_conds);
