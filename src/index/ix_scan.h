@@ -44,6 +44,7 @@ class IxScan : public RecScan {
     void next() override;
 
     bool is_end() const override {
+        std::scoped_lock<std::mutex> lock(ih_->root_latch_);  // 与 insert/delete 分裂/合并互斥，避免 num_pages_ TOCTOU 崩溃
         normalize_position();
         return iid_ == end_;
     }

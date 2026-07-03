@@ -625,6 +625,7 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
  * @note iid和rid存的不是一个东西，rid是上层传过来的记录位置，iid是索引内部生成的索引槽位置
  */
 Rid IxIndexHandle::get_rid(const Iid &iid) const {
+    std::scoped_lock<std::mutex> lock(root_latch_);  // 与并发 insert/delete(分裂/合并) 互斥，避免读到未生效页
     IxNodeHandle *node = fetch_node(iid.page_no);
     if (iid.slot_no >= node->get_size()) {
         buffer_pool_manager_->unpin_page(node->get_page_id(), false);
@@ -701,9 +702,11 @@ Iid IxIndexHandle::upper_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_end() const {
+    std::scoped_lock<std::mutex> lock(root_latch_);  // last_leaf_ 会随分裂变化，需与写操作互斥
     IxNodeHandle *node = fetch_node(file_hdr_->last_leaf_);
     Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node->get_size()};
     buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
+    delete node;  // 修复内存泄漏：fetch_node 返回 new IxNodeHandle
     return iid;
 }
 
@@ -714,6 +717,7 @@ Iid IxIndexHandle::leaf_end() const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_begin() const {
+    std::scoped_lock<std::mutex> lock(root_latch_);  // 与写操作互斥读取 first_leaf_
     Iid iid = {.page_no = file_hdr_->first_leaf_, .slot_no = 0};
     return iid;
 }
@@ -816,7 +820,11 @@ void IxIndexHandle::erase_leaf(IxNodeHandle *leaf) {
  * @param node
  */
 void IxIndexHandle::release_node_handle(IxNodeHandle &node) {
-    file_hdr_->num_pages_--;
+    // 不递减 num_pages_：DiskManager::deallocate_page 为空操作、allocate_page 单调自增(fd2pageno_)，
+    // 页从不真正回收复用。若此处 num_pages_-- 会与分配计数漂移，导致后续 create_node 分配到的
+    // 合法页号 >= num_pages_，被 fetch_node 的越界检查误判为 "invalid page" 而抛异常崩溃。
+    // num_pages_ 必须保持单调，作为 fetch_node 的有效页上界。
+    (void)node;
 }
 
 /**
