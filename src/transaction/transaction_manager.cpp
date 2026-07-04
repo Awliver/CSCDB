@@ -710,17 +710,79 @@ bool TransactionManager::ser_record_matches(const std::string &tab, const char *
 
 void TransactionManager::ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid) {
     std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
-    SerInfo &info = ser_[txn->get_transaction_id()];
+    txn_id_t id = txn->get_transaction_id();
+    SerInfo &info = ser_[id];
     info.read_ts = txn->get_read_ts();
-    info.read_rids.push_back({tab, mvcc_key(rid)});
+    int64_t rkey = mvcc_key(rid);
+    info.read_rids.push_back({tab, rkey});
+    ser_rid_readers_[tab][rkey].insert(id);      // 反查索引：写方 O(1) 直查读者
 }
 
 void TransactionManager::ser_record_pred(Transaction *txn, const std::string &tab,
                                          const std::vector<Condition> &conds) {
     std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
-    SerInfo &info = ser_[txn->get_transaction_id()];
+    txn_id_t id = txn->get_transaction_id();
+    SerInfo &info = ser_[id];
     info.read_ts = txn->get_read_ts();
     info.read_preds.push_back({tab, conds});
+    // 预编译（列偏移解析一次）后进按表分桶的反查索引；编译失败＝谓词引用不存在的列，
+    // 旧的 ser_record_matches 对其恒返回 false（永不命中），故直接不登记，语义等价。
+    std::vector<SerCompiledCond> cc;
+    if (ser_compile_pred(tab, conds, cc)) {
+        ser_pred_readers_[tab][id].push_back(std::move(cc));
+    }
+}
+
+bool TransactionManager::ser_compile_pred(const std::string &tab, const std::vector<Condition> &conds,
+                                          std::vector<SerCompiledCond> &out) {
+    TabMeta &meta = sm_manager_->db_.get_table(tab);
+    for (const auto &cond : conds) {
+        auto it = std::find_if(meta.cols.begin(), meta.cols.end(), [&](const ColMeta &c) {
+            return c.name == cond.lhs_col.col_name &&
+                   (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
+        });
+        if (it == meta.cols.end()) return false;
+        SerCompiledCond cc;
+        cc.lhs_off = it->offset;
+        cc.lhs_len = it->len;
+        cc.type = it->type;
+        cc.op = cond.op;
+        cc.rhs_is_val = cond.is_rhs_val;
+        cc.rhs_off = -1;
+        if (cond.is_rhs_val) {
+            cc.rhs_val.assign(cond.rhs_val.raw->data, it->len);
+        } else {
+            auto rit = std::find_if(meta.cols.begin(), meta.cols.end(),
+                                    [&](const ColMeta &c) { return c.name == cond.rhs_col.col_name; });
+            if (rit == meta.cols.end()) return false;
+            cc.rhs_off = rit->offset;
+        }
+        out.push_back(std::move(cc));
+    }
+    return true;
+}
+
+bool TransactionManager::ser_compiled_match(const char *data, const std::vector<SerCompiledCond> &cs) {
+    for (const auto &c : cs) {                    // 空谓词(全表扫描)匹配所有记录
+        const char *rhs = c.rhs_is_val ? c.rhs_val.data() : data + c.rhs_off;
+        if (!ser_cmp(data + c.lhs_off, rhs, c.lhs_len, c.type, c.op)) return false;
+    }
+    return true;
+}
+
+void TransactionManager::ser_unindex(txn_id_t id, const SerInfo &info) {
+    for (const auto &rr : info.read_rids) {
+        auto t = ser_rid_readers_.find(rr.first);
+        if (t == ser_rid_readers_.end()) continue;
+        auto r = t->second.find(rr.second);
+        if (r == t->second.end()) continue;
+        r->second.erase(id);
+        if (r->second.empty()) t->second.erase(r);
+    }
+    for (const auto &pr : info.read_preds) {
+        auto t = ser_pred_readers_.find(pr.first);
+        if (t != ser_pred_readers_.end()) t->second.erase(id);
+    }
 }
 
 void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts) {
@@ -732,6 +794,7 @@ void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t com
     } else {
         for (txn_id_t o : it->second.in_rw)  { auto p = ser_.find(o); if (p != ser_.end()) p->second.out_rw.erase(id); }
         for (txn_id_t o : it->second.out_rw) { auto p = ser_.find(o); if (p != ser_.end()) p->second.in_rw.erase(id); }
+        ser_unindex(id, it->second);             // 同步移除反查索引
         ser_.erase(it);                          // 回滚视为从未发生
     }
     // 水位 GC：已提交且 commit_ts <= 所有活跃事务最低 read_ts 的条目，不可能再与任何
@@ -744,6 +807,7 @@ void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t com
                 txn_id_t gone = sit->first;
                 for (txn_id_t o : sit->second.in_rw)  { auto p = ser_.find(o); if (p != ser_.end()) p->second.out_rw.erase(gone); }
                 for (txn_id_t o : sit->second.out_rw) { auto p = ser_.find(o); if (p != ser_.end()) p->second.in_rw.erase(gone); }
+                ser_unindex(gone, sit->second);      // 同步移除反查索引
                 sit = ser_.erase(sit);
             } else {
                 ++sit;
@@ -794,19 +858,33 @@ bool TransactionManager::ser_write_check(Transaction *txn, const std::string &ta
     std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     SerInfo &my = ser_[me];
     my.read_ts = txn->get_read_ts();
+    // 反查索引代替全表遍历（旧实现：遍历全部 ser_ 条目 × 线性扫其读集 × 按列名字符串
+    // 解析匹配谓词，perf 占 ~25% CPU）。命中集合与旧实现逐条等价：
+    // 读过该 rid 的事务（rid 索引直查）∪ 本表谓词匹配写入值的事务（预编译谓词按表桶匹配）。
+    std::unordered_set<txn_id_t> hits;
+    auto t1 = ser_rid_readers_.find(tab);
+    if (t1 != ser_rid_readers_.end()) {
+        auto r = t1->second.find(key);
+        if (r != t1->second.end()) {
+            for (txn_id_t o : r->second) {
+                if (o != me) hits.insert(o);
+            }
+        }
+    }
+    if (data != nullptr) {
+        auto t2 = ser_pred_readers_.find(tab);
+        if (t2 != ser_pred_readers_.end()) {
+            for (auto &kv : t2->second) {
+                if (kv.first == me || hits.count(kv.first)) continue;
+                for (auto &cc : kv.second) {
+                    if (ser_compiled_match(data, cc)) { hits.insert(kv.first); break; }
+                }
+            }
+        }
+    }
     bool dangerous = false;
-    for (auto &kv : ser_) {
-        txn_id_t other = kv.first;
-        if (other == me) continue;
-        SerInfo &oi = kv.second;
-        bool hit = false;
-        for (auto &rr : oi.read_rids)
-            if (rr.second == key && rr.first == tab) { hit = true; break; }
-        if (!hit && data)
-            for (auto &pr : oi.read_preds)
-                if (pr.first == tab && ser_record_matches(tab, data, pr.second)) { hit = true; break; }
-        if (hit && ser_overlap(other, me))
-            if (ser_add_edge(other, me)) dangerous = true;   // other ->rw me
+    for (txn_id_t other : hits) {
+        if (ser_overlap(other, me) && ser_add_edge(other, me)) dangerous = true;   // other ->rw me
     }
     return dangerous;
 }

@@ -331,6 +331,28 @@ private:
         std::unordered_set<txn_id_t> out_rw;   // 本事务 ->rw Y
     };
     std::unordered_map<txn_id_t, SerInfo> ser_;
+
+    /* 题9 性能：写方镜像检查(ser_write_check)的反查索引——均由 mvcc_meta_latch_ 保护。
+     * 旧实现每次写遍历全部 ser_ 条目 × 线性扫其读集 × 按列名字符串解析匹配谓词
+     * (perf: ser_write_check 12.2% + ser_record_matches 12.3%)。改为：
+     *   - (tab, rkey) → 读者集合：记录读时登记，写时 O(1) 直查；
+     *   - tab → 事务 → 预编译谓词(列偏移在 record 时解析一次)：写时只匹配本表谓词。
+     * 与 ser_ 同生共死：abort/GC 清除 SerInfo 时经 ser_unindex 同步移除。 */
+    struct SerCompiledCond {
+        int lhs_off, lhs_len;
+        ColType type;
+        CompOp op;
+        bool rhs_is_val;
+        int rhs_off;              // rhs 为列时的偏移
+        std::string rhs_val;      // rhs 为字面量时的字节
+    };
+    std::unordered_map<std::string, std::unordered_map<int64_t, std::unordered_set<txn_id_t>>> ser_rid_readers_;
+    std::unordered_map<std::string, std::unordered_map<txn_id_t, std::vector<std::vector<SerCompiledCond>>>> ser_pred_readers_;
+    void ser_unindex(txn_id_t id, const SerInfo &info);
+    bool ser_compile_pred(const std::string &tab, const std::vector<Condition> &conds,
+                          std::vector<SerCompiledCond> &out);
+    static bool ser_compiled_match(const char *data, const std::vector<SerCompiledCond> &cs);
+
     void ser_begin(txn_id_t id, timestamp_t read_ts);
     void ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts);
     bool ser_add_edge(txn_id_t reader, txn_id_t writer);    // 加 rw 边 + 查危险结构(true=危险)
