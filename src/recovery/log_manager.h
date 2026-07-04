@@ -349,7 +349,7 @@ public:
     void flush_log_to_disk();
     void wait_for_persist(lsn_t target_lsn);
 
-    LogBuffer* get_log_buffer() { return &log_buffer_; }
+    LogBuffer* get_log_buffer() { return &bufs_[active_]; }
 
     // 题10：以磁盘上既有日志长度初始化追加偏移（启动恢复后调用）
     void init_offset(long disk_bytes) {
@@ -363,17 +363,22 @@ public:
     }
 
 private:
-    void flush_nolock();
     void flush_worker();
 
     std::atomic<lsn_t> global_lsn_{0};  // 全局lsn，递增，用于为每条记录分发lsn
-    std::mutex latch_;                  // 用于对log_buffer_的互斥访问
-    std::condition_variable cv_;
-    std::condition_variable persist_cv_;
+    std::mutex latch_;                  // 保护双缓冲/lsn 元数据（IO 在锁外进行）
+    std::condition_variable cv_;         // 唤醒 flush worker
+    std::condition_variable persist_cv_; // 等待持久化的 committer
+    std::condition_variable space_cv_;   // active 缓冲满时等待换出的写日志者
     std::thread flush_thread_;
     bool stop_{false};
     bool flush_requested_{false};
-    LogBuffer log_buffer_;              // 日志缓冲区
+    /* 双缓冲组提交：worker 把 active 换出后在【锁外】write+fsync，期间到达的日志
+     * 进入新 active 排队——fsync 时长天然成为聚合窗口，一次 fsync 覆盖一批 commit。
+     * 旧实现 write+fsync 在锁内：fsync 期间所有日志追加被锁死，每笔 commit 实付一次
+     * fsync，慢盘上吞吐上限 = 1/fsync 延迟（OJ tpmC 天花板主因）。 */
+    LogBuffer bufs_[2];
+    int active_ = 0;                    // 当前接收写入的缓冲下标
     lsn_t persist_lsn_ = INVALID_LSN;   // 记录已经持久化到磁盘中的最后一条日志的日志号
     long total_offset_ = 0;             // 题10：日志文件逻辑总长（磁盘已刷 + 缓冲未刷）
     DiskManager* disk_manager_;
