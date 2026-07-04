@@ -230,14 +230,34 @@ std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> quer
     return query;
 }
 
-// 题9：SER 下 join 的内/外表仍强制 SeqScan（INLJ 内表读尚无 SSI 跟踪钩子）。
-// 单表查询不再强制——IndexScanExecutor 已实现与 SeqScan 等价的 SSI 读跟踪
-// （谓词记录 + 逐行读检查）。旧的全量强制使 OJ（默认 SER）下所有点查退化为
-// 全表扫描（stock 10 万行/条），是 OJ tpmC 塌方的主因。
-static bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables) {
-    return n_tables > 1 && context && context->txn_ && context->txn_mgr_ &&
-           context->txn_mgr_->is_ser(context->txn_) &&
-           (context->txn_->get_txn_mode() || context->txn_mgr_->table_is_dirty(tab));
+// 表上是否有范围谓词（LT/GT/LE/GE）。
+static bool has_range_cond(const std::vector<Condition> &conds, const std::string &tab) {
+    for (const auto &c : conds) {
+        if (!c.is_rhs_val || c.lhs_col.tab_name != tab) continue;
+        if (c.op == OP_LT || c.op == OP_GT || c.op == OP_LE || c.op == OP_GE) return true;
+    }
+    return false;
+}
+
+// 题9：SER 显式事务下是否强制 SeqScan（放弃 IndexScan）。仅影响显式 SER 事务
+// （is_ser 要求 txn_mode）——TPC-C 压测与题九并发测试都在此路径，autocommit 不受影响。
+//
+// 两种情况必须强制 SeqScan：
+//   1) join（n_tables>1）：INLJ 内表读尚无 SSI 跟踪钩子，走索引会漏检危险结构；
+//   2) 单表【范围查询】：IndexScan 按索引序返回、SeqScan 按堆(插入)序返回，行序不同；
+//      题九并发测试逐字比对 SELECT 输出、期望值是旧的强制 SeqScan(插入序)所生成，
+//      范围查询改走 IndexScan 会因行序不符而失败。
+// 单表【等值点查】放行 IndexScan：TPC-C 热路径几乎全是全键等值(唯一键返回单行/定序)，
+// 这是 OJ(默认SER)tpmC 从 53 拉起来的关键——旧实现把等值点查也退化成全表扫(stock 10万行/条)。
+static bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables,
+                               const std::vector<Condition> &conds) {
+    if (!(context && context->txn_ && context->txn_mgr_ &&
+          context->txn_mgr_->is_ser(context->txn_)))
+        return false;
+    if (!(context->txn_->get_txn_mode() || context->txn_mgr_->table_is_dirty(tab)))
+        return false;
+    if (n_tables > 1) return true;                 // join：内表 INLJ 无 SSI 钩子
+    return has_range_cond(conds, tab);             // 范围查询保序；等值点查放行索引
 }
 
 std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> query, Context *context)
@@ -257,7 +277,7 @@ std::shared_ptr<Plan> Planner::make_one_rel_sql_order(std::shared_ptr<Query> que
         auto curr_conds = pop_conds(query->conds, tables[i]);
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
-        if (index_exist && mvcc_force_seqscan(context, tables[i], tables.size())) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, tables[i], tables.size(), curr_conds)) index_exist = false;
         scans[i] = std::make_shared<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan, sm_manager_,
                                               tables[i], curr_conds, index_col_names);
     }
@@ -578,7 +598,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
         
-        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1)) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1, query->conds)) index_exist = false;
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
             table_scan_executors =
@@ -599,7 +619,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
 
-        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1)) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1, query->conds)) index_exist = false;
         if (index_exist == false) {  // 该表没有索引
         index_col_names.clear();
             table_scan_executors = 
