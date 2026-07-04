@@ -226,6 +226,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         txn->get_state() == TransactionState::ABORTED) return;
 
     timestamp_t cts = 0;
+    timestamp_t prune_wm = 0;
     auto write_set = txn->get_write_set();
     const bool had_writes = !write_set->empty();
     std::unordered_set<std::string> touched_tabs;
@@ -241,6 +242,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             if (wit != active_rts_.end()) active_rts_.erase(wit);
         }
         ser_finish(txn->get_transaction_id(), true, cts);
+        // 剪枝水位：其余活跃事务的最低 read_ts；无活跃事务时用本次 cts
+        //（未来事务 read_ts >= cts，只会读最新版本）。
+        prune_wm = active_rts_.empty() ? cts : *active_rts_.begin();
     }
     struct HeapFlush {
         std::string tab;
@@ -284,11 +288,45 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             }
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
-            prune_mvcc_after_commit(tab, wr->GetRid());
+            prune_mvcc_after_commit(tab, wr->GetRid(), prune_wm);
         }
     }
     for (const auto &hf : heap_flushes) {
         sm_manager_->fhs_.at(hf.tab)->update_record(hf.rid, (char *)hf.data.data(), nullptr);
+    }
+    // 删除活动跟踪收尾：记录各删除表的最近删除提交时间戳；递减活跃删除事务数
+    {
+        std::unordered_set<std::string> del_tabs;
+        for (auto *wr : *write_set) {
+            if (wr->GetWriteType() == WType::DELETE_TUPLE) del_tabs.insert(wr->GetTableName());
+        }
+        if (!del_tabs.empty()) {
+            std::scoped_lock<std::mutex> lck(del_meta_latch_);
+            for (const auto &t : del_tabs) last_del_cts_[t] = cts;
+        }
+        if (txn->has_delete()) {
+            active_del_txns_.fetch_sub(1, std::memory_order_acq_rel);
+            txn->set_has_delete(false);
+        }
+    }
+    // 干净链回收：堆已物化后，单版本、非墓碑、低于水位且无 pending 的链与堆等价，
+    // 可整链删除——否则 store 随事务数无界增长，插入端删-插冲突全链扫描 O(n²) 恶化。
+    for (auto *wr : *write_set) {
+        const std::string &tab = wr->GetTableName();
+        int64_t rkey = mvcc_key(wr->GetRid());
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
+        auto &sd = mvcc_shard_data_[sh];
+        auto tit = sd.store.find(tab);
+        if (tit == sd.store.end()) continue;
+        auto cit = tit->second.find(rkey);
+        if (cit == tit->second.end()) continue;
+        MvccChain &ch = cit->second;
+        if (ch.writer != INVALID_TXN_ID || ch.hist.size() != 1 ||
+            ch.hist[0].is_deleted || ch.hist[0].commit_ts > prune_wm) continue;
+        auto pit = sd.pending.find(tab);
+        if (pit != sd.pending.end() && pit->second.count(rkey)) continue;   // 他人 overlay 持有
+        tit->second.erase(cit);
     }
     if (!touched_tabs.empty()) {
         std::unique_lock<std::shared_mutex> lck(mvcc_dirty_mutex_);
@@ -413,6 +451,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         // abort 不写盘：高冲突 SI 下 abort 极频繁，同步刷 WAL 是主要瓶颈之一
     }
 
+    if (txn->has_delete()) {
+        active_del_txns_.fetch_sub(1, std::memory_order_acq_rel);
+        txn->set_has_delete(false);
+    }
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
     clear_pending_si_for_txn(txn);
     if (lock_manager_ != nullptr) lock_manager_->unlock_all(txn);
@@ -447,12 +489,13 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
         out = ch.writer_data;
         return true;
     }
-    // 其余情况按事务级快照读最新已提交版本（忽略他人未提交写）
+    // 其余情况按事务级快照读最新已提交版本（忽略他人未提交写）。
+    // 从新到旧反向扫：读者绝大多数只要最新版本，典型 O(1)；正向扫会随链长线性退化
+    // （热点行如 warehouse/district 链长 ∝ 已提交事务数 → 吞吐随运行时间衰减）。
     timestamp_t rts = txn->get_read_ts();
     const MvccVer *vis = nullptr;
-    for (const auto &v : ch.hist) {            // commit_ts 升序
-        if (v.commit_ts <= rts) vis = &v;
-        else break;
+    for (auto it = ch.hist.rbegin(); it != ch.hist.rend(); ++it) {   // commit_ts 降序
+        if (it->commit_ts <= rts) { vis = &*it; break; }
     }
     if (vis == nullptr || vis->is_deleted) return false;  // 快照中不存在或已删
     out = vis->data;
@@ -530,6 +573,11 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     ch.writer_del = is_delete;
     if (is_delete) ch.writer_data.clear();
     else ch.writer_data.assign(write_ptr, len);
+    // 删除活动跟踪：供插入端删-插冲突检查的快速门
+    if (is_delete && !txn->has_delete()) {
+        txn->set_has_delete(true);
+        active_del_txns_.fetch_add(1, std::memory_order_acq_rel);
+    }
     if (first_touch) {
         RmRecord undo_old(len);
         memcpy(undo_old.data, old_data, len);
@@ -782,17 +830,28 @@ bool TransactionManager::table_is_dirty(const std::string &tab) {
     return mvcc_dirty_.count(tab) != 0;
 }
 
-void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid) {
-    // 调用方(commit)已持 mvcc_shards_[mvcc_shard_idx(tab, rkey)]
+void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid,
+                                                 timestamp_t watermark) {
+    // 调用方(commit)已持 mvcc_shards_[mvcc_shard_idx(tab, rkey)]。
+    // 剪枝规则：任何读者的可见版本 = 最新的 commit_ts <= 其 read_ts 的版本。所有活跃
+    // 事务 read_ts >= watermark、未来事务 read_ts >= 本次 cts >= watermark，因此
+    // 「低于等于水位的版本中除最新一个以外」不可能被任何人选中，可安全删除。
+    // 高于水位的版本全部保留（可能被某个较旧快照选中或供 SER rw 反依赖检测）。
+    // 注意保留水位版本本身（含墓碑）：它区分"快照可见旧值/已删"与"未跟踪读堆"。
     auto &store = mvcc_shard_data_[mvcc_shard_idx(tab, mvcc_key(rid))].store;
     auto tit = store.find(tab);
     if (tit == store.end()) return;
     auto cit = tit->second.find(mvcc_key(rid));
     if (cit == tit->second.end()) return;
     MvccChain &ch = cit->second;
-    if (ch.writer != INVALID_TXN_ID || ch.hist.empty() || ch.hist.back().is_deleted) return;
-    // 保留已提交版本链供快照读；过早 prune 会使 read_ts 较旧的事务误读堆上最新值
-    return;
+    if (ch.hist.size() <= 1) return;
+    int keep_from = -1;                    // 最新的 commit_ts <= watermark 的版本下标
+    for (int i = (int)ch.hist.size() - 1; i >= 0; --i) {
+        if (ch.hist[i].commit_ts <= watermark) { keep_from = i; break; }
+    }
+    if (keep_from > 0) {
+        ch.hist.erase(ch.hist.begin(), ch.hist.begin() + keep_from);
+    }
 }
 
 void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecord *wr) {

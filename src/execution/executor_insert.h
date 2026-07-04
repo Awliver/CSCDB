@@ -58,9 +58,11 @@ class InsertExecutor : public AbstractExecutor {
         }
 
         // 题9 删-插写写冲突：插入的逻辑记录(按首列键)在本事务快照内可见、且正被并发删除
-        // (未提交删或快照后已提交删) → 与该删除基于同一旧版本 → first-updater-wins → abort
+        // (未提交删或快照后已提交删) → 与该删除基于同一旧版本 → first-updater-wins → abort。
+        // insert_key_conflict_needed 快速门：表上无在飞删除且快照后无已提交删除时跳过全链扫描
+        // （该扫描持全部分片锁且 O(链数)，曾占 87% CPU 并造成吞吐随时间衰减）。
         if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_) &&
-            !tab_.cols.empty()) {
+            !tab_.cols.empty() && context_->txn_mgr_->insert_key_conflict_needed(context_->txn_, tab_name_)) {
             auto &kcol = tab_.cols[0];
             if (context_->txn_mgr_->mvcc_insert_key_conflict(context_->txn_, tab_name_,
                                                              rec.data, kcol.offset, kcol.len)) {

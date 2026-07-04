@@ -196,6 +196,17 @@ public:
         if (!any_mvcc_dirty_.load()) return false;
         return table_is_dirty(tab);
     }
+    /* 题9 性能：插入端删-插冲突检查(mvcc_insert_key_conflict)的快速门。
+     * 该冲突只可能由「未提交删除」或「本事务快照之后已提交的删除」构成；
+     * 表上两者皆无时无需全链扫描（TPC-C 中 orders/order_line/stock 永远跳过）。
+     * perf 实测：无此门时全链扫描占 87% CPU 且随运行时间 O(n²) 恶化。 */
+    bool insert_key_conflict_needed(Transaction *txn, const std::string &tab) {
+        if (active_del_txns_.load(std::memory_order_acquire) > 0) return true;
+        std::scoped_lock<std::mutex> lck(del_meta_latch_);
+        auto it = last_del_cts_.find(tab);
+        return it != last_del_cts_.end() && it->second > txn->get_read_ts();
+    }
+
     /* 题9 唯一索引: 该 (table,rid) 是否被另一活跃事务持写(未提交插入/更新/删除)。用于
        并发同键插入的写写冲突检测——避免 MVCC 感知唯一检查把他人未提交插入误判为可重插。*/
     bool mvcc_other_writer(const std::string &tab, const Rid &rid, txn_id_t me) {
@@ -270,6 +281,11 @@ private:
     mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
 
+    /* 题9 性能：删除活动跟踪（insert_key_conflict_needed 的门） */
+    std::atomic<int> active_del_txns_{0};                     // 含未提交删除的活跃事务数
+    mutable std::mutex del_meta_latch_;                       // 保护 last_del_cts_
+    std::unordered_map<std::string, timestamp_t> last_del_cts_;  // 表 → 最近提交删除的 commit_ts
+
     /* 题9 SER (SSI) 状态 —— 由 mvcc_meta_latch_ 保护 */
     struct SerInfo {
         timestamp_t read_ts = 0;
@@ -297,7 +313,9 @@ private:
     void lock_all_mvcc_shards() const;
     void unlock_all_mvcc_shards() const;
     friend struct MvccAllShardsGuard;
-    void prune_mvcc_after_commit(const std::string &tab, const Rid &rid);
+    /* commit 时按活跃事务最低 read_ts 水位剪枝版本链：低于水位的版本只保留最新一个，
+     * 其余对任何现役/未来事务都不可见（未来事务 read_ts >= 本次 commit_ts > 水位）。 */
+    void prune_mvcc_after_commit(const std::string &tab, const Rid &rid, timestamp_t watermark);
     void physical_undo_write_record(Transaction *txn, WriteRecord *wr);
     static std::string si_overlay_key(const std::string &tab, int64_t rkey) {
         return tab + "#" + std::to_string(rkey);
