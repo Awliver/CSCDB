@@ -39,8 +39,10 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
     while (bufs_[active_].is_full(len)) {
         // active 满：请求换出并等待（另一块缓冲正被 worker 刷盘时形成自然背压）
         flush_requested_ = true;
+        space_waiters_++;
         cv_.notify_one();
         space_cv_.wait(lock, [&] { return !bufs_[active_].is_full(len) || stop_; });
+        space_waiters_--;
         if (stop_) break;
     }
     log_record->lsn_ = global_lsn_++;
@@ -57,6 +59,7 @@ void LogManager::flush_log_to_disk() {
     std::unique_lock<std::mutex> lock(latch_);
     lsn_t target = global_lsn_.load() - 1;
     if (persist_lsn_ >= target) return;
+    if (target > requested_lsn_) requested_lsn_ = target;
     flush_requested_ = true;
     cv_.notify_one();
     persist_cv_.wait(lock, [&] { return persist_lsn_ >= target || stop_; });
@@ -65,6 +68,7 @@ void LogManager::flush_log_to_disk() {
 void LogManager::wait_for_persist(lsn_t target_lsn) {
     std::unique_lock<std::mutex> lock(latch_);
     if (persist_lsn_ >= target_lsn) return;
+    if (target_lsn > requested_lsn_) requested_lsn_ = target_lsn;
     flush_requested_ = true;
     cv_.notify_one();
     persist_cv_.wait(lock, [&] { return persist_lsn_ >= target_lsn || stop_; });
@@ -77,8 +81,11 @@ void LogManager::flush_worker() {
     while (true) {
         cv_.wait(lock, [&] { return stop_ || flush_requested_; });
         flush_requested_ = false;
-        // 连续排空：上一轮 fsync 期间积累的日志立即成为下一批
-        while (bufs_[active_].offset_ > 0) {
+        // 只为"有人等待"的目标刷盘：有 committer 等 lsn、有写者等缓冲空间、或正在停机。
+        // 不做无差别排空——否则语句日志一到就被后台连续 fsync，慢盘上抢占数据页 IO
+        // （OJ 实测回退 -10% 的来源）。fsync 期间积累的下一批在仍有等待者时立即接续。
+        while (bufs_[active_].offset_ > 0 &&
+               (persist_lsn_ < requested_lsn_ || space_waiters_ > 0 || stop_)) {
             int fl = active_;
             active_ ^= 1;                       // 单 worker 串行 ⇒ 换入的缓冲此刻必为空
             lsn_t target = global_lsn_.load() - 1;

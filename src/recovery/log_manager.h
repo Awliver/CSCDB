@@ -380,6 +380,9 @@ private:
     LogBuffer bufs_[2];
     int active_ = 0;                    // 当前接收写入的缓冲下标
     lsn_t persist_lsn_ = INVALID_LSN;   // 记录已经持久化到磁盘中的最后一条日志的日志号
+    lsn_t requested_lsn_ = INVALID_LSN; // 被等待持久化的最大 lsn（只为它们 fsync——
+                                        // 无人等待时不刷，避免后台连续 fsync 抢占慢盘 IO）
+    int space_waiters_ = 0;             // 等待缓冲空间的写日志者数
     long total_offset_ = 0;             // 题10：日志文件逻辑总长（磁盘已刷 + 缓冲未刷）
     DiskManager* disk_manager_;
 };
