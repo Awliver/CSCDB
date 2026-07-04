@@ -294,20 +294,25 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     for (const auto &hf : heap_flushes) {
         sm_manager_->fhs_.at(hf.tab)->update_record(hf.rid, (char *)hf.data.data(), nullptr);
     }
-    // 删除活动跟踪收尾：记录各删除表的最近删除提交时间戳；递减活跃删除事务数
-    {
-        std::unordered_set<std::string> del_tabs;
-        for (auto *wr : *write_set) {
-            if (wr->GetWriteType() == WType::DELETE_TUPLE) del_tabs.insert(wr->GetTableName());
+    // 被删键索引收尾：本事务的删除键转为已提交（记 cts、清 writer），并机会式
+    // 清理水位以下的陈旧条目（无未提交删除者且 cts <= 水位的键不可能再触发冲突）。
+    if (!txn->del_keys().empty()) {
+        std::scoped_lock<std::mutex> lck(del_meta_latch_);
+        for (const auto &tk : txn->del_keys()) {
+            auto &st = del_keys_[tk.first][tk.second];
+            st.writers.erase(txn->get_transaction_id());
+            if (cts > st.last_del_cts) st.last_del_cts = cts;
+            auto &tabmap = del_keys_[tk.first];
+            if (tabmap.size() > 8192) {
+                for (auto it = tabmap.begin(); it != tabmap.end();) {
+                    if (it->second.writers.empty() && it->second.last_del_cts <= prune_wm)
+                        it = tabmap.erase(it);
+                    else
+                        ++it;
+                }
+            }
         }
-        if (!del_tabs.empty()) {
-            std::scoped_lock<std::mutex> lck(del_meta_latch_);
-            for (const auto &t : del_tabs) last_del_cts_[t] = cts;
-        }
-        if (txn->has_delete()) {
-            active_del_txns_.fetch_sub(1, std::memory_order_acq_rel);
-            txn->set_has_delete(false);
-        }
+        txn->del_keys().clear();
     }
     // 干净链回收：堆已物化后，单版本、非墓碑、低于水位且无 pending 的链与堆等价，
     // 可整链删除——否则 store 随事务数无界增长，插入端删-插冲突全链扫描 O(n²) 恶化。
@@ -451,9 +456,19 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         // abort 不写盘：高冲突 SI 下 abort 极频繁，同步刷 WAL 是主要瓶颈之一
     }
 
-    if (txn->has_delete()) {
-        active_del_txns_.fetch_sub(1, std::memory_order_acq_rel);
-        txn->set_has_delete(false);
+    // 撤销本事务的被删键登记；条目已无内容则移除
+    if (!txn->del_keys().empty()) {
+        std::scoped_lock<std::mutex> lck(del_meta_latch_);
+        for (const auto &tk : txn->del_keys()) {
+            auto tit = del_keys_.find(tk.first);
+            if (tit == del_keys_.end()) continue;
+            auto kit = tit->second.find(tk.second);
+            if (kit == tit->second.end()) continue;
+            kit->second.writers.erase(txn->get_transaction_id());
+            if (kit->second.writers.empty() && kit->second.last_del_cts == 0)
+                tit->second.erase(kit);
+        }
+        txn->del_keys().clear();
     }
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
     clear_pending_si_for_txn(txn);
@@ -573,10 +588,15 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     ch.writer_del = is_delete;
     if (is_delete) ch.writer_data.clear();
     else ch.writer_data.assign(write_ptr, len);
-    // 删除活动跟踪：供插入端删-插冲突检查的快速门
-    if (is_delete && !txn->has_delete()) {
-        txn->set_has_delete(true);
-        active_del_txns_.fetch_add(1, std::memory_order_acq_rel);
+    // 被删键登记（首列字节）：供插入端删-插冲突 O(1) 点查。锁序：分片锁 → del_meta_latch_
+    if (is_delete && old_data != nullptr) {
+        TabMeta &meta = sm_manager_->db_.get_table(tab);
+        if (!meta.cols.empty() && meta.cols[0].offset + meta.cols[0].len <= len) {
+            std::string kb(old_data + meta.cols[0].offset, meta.cols[0].len);
+            std::scoped_lock<std::mutex> dl(del_meta_latch_);
+            del_keys_[tab][kb].writers.insert(txn->get_transaction_id());
+            txn->add_del_key(tab, kb);
+        }
     }
     if (first_touch) {
         RmRecord undo_old(len);
@@ -590,32 +610,20 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
 
 bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
                                                   const char *rec_data, int key_off, int key_len) {
-    MvccAllShardsGuard all_shards(this);
+    // 被删键索引 O(1) 点查（原实现持全部分片锁全表扫版本链，占 87% CPU）。
+    // 语义与原扫描同为"记录首列"粒度；略保守——不再验证被删旧版本对本快照可见，
+    // 误报仅多一次 abort（安全），TPC-C 键单调递增实际不撞。
+    std::scoped_lock<std::mutex> lck(del_meta_latch_);
+    auto tit = del_keys_.find(tab);
+    if (tit == del_keys_.end()) return false;
+    auto kit = tit->second.find(std::string(rec_data + key_off, key_len));
+    if (kit == tit->second.end()) return false;
+    const DelKeyState &st = kit->second;
     txn_id_t me = txn->get_transaction_id();
-    timestamp_t rts = txn->get_read_ts();
-    const char *key = rec_data + key_off;
-    // 该表的版本链按 rkey 分散在所有分片，逐分片扫描
-    for (auto &sd : mvcc_shard_data_) {
-        auto tit = sd.store.find(tab);
-        if (tit == sd.store.end()) continue;
-        for (auto &kv : tit->second) {
-            MvccChain &ch = kv.second;
-            // 本事务快照可见的最新已提交版本
-            const MvccVer *vis = nullptr;
-            for (const auto &v : ch.hist) {          // commit_ts 升序
-                if (v.commit_ts <= rts) vis = &v;
-                else break;
-            }
-            if (vis == nullptr || vis->is_deleted) continue;   // 快照内无该记录 → 插入不基于旧版本
-            if ((int)vis->data.size() < key_off + key_len) continue;
-            if (memcmp(vis->data.data() + key_off, key, key_len) != 0) continue;  // 键不同
-            // 快照可见同键旧版本：被并发删除(未提交或快照后已提交) → 写写冲突
-            if (ch.writer != INVALID_TXN_ID && ch.writer != me && ch.writer_del) return true;
-            if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
-                ch.hist.back().commit_ts > rts && ch.hist.back().is_deleted) return true;
-        }
+    for (txn_id_t w : st.writers) {
+        if (w != me) return true;                       // 他人未提交删除同键 → 冲突
     }
-    return false;
+    return st.last_del_cts > txn->get_read_ts();        // 快照之后已提交的删除 → 冲突
 }
 
 /* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------

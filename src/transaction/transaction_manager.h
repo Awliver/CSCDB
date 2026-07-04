@@ -196,17 +196,6 @@ public:
         if (!any_mvcc_dirty_.load()) return false;
         return table_is_dirty(tab);
     }
-    /* 题9 性能：插入端删-插冲突检查(mvcc_insert_key_conflict)的快速门。
-     * 该冲突只可能由「未提交删除」或「本事务快照之后已提交的删除」构成；
-     * 表上两者皆无时无需全链扫描（TPC-C 中 orders/order_line/stock 永远跳过）。
-     * perf 实测：无此门时全链扫描占 87% CPU 且随运行时间 O(n²) 恶化。 */
-    bool insert_key_conflict_needed(Transaction *txn, const std::string &tab) {
-        if (active_del_txns_.load(std::memory_order_acquire) > 0) return true;
-        std::scoped_lock<std::mutex> lck(del_meta_latch_);
-        auto it = last_del_cts_.find(tab);
-        return it != last_del_cts_.end() && it->second > txn->get_read_ts();
-    }
-
     /* 题9 唯一索引: 该 (table,rid) 是否被另一活跃事务持写(未提交插入/更新/删除)。用于
        并发同键插入的写写冲突检测——避免 MVCC 感知唯一检查把他人未提交插入误判为可重插。*/
     bool mvcc_other_writer(const std::string &tab, const Rid &rid, txn_id_t me) {
@@ -281,10 +270,16 @@ private:
     mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
 
-    /* 题9 性能：删除活动跟踪（insert_key_conflict_needed 的门） */
-    std::atomic<int> active_del_txns_{0};                     // 含未提交删除的活跃事务数
-    mutable std::mutex del_meta_latch_;                       // 保护 last_del_cts_
-    std::unordered_map<std::string, timestamp_t> last_del_cts_;  // 表 → 最近提交删除的 commit_ts
+    /* 题9 性能：被删键索引（del_keys_）——插入端删-插冲突检测的 O(1) 点查。
+     * 曾经的实现对每次 INSERT 持全部分片锁全表扫版本链，perf 实测占 87% CPU 且
+     * 随累计事务数 O(n²) 恶化。此索引只登记"被删除过的键"（TPC-C 中仅 new_orders），
+     * 天然很小；键粒度与原扫描一致（记录首列字节）。 */
+    struct DelKeyState {
+        std::unordered_set<txn_id_t> writers;   // 未提交删除者（同键可有多行、多事务）
+        timestamp_t last_del_cts = 0;           // 最近已提交删除的 commit_ts
+    };
+    mutable std::mutex del_meta_latch_;         // 保护 del_keys_
+    std::unordered_map<std::string, std::unordered_map<std::string, DelKeyState>> del_keys_;
 
     /* 题9 SER (SSI) 状态 —— 由 mvcc_meta_latch_ 保护 */
     struct SerInfo {

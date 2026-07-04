@@ -75,9 +75,12 @@ class Transaction {
     inline void set_txn_mode(bool txn_mode) { txn_mode_ = txn_mode; }
     inline bool get_txn_mode() { return txn_mode_; }
 
-    // 题9 性能：本事务是否含删除写（插入端删-插冲突检查的快速门用）
-    inline void set_has_delete(bool v) { has_delete_ = v; }
-    inline bool has_delete() const { return has_delete_; }
+    // 题9 性能：本事务登记过的删除键 (表名, 首列键字节)。
+    // commit 时转为已提交删除、abort 时撤销登记——供插入端删-插冲突 O(1) 点查。
+    inline void add_del_key(const std::string &tab, const std::string &key) {
+        del_keys_.emplace_back(tab, key);
+    }
+    inline std::vector<std::pair<std::string, std::string>> &del_keys() { return del_keys_; }
 
     inline void set_start_ts(timestamp_t start_ts) { start_ts_ = start_ts; }
     inline timestamp_t get_start_ts() { return start_ts_; }
@@ -144,7 +147,7 @@ class Transaction {
 
    private:
     bool txn_mode_;                   // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
-    bool has_delete_ = false;         // 题9 性能：本事务是否登记过删除写
+    std::vector<std::pair<std::string, std::string>> del_keys_;  // 题9 性能：本事务的删除键登记
     TransactionState state_;          // 事务状态
     IsolationLevel isolation_level_;  // 事务的隔离级别，默认隔离级别为可串行化
     std::thread::id thread_id_;       // 当前事务对应的线程id
