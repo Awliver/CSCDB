@@ -82,6 +82,11 @@ class Transaction {
     }
     inline std::vector<std::pair<std::string, std::string>> &del_keys() { return del_keys_; }
 
+    // 题9 性能：本事务写过的表集合（首次写返回 true）。供每表写活动计数
+    // （SER 读检查门）在 mvcc_write/mvcc_insert 时精确 +1、commit/abort 时对称 -1。
+    inline bool add_written_tab(const std::string &tab) { return written_tabs_.insert(tab).second; }
+    inline std::unordered_set<std::string> &written_tabs() { return written_tabs_; }
+
     inline void set_start_ts(timestamp_t start_ts) { start_ts_ = start_ts; }
     inline timestamp_t get_start_ts() { return start_ts_; }
 
@@ -148,6 +153,7 @@ class Transaction {
    private:
     bool txn_mode_;                   // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     std::vector<std::pair<std::string, std::string>> del_keys_;  // 题9 性能：本事务的删除键登记
+    std::unordered_set<std::string> written_tabs_;               // 题9 性能：本事务写过的表
     TransactionState state_;          // 事务状态
     IsolationLevel isolation_level_;  // 事务的隔离级别，默认隔离级别为可串行化
     std::thread::id thread_id_;       // 当前事务对应的线程id

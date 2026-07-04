@@ -294,6 +294,18 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     for (const auto &hf : heap_flushes) {
         sm_manager_->fhs_.at(hf.tab)->update_record(hf.rid, (char *)hf.data.data(), nullptr);
     }
+    // 每表写活动收尾：记录含写提交的 cts、写者计数 -1（与 note_table_write 对称）。
+    // 顺序：cts 更新与减计数同锁原子——读者要么见 writers>0 要么见 last_cts>其快照，
+    // 两者都触发检查，不存在"计数已减而 cts 未记"的漏检窗口。
+    if (!txn->written_tabs().empty()) {
+        std::unique_lock<std::shared_mutex> lck(write_activity_mutex_);
+        for (const auto &tab : txn->written_tabs()) {
+            WriteActivity &wa = write_activity_[tab];
+            if (cts > wa.last_cts) wa.last_cts = cts;
+            if (wa.writers > 0) wa.writers--;
+        }
+        txn->written_tabs().clear();
+    }
     // 被删键索引收尾：本事务的删除键转为已提交（记 cts、清 writer），并机会式
     // 清理水位以下的陈旧条目（无未提交删除者且 cts <= 水位的键不可能再触发冲突）。
     if (!txn->del_keys().empty()) {
@@ -456,6 +468,15 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         // abort 不写盘：高冲突 SI 下 abort 极频繁，同步刷 WAL 是主要瓶颈之一
     }
 
+    // 每表写活动收尾（abort）：写者计数 -1，不记 cts（回滚的写不产生已提交版本）
+    if (!txn->written_tabs().empty()) {
+        std::unique_lock<std::shared_mutex> lck(write_activity_mutex_);
+        for (const auto &tab : txn->written_tabs()) {
+            auto it = write_activity_.find(tab);
+            if (it != write_activity_.end() && it->second.writers > 0) it->second.writers--;
+        }
+        txn->written_tabs().clear();
+    }
     // 撤销本事务的被删键登记；条目已无内容则移除
     if (!txn->del_keys().empty()) {
         std::scoped_lock<std::mutex> lck(del_meta_latch_);
@@ -519,7 +540,9 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
 
 void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
                                      const char *data, int len) {
+    note_table_write(txn, tab);        // 先计数后写存储：读者门不得漏看在飞写者
     int64_t rkey = mvcc_key(rid);
+    recent_writes_add(tab, rkey);      // 先登记后写链：幻影检测扫描范围不得漏看在飞写
     size_t sh = mvcc_shard_idx(tab, rkey);
     std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
     {
@@ -538,7 +561,9 @@ void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, c
 bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
                                     const char *old_data, const char *new_data, int len, bool is_delete,
                                     std::string *effective_out) {
+    note_table_write(txn, tab);        // 先计数后写存储：读者门不得漏看在飞写者
     int64_t rkey = mvcc_key(rid);
+    recent_writes_add(tab, rkey);      // 先登记后写链：幻影检测扫描范围不得漏看在飞写
     size_t sh = mvcc_shard_idx(tab, rkey);
     std::unique_lock<std::mutex> lck(mvcc_shards_[sh]);
     {
@@ -787,6 +812,9 @@ bool TransactionManager::ser_write_check(Transaction *txn, const std::string &ta
 }
 
 bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab, const Rid &rid) {
+    // 门：表上无在飞写者且最近写提交 <= 本快照 ⇒ 不存在对本事务不可见的写 ⇒ 无边可建。
+    // （门后出现的写由写方 ser_write_check 匹配本事务已记录的读集/谓词建边，不漏检。）
+    if (!ser_needs_read_check(txn, tab)) return false;
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
     int64_t key = mvcc_key(rid);
@@ -817,32 +845,70 @@ bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab
 // 建立 me ->rw writer。补齐 ser_read_check(只查已读 rid) 无法发现的"看不到的新行"。
 bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string &tab,
                                              const std::vector<Condition> &conds) {
+    // 门：表无在飞写者且最近写提交 <= 本快照 ⇒ 整跳（item 等只读表）。
+    // 调用方保证先 ser_record_pred 再调本函数——门后出现的匹配写由写方 ser_write_check 建边。
+    if (!ser_needs_read_check(txn, tab)) return false;
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
-    MvccAllShardsGuard all_shards(this);
+
+    // 只扫"近期写链"集合（未提交写 + 水位以上已提交写），O(活跃窗口写数)；
+    // 旧实现锁全部 64 分片 + 全表链扫描，占 47% CPU 且随累计事务数恶化。
+    std::vector<int64_t> keys;
+    {
+        std::scoped_lock<std::mutex> rl(recent_writes_latch_);
+        auto it = recent_writes_.find(tab);
+        if (it == recent_writes_.end() || it->second.empty()) return false;
+        keys.assign(it->second.begin(), it->second.end());
+    }
+    timestamp_t wm;
+    {
+        std::scoped_lock<std::mutex> ml(mvcc_meta_latch_);
+        wm = active_rts_.empty() ? last_commit_ts_.load() : *active_rts_.begin();
+    }
+
+    // 逐链检查（仅持该链的分片锁），收集需建边的写者；冷链顺手剔除
+    std::vector<txn_id_t> hit_writers;
+    std::vector<int64_t> cold;
+    for (int64_t rkey : keys) {
+        size_t sh = mvcc_shard_idx(tab, rkey);
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
+        auto tit = mvcc_shard_data_[sh].store.find(tab);
+        if (tit == mvcc_shard_data_[sh].store.end()) { cold.push_back(rkey); continue; }
+        auto cit = tit->second.find(rkey);
+        if (cit == tit->second.end()) { cold.push_back(rkey); continue; }
+        MvccChain &ch = cit->second;
+        // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
+        if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
+            !ch.writer_data.empty() && ser_record_matches(tab, ch.writer_data.data(), conds)) {
+            hit_writers.push_back(ch.writer);
+        }
+        // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
+        for (auto &v : ch.hist) {
+            if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
+                v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
+                ser_record_matches(tab, v.data.data(), conds)) {
+                hit_writers.push_back(v.writer_txn);
+            }
+        }
+        // 冷判定：无在飞写者且最新已提交版本低于全局水位 → 对任何现役/未来读者都可见
+        if (ch.writer == INVALID_TXN_ID &&
+            (ch.hist.empty() || ch.hist.back().commit_ts <= wm)) {
+            cold.push_back(rkey);
+        }
+    }
+    if (!cold.empty()) {
+        std::scoped_lock<std::mutex> rl(recent_writes_latch_);
+        auto it = recent_writes_.find(tab);
+        if (it != recent_writes_.end())
+            for (int64_t k : cold) it->second.erase(k);
+    }
+    if (hit_writers.empty()) return false;
+    // 统一在 meta latch 下做 ser_ 归属校验 + 建边 + 危险结构检测（与旧实现语义一致）
     std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
     bool dangerous = false;
-    // 该表的版本链按 rkey 分散在所有分片，逐分片扫描
-    for (auto &sd : mvcc_shard_data_) {
-        auto tit = sd.store.find(tab);
-        if (tit == sd.store.end()) continue;
-        for (auto &kv : tit->second) {
-            MvccChain &ch = kv.second;
-            // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
-            if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
-                !ch.writer_data.empty() && ser_.count(ch.writer) && ser_overlap(me, ch.writer) &&
-                ser_record_matches(tab, ch.writer_data.data(), conds)) {
-                if (ser_add_edge(me, ch.writer)) dangerous = true;
-            }
-            // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
-            for (auto &v : ch.hist) {
-                if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
-                    v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
-                    ser_.count(v.writer_txn) && ser_overlap(me, v.writer_txn) &&
-                    ser_record_matches(tab, v.data.data(), conds)) {
-                    if (ser_add_edge(me, v.writer_txn)) dangerous = true;
-                }
-            }
+    for (txn_id_t w : hit_writers) {
+        if (ser_.count(w) && ser_overlap(me, w)) {
+            if (ser_add_edge(me, w)) dangerous = true;
         }
     }
     return dangerous;

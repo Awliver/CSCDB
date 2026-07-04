@@ -281,6 +281,45 @@ private:
     mutable std::mutex del_meta_latch_;         // 保护 del_keys_
     std::unordered_map<std::string, std::unordered_map<std::string, DelKeyState>> del_keys_;
 
+    /* 题9 性能：每表写活动（SER 读检查门）。
+     * writers>0 或 last_cts>读者快照 ⇒ 可能存在对读者不可见的写 ⇒ 读侧检查必须跑；
+     * 否则整跳（ser_read_pred_check 曾占 47% CPU：每个 SER SELECT 锁全部分片+全表扫版本存储）。
+     * 可靠性：门后才出现的写由写方 ser_write_check（无条件跑、匹配已记录读集/谓词）建边——
+     * 前提是读方先 ser_record_pred/ser_record_read 再判门（调用方顺序保证）。 */
+    struct WriteActivity {
+        int writers = 0;                 // 持未提交写的活跃事务数
+        timestamp_t last_cts = 0;        // 最近一次含写提交的 commit_ts
+    };
+    mutable std::shared_mutex write_activity_mutex_;
+    std::unordered_map<std::string, WriteActivity> write_activity_;
+
+    /* 题9 性能：每表"近期写链"集合（SER 幻影检测的扫描范围）。
+     * 包含：有未提交写的链 + 已提交但 commit_ts > 水位的链。ser_read_pred_check
+     * 只扫此集合（O(活跃窗口写数)），代替全表链扫描+全分片锁（曾占 47% CPU，
+     * 且随累计事务数增长——也是 OJ Join Test 43s→111s 回归的元凶）。
+     * 维护：mvcc_write/insert 在写入链之前登记（读者不得漏看在飞写）；
+     * 冷链（无 writer 且 hist.back().cts <= 全局水位）由 pred check 遍历时惰性剔除
+     * ——水位单调不减，剔除后不会重新变热。 */
+    mutable std::mutex recent_writes_latch_;
+    std::unordered_map<std::string, std::unordered_set<int64_t>> recent_writes_;
+    void recent_writes_add(const std::string &tab, int64_t rkey) {
+        std::scoped_lock<std::mutex> lck(recent_writes_latch_);
+        recent_writes_[tab].insert(rkey);
+    }
+    /* 首次写某表时计数 +1（在写进版本存储之前调用，保证读者门不漏看在飞写者） */
+    void note_table_write(Transaction *txn, const std::string &tab) {
+        if (txn == nullptr || !txn->add_written_tab(tab)) return;
+        std::unique_lock<std::shared_mutex> lck(write_activity_mutex_);
+        write_activity_[tab].writers++;
+    }
+    /* 读侧门：本表是否可能存在对 txn 不可见的写（不可能则读检查可整跳） */
+    bool ser_needs_read_check(Transaction *txn, const std::string &tab) {
+        std::shared_lock<std::shared_mutex> lck(write_activity_mutex_);
+        auto it = write_activity_.find(tab);
+        if (it == write_activity_.end()) return false;
+        return it->second.writers > 0 || it->second.last_cts > txn->get_read_ts();
+    }
+
     /* 题9 SER (SSI) 状态 —— 由 mvcc_meta_latch_ 保护 */
     struct SerInfo {
         timestamp_t read_ts = 0;
