@@ -1,5 +1,9 @@
 # tpccbench — RMDB 的 TPC-C 基准测试工具
 
+> ⚠️ **单实例约定**：本工具（与 tests/ 下所有脚本一致）启动服务器前会
+> `pkill -9 -f bin/rmdb` 清场，且所有测试共用端口 8765。**不要并行运行
+> 两个测试/基准**——后启动的会直接杀死先前的服务器（表现为静默崩溃）。
+
 仿照 pgbench / BenchBase 结构、按 **TPC-C 规范 v5.11** 实现的完整测试工具：
 数据生成 → 装载校验 → 事务正确性 → 一致性检查 → ACID 测试 → 多客户端压测。
 
@@ -37,7 +41,19 @@ python3 bench/tpccbench.py run --duration 300 --clients 8 --json out.json
 - 无 DISTINCT：stock_level 取 join 行客户端去重（结果等价）
 - `c_data char(50)`（规范 300..500）
 - Delivery 内联执行（多数实现同此，规范允许排队）
-- 无键入/思考时间（pgbench 式极限吞吐模式）
+
+## keying / think time（`--think`，默认开启）
+
+TPC-C 规范 5.2.5.4 要求每个终端在事务前有 **keying time**（固定输入时间）、提交后有
+**think time**（指数分布思考时间），把吞吐限流到规范上限。**这是 tpmC 落在真实数十
+量级的根本原因**——OJ 也是这么测的（OJ 实测 ~53）。
+
+- `--think 1.0`（默认）：完整规范限流。W=1、8 客户端下 tpmC ≈ 10~50，与 OJ 同数量级。
+  要逼近 OJ 的绝对值，按规范用 `--clients`＝10×仓库数、跑满 `--duration 360`。
+- `--think 0`：关闭限流 = **极限吞吐模式**（旧 pgbench 式）。tpmC 会虚高几百倍
+  （20000+），**只适合做引擎内部优化的相对对比，不代表真实 TPC-C 成绩**。
+
+keying/think 时间不计入事务延迟统计（p50/p90/p99 仍是纯事务响应时间）。
 
 ## 本工具发现并已修复的引擎 bug（2026-07-03 发现，07-04 修复）
 

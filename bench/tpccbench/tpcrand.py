@@ -15,6 +15,13 @@ A_C_LAST = 255
 A_C_ID = 1023
 A_OL_I_ID = 8191
 
+# TPC-C 规范 5.2.5.4 每事务的 keying time（固定最小输入时间，秒）与 think time（思考时间均值，秒）。
+# 这两项把每个终端限流到规范吞吐上限——没有它们就是"极限吞吐模式"，tpmC 会虚高几百倍。
+KEYING_TIME = {"new_order": 18.0, "payment": 3.0, "order_status": 2.0,
+               "delivery": 2.0, "stock_level": 2.0}
+THINK_MEAN = {"new_order": 12.0, "payment": 12.0, "order_status": 10.0,
+              "delivery": 5.0, "stock_level": 5.0}
+
 
 def lastname(num):
     """Spec 4.3.2.3: three syllables from digits of num (0..999)."""
@@ -93,3 +100,18 @@ class TpccRandom:
         seq = list(seq)
         self.rng.shuffle(seq)
         return seq
+
+    def keying_time(self, txn):
+        """规范 5.2.5.4：事务开始前的固定输入时间。"""
+        return KEYING_TIME.get(txn, 0.0)
+
+    def think_time(self, txn):
+        """规范 5.2.5.4：事务提交后的思考时间，指数分布 Tt = -ln(r)*mean，截断于 10*mean。"""
+        mean = THINK_MEAN.get(txn, 0.0)
+        if mean <= 0:
+            return 0.0
+        import math
+        r = self.rng.random()
+        if r <= 0.0:
+            r = 1e-9
+        return min(-math.log(r) * mean, 10.0 * mean)

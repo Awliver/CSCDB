@@ -52,7 +52,7 @@ def _pct(sorted_ms, q):
 
 class Worker(threading.Thread):
     def __init__(self, idx, cfg, deck_weights, stats, stop_evt, seed, c_consts,
-                 isolation, timeout):
+                 isolation, timeout, think_scale=1.0):
         super().__init__(daemon=True)
         self.idx = idx
         self.cfg = cfg
@@ -63,7 +63,19 @@ class Worker(threading.Thread):
         self.w_id = 1 + (idx % cfg.warehouses)
         self.isolation = isolation
         self.timeout = timeout
+        self.think_scale = think_scale     # TPC-C keying+think 时间倍率；0=极限吞吐模式
         self.fatal = None
+
+    def _pace(self, seconds):
+        """按 stop_evt 分段睡眠，保证停测时能及时退出（think time 可达数十秒）。"""
+        if seconds <= 0:
+            return
+        end = time.perf_counter() + seconds
+        while not self.stop_evt.is_set():
+            remain = end - time.perf_counter()
+            if remain <= 0:
+                return
+            time.sleep(min(remain, 0.5))
 
     def _connect(self):
         cli = Client(timeout=self.timeout)
@@ -83,6 +95,11 @@ class Worker(threading.Thread):
             if not deck:
                 deck = self.rng.shuffled(workload.build_deck(self.deck_weights))
             name, fn = deck.pop()
+            # 规范 5.2.5.4：事务前的 keying time（终端限流，不计入事务延迟）
+            if self.think_scale > 0:
+                self._pace(self.rng.keying_time(name) * self.think_scale)
+                if self.stop_evt.is_set():
+                    break
             t0 = time.perf_counter()
             try:
                 status, detail = fn(cli, self.rng, self.cfg, self.w_id)
@@ -107,12 +124,15 @@ class Worker(threading.Thread):
                     return
             ms = (time.perf_counter() - t0) * 1000
             self.stats.record(name, status, ms, detail)
+            # 规范 5.2.5.4：事务提交后的 think time（指数分布）
+            if self.think_scale > 0:
+                self._pace(self.rng.think_time(name) * self.think_scale)
         cli.close()
 
 
 def bench(cfg, duration, warmup=10, clients=8, mix=(45, 43, 4, 4, 4),
           isolation="si", seed=42, c_last_load=None, progress=5,
-          server_alive=None, timeout=60):
+          server_alive=None, timeout=60, think_scale=1.0):
     """Run the benchmark; returns result dict."""
     rng = TpccRandom(seed)
     c_last_run = derive_c_run(c_last_load, rng.rng) if c_last_load is not None else rng.c_last
@@ -120,11 +140,12 @@ def bench(cfg, duration, warmup=10, clients=8, mix=(45, 43, 4, 4, 4),
 
     stats = Stats()
     stop = threading.Event()
-    workers = [Worker(i, cfg, mix, stats, stop, seed, c_consts, isolation, timeout)
+    workers = [Worker(i, cfg, mix, stats, stop, seed, c_consts, isolation, timeout, think_scale)
                for i in range(clients)]
 
-    print("tpccbench run: W=%d clients=%d mix=%s isolation=%s warmup=%ds measure=%ds"
-          % (cfg.warehouses, clients, "/".join(map(str, mix)), isolation, warmup, duration),
+    mode = ("think=%.2gx(TPC-C规范限流)" % think_scale) if think_scale > 0 else "极限吞吐(无think)"
+    print("tpccbench run: W=%d clients=%d mix=%s isolation=%s warmup=%ds measure=%ds %s"
+          % (cfg.warehouses, clients, "/".join(map(str, mix)), isolation, warmup, duration, mode),
           flush=True)
     for w in workers:
         w.start()
@@ -203,6 +224,7 @@ def bench(cfg, duration, warmup=10, clients=8, mix=(45, 43, 4, 4, 4),
         "clients": clients,
         "mix": list(mix),
         "isolation": isolation,
+        "think_scale": think_scale,
         "totals": totals,
         "fatal": fatal,
         "per_txn": {

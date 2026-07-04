@@ -199,7 +199,8 @@ def cmd_run(args):
                        clients=args.clients, mix=_parse_mix(args.mix),
                        isolation=args.isolation, seed=args.seed,
                        c_last_load=m.get("c_last_load"), progress=args.progress,
-                       server_alive=server.alive, timeout=args.timeout)
+                       server_alive=server.alive, timeout=args.timeout,
+                       think_scale=args.think)
         if args.json:
             with open(args.json, "w") as f:
                 json.dump(result, f, indent=2)
@@ -229,7 +230,8 @@ def cmd_full(args):
                        clients=args.clients, mix=_parse_mix(args.mix),
                        isolation=args.isolation, seed=args.seed,
                        c_last_load=m.get("c_last_load"), progress=args.progress,
-                       server_alive=server.alive, timeout=args.timeout)
+                       server_alive=server.alive, timeout=args.timeout,
+                       think_scale=args.think)
         rc |= 1 if result["fatal"] else 0
 
         print("\n== consistency (post-benchmark) ==")
@@ -290,6 +292,10 @@ def main(argv=None):
         sp.add_argument("--timeout", type=int, default=60, help="per-statement client timeout (s)")
         sp.add_argument("--json", help="write result json")
         sp.add_argument("--samples", type=int, default=8)
+        # TPC-C 规范 5.2.5.4 keying+think 时间倍率。默认 1.0 = 完整规范限流（tpmC 落到真实
+        # 数十量级，与 OJ 同数量级）；0 = 极限吞吐模式（不限流，原 pgbench 式高吞吐）。
+        sp.add_argument("--think", type=float, default=1.0,
+                        help="TPC-C keying+think time scale (1.0=spec, 0=max-throughput)")
 
     args = p.parse_args(argv)
     return {"gen": cmd_gen, "load": cmd_load, "smoke": cmd_smoke, "check": cmd_check,
