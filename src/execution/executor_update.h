@@ -119,11 +119,13 @@ class UpdateExecutor : public AbstractExecutor {
                     if (col_it == tab_.cols.end()) continue;
                     apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
                 }
-                // 并发 NewOrder：客户端用旧快照发绝对 d_next_o_id，须钳制为 > 当前可见值
+                // 并发 NewOrder：客户端用旧快照发绝对 d_next_o_id，须钳制为 > 当前可见值。
+                // 仅当本语句确实改动了计数器(proposed != visible)且回退(proposed < visible)才钳制；
+                // payment 只改 d_ytd、计数器原样带过(proposed == visible)，不得误 +1。
                 if (tab_name_ == "district" && (int)mv_new.size() > 97) {
                     int visible = *reinterpret_cast<int *>(mv_old.data() + 97);
                     int proposed = *reinterpret_cast<int *>(mv_new.data() + 97);
-                    if (proposed <= visible) {
+                    if (proposed < visible) {
                         *reinterpret_cast<int *>(mv_new.data() + 97) = visible + 1;
                     }
                 }
@@ -228,10 +230,11 @@ class UpdateExecutor : public AbstractExecutor {
                 if (col_it == tab_.cols.end()) continue;
                 apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
             }
+            // 同上：只钳制真正回退的计数器写；未触及计数器的更新(*nxt == visible)不得误 +1
             if (tab_name_ == "district" && record_size_ > 97) {
                 int visible = *reinterpret_cast<int *>(orig_rec.data() + 97);
                 int *nxt = reinterpret_cast<int *>(slot + 97);
-                if (*nxt <= visible) *nxt = visible + 1;
+                if (*nxt < visible) *nxt = visible + 1;
             }
             }
 

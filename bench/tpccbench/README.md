@@ -39,15 +39,29 @@ python3 bench/tpccbench.py run --duration 300 --clients 8 --json out.json
 - Delivery 内联执行（多数实现同此，规范允许排队）
 - 无键入/思考时间（pgbench 式极限吞吐模式）
 
-## 已知引擎问题（本工具首次发现，2026-07-03）
+## 本工具发现并已修复的引擎 bug（2026-07-03 发现，07-04 修复）
 
-1. **SI 提交可见性滞后/丢失**：SI 下已提交插入要等下一笔事务才可见，
-   会话最后一笔**永久丢失**。复现：`tests/local/debug/repro_lost_insert.py N si pure`。
-   SER 串行无此问题；baseline 0d36b94 同样存在（非 INLJ 回归）。
-2. **并发 abort 残留**：4 客户端下（SER 亦然）出现孤儿 new_orders、
-   丢失 orders、d_next_o_id 空洞（C3/C5/C6 FAIL，金额类 C1/C8/C9 PASS）。
-3. **SI 快照读不稳定**：事务内重读看到他人已提交修改（`acid` I1 FAIL），
-   实际隔离级别退化为 Read Committed。
+历史现象（三个表象，同源）：SI 提交行"丢失/滞后一拍"、并发下孤儿 new_orders /
+orders 空洞（C2/C3/C5/C6 FAIL）、SI 快照读不稳定（acid I1 FAIL）。
+
+根因与修复（5 处，见 git log）：
+1. **IndexScan 无 MVCC 可见性**（主根因）：直接读堆，读不到本事务链上未提交写
+   （版本化 update 只写链、commit 才物化堆）→ district 计数器重读回旧值 →
+   o_id 差一 → 唯一键静默 "failure" → 丢单/孤儿行/空洞。修复：IndexScan 与
+   SeqScan 同样走 `mvcc_read` 重建可见版本。INLJ 内表读同修。
+2. **district 计数器钳制误伤 payment**：三处钳制（update 执行器 MVCC/快路径、
+   commit）对 `proposed == visible`（payment 不改计数器）也 +1 → 每笔 payment
+   幽灵递增 d_next_o_id。修复：仅 `proposed < visible` 时钳制。
+3. **rebase_write_delta 基底错误**：以事务旧快照为基底，未修改列覆盖他人已
+   提交增量（new_order 全行镜像覆盖 payment 的 d_ytd → C1/C9 丢钱）。
+   修复：基底改为 latest_rec。
+4. **IxScan 无限绕环**：叶链经 header 页成环，定位式 end_ 被并发分裂打失效后
+   扫描绕环不停（stock_level 卡 15 分钟）。修复：page_no_valid 排除 header 页。
+5. **IndexScan 越界返回**：stale end_ 下"范围吸收"优化返回越界行。修复：值条件
+   始终逐行 eval、EQ 前缀检查始终开启。
+
+修复后验证：`full`（SI/SER × 4/8 客户端）全 PASS、`acid` 7 项全 PASS、
+`repro_lost_insert 200 si` 0 丢失、C5 定向压测 40 轮 OK、官方 P2 回归 11/11。
 
 ## 规模预设
 

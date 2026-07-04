@@ -30,6 +30,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     std::vector<Rid> right_hits_;
     size_t hit_idx_ = 0;
     bool isend_ = true;
+    bool mvcc_on_ = false;      // 题9：内表脏态时按快照重建可见版本
 
     bool build_lookup_key(std::vector<char> &key) {
         key.assign(index_meta_.col_tot_len, 0);
@@ -111,15 +112,32 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         ih->get_value(key.data(), &right_hits_, context_ ? context_->txn_ : nullptr);
     }
 
+    // 题9 MVCC：内表记录按本事务快照重建可见版本；不可见返回 false（与 SeqScan/IndexScan 一致）
+    bool read_right_visible(const Rid &rid, RmRecord &out) {
+        auto right_rec = right_fh_->get_record(rid, context_);
+        if (!mvcc_on_) {
+            memcpy(out.data, right_rec->data, right_record_size_);
+            return true;
+        }
+        std::string buf;
+        if (!context_->txn_mgr_->mvcc_read(context_->txn_, right_table_, rid,
+                                           right_rec->data, right_record_size_, buf)) {
+            return false;
+        }
+        memcpy(out.data, buf.data(), right_record_size_);
+        return true;
+    }
+
     void find_next_valid_tuple() {
+        RmRecord right_rec(right_record_size_);
         while (!left_->is_end()) {
             if (left_rec_ == nullptr) {
                 left_rec_ = left_->Next();
                 probe_right_index();
             }
             while (hit_idx_ < right_hits_.size()) {
-                auto right_rec = right_fh_->get_record(right_hits_[hit_idx_], context_);
-                if (eval_joined_conds(right_rec.get())) {
+                if (read_right_visible(right_hits_[hit_idx_], right_rec) &&
+                    eval_joined_conds(&right_rec)) {
                     isend_ = false;
                     return;
                 }
@@ -154,6 +172,9 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
+        // 题9：内表进入 MVCC 脏态后必须按快照重建可见版本
+        mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
+                   context_->txn_mgr_->table_is_dirty(right_table_);
         left_->beginTuple();
         left_rec_.reset();
         isend_ = left_->is_end();
@@ -168,9 +189,10 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
 
     std::unique_ptr<RmRecord> Next() override {
         auto rec = std::make_unique<RmRecord>(len_);
-        auto right_rec = right_fh_->get_record(right_hits_[hit_idx_], context_);
+        RmRecord right_rec(right_record_size_);
+        read_right_visible(right_hits_[hit_idx_], right_rec);   // 当前 hit 已在 find_next 验证过可见
         memcpy(rec->data, left_rec_->data, left_->tupleLen());
-        memcpy(rec->data + left_->tupleLen(), right_rec->data, right_record_size_);
+        memcpy(rec->data + left_->tupleLen(), right_rec.data, right_record_size_);
         return rec;
     }
 

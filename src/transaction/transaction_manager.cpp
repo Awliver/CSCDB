@@ -69,11 +69,13 @@ void restore_index_if_missing(SmManager *sm, const std::string &tab_name, const 
     }
 }
 
-/* SI 写写冲突：将基于旧快照的增量写重定位到最新已提交版本（TPC-C read-then-write 模式） */
+/* SI 写写冲突：将基于旧快照的增量写重定位到最新已提交版本（TPC-C read-then-write 模式）。
+ * 基底必须取 latest_rec：本事务未改动的列要保留最新已提交值（如 new_order 全行镜像里
+ * 顺带携带的 d_ytd），若以旧快照为基底会把并发 payment 已提交的增量覆盖回旧值（丢钱）。 */
 bool rebase_write_delta(SmManager *sm, const std::string &tab,
                         const char *old_rec, const char *new_rec, const char *latest_rec,
                         int len, std::string &out) {
-    out.assign(old_rec, len);
+    out.assign(latest_rec, len);
     if (memcmp(old_rec, new_rec, len) == 0) return false;
     TabMeta &meta = sm->db_.get_table(tab);
     bool any = false;
@@ -265,11 +267,13 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             v.is_deleted = ch.writer_del;
             v.writer_txn = txn->get_transaction_id();
             if (!ch.writer_del) v.data = ch.writer_data;
-            // district 计数器在并发 SI 下必须严格单调递增，禁止陈旧写覆盖新值
+            // district 计数器在并发 SI 下必须单调不减，禁止陈旧写把计数器拉低。
+            // payment 等不改计数器的更新 new_n == back_n 属正常，不得误 +1（否则每笔
+            // payment 幽灵递增一次 d_next_o_id → 大量 o_id 空洞/丢单）。
             if (tab == "district" && !ch.writer_del && !v.data.empty() && !ch.hist.empty()) {
                 int back_n = district_next_oid(ch.hist.back().data);
                 int new_n = district_next_oid(v.data);
-                if (new_n <= back_n) {
+                if (new_n < back_n) {
                     *(int *)(v.data.data() + 97) = back_n + 1;
                     ch.writer_data = v.data;
                 }

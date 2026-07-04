@@ -62,6 +62,12 @@ class IndexScanExecutor : public AbstractExecutor {
     bool need_eval_ = true;             // false = 所有 cond 都被 index range 吸收，跳过 eval
     bool need_prefix_check_ = true;     // false = hi 是精确的（EQ 全匹配 或 range 上界），EQ 前缀检查冗余
 
+    // 题9 MVCC：索引扫描与 SeqScan 同等对待——表进入 MVCC 脏态后，堆上的裸记录可能
+    // 包含未提交写或缺少本事务自己的链上写(未提交版本仅存链/overlay，commit 才物化到堆)。
+    // 不做可见性重建会导致：事务读不到自己的 district 计数器更新 → o_id 错位 → 丢单/孤儿行。
+    bool mvcc_on_ = false;
+    std::string mvcc_buf_;              // 当前 rid 的可见版本字节（mvcc_on_ 时有效）
+
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
                     Context *context) {
@@ -215,19 +221,30 @@ class IndexScanExecutor : public AbstractExecutor {
                 break;
             }
 
-            // Fast path：range 已精确，且无残余 cond，直接返回匹配
-            if (!need_eval_ && !need_prefix_check_) {
+            // Fast path：range 已精确，且无残余 cond，直接返回匹配（仅当无需 MVCC 重建）
+            if (!mvcc_on_ && !need_eval_ && !need_prefix_check_) {
                 return;
             }
 
             const char *slot = get_table_slot(rid_);  // 0-alloc 直接读 slot
+            const char *rec_data = slot;
+
+            if (mvcc_on_) {
+                // 题9：按本事务快照重建可见版本；不可见/已删则跳过（与 SeqScan 一致）
+                if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_,
+                                                   slot, table_record_size_, mvcc_buf_)) {
+                    scan_->next();
+                    continue;
+                }
+                rec_data = mvcc_buf_.data();
+            }
 
             if (need_prefix_check_) {
                 int offset = 0;
                 bool match = true;
                 for (int i = 0; i < eq_match_count_; i++) {
                     const auto &col = index_meta_.cols[i];
-                    if (memcmp(slot + col.offset, eq_prefix_data_.data() + offset, col.len) != 0) {
+                    if (memcmp(rec_data + col.offset, eq_prefix_data_.data() + offset, col.len) != 0) {
                         match = false;
                         break;
                     }
@@ -240,7 +257,7 @@ class IndexScanExecutor : public AbstractExecutor {
             }
 
             if (need_eval_) {
-                if (!eval_compiled(slot)) {
+                if (!eval_compiled(rec_data)) {
                     scan_->next();
                     continue;
                 }
@@ -339,6 +356,9 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
+        // 题9：与 SeqScan 相同的 MVCC 开关——表被 MVCC 写过后必须按快照重建可见版本
+        mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
+                   context_->txn_mgr_->table_is_dirty(tab_name_);
         auto ih = sm_manager_->ihs_.at(
             sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
 
@@ -425,25 +445,13 @@ class IndexScanExecutor : public AbstractExecutor {
             hi = ih->leaf_end();
         }
 
-        // 决定是否需要逐行 eval
-        //   - 所有 cond 都被 EQ 前缀 + range 上下界吸收时，无需再 eval
-        int absorbed = eq_match_count_;
-        if (eq_match_count_ < (int)index_meta_.cols.size()) {
-            const auto &range_col = index_meta_.cols[eq_match_count_];
-            for (const auto &cond : fed_conds_) {
-                if (!cond.is_rhs_val) continue;
-                if (cond.lhs_col.tab_name != tab_name_) continue;
-                if (cond.lhs_col.col_name != range_col.name) continue;
-                if (cond.op == OP_GT || cond.op == OP_GE ||
-                    cond.op == OP_LT || cond.op == OP_LE) {
-                    absorbed++;
-                }
-            }
-        }
-        need_eval_ = (absorbed != (int)fed_conds_.size());
-
-        // hi 精确（range 上界 / 全 EQ）时，EQ 前缀检查冗余
-        need_prefix_check_ = (eq_match_count_ > 0) && !(has_upper || full_eq);
+        // 并发修正：IxScan 的 end_ 是定位式 (page,slot)，并发分裂会使其失效（条目搬走后
+        // iid_==end_ 永不成立），扫描可能越过逻辑上界继续走。因此不能信任"范围已被
+        // lo/hi 完全吸收"而跳过逐行检查：
+        //   - 所有值条件始终逐行 eval（吸收的 range 条件也在 compiled_ 里，代价极小）；
+        //   - EQ 前缀检查始终开启，作为越界后的早期硬停（range_exhausted_）。
+        need_eval_ = !fed_conds_.empty();
+        need_prefix_check_ = (eq_match_count_ > 0);
 
         // 矛盾/空范围保护：显式上下界交叉时（如 w_id > 500 and w_id < 400），
         // lo 会落在 hi 之后，IxScan 顺序前进永远到不了 end_，会越过树尾导致
@@ -476,10 +484,15 @@ class IndexScanExecutor : public AbstractExecutor {
     bool is_end() const override { return range_exhausted_ || scan_->is_end(); }
 
     std::unique_ptr<RmRecord> Next() override {
-        // 从缓存的 slot 复制到新 RmRecord（仅匹配时调一次）
-        const char *slot = get_table_slot(rid_);
         auto rec = std::make_unique<RmRecord>(table_record_size_);
-        memcpy(rec->data, slot, table_record_size_);
+        if (mvcc_on_) {
+            // 题9：position_to_match 已为当前 rid_ 重建可见版本，直接物化
+            memcpy(rec->data, mvcc_buf_.data(), table_record_size_);
+        } else {
+            // 从缓存的 slot 复制到新 RmRecord（仅匹配时调一次）
+            const char *slot = get_table_slot(rid_);
+            memcpy(rec->data, slot, table_record_size_);
+        }
         return rec;
     }
 

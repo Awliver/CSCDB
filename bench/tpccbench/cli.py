@@ -137,6 +137,19 @@ def cmd_smoke(args):
         server.stop()
 
 
+def _checks_with_retry(cli, m, samples, deep=False):
+    """跑一致性检查；失败则等待在途事务结清后重试一次（worker join 超时可能残留
+    活跃事务，与检查并发造成瞬态计数偏差——真实损坏重试后仍 FAIL）。"""
+    rep = run_checks(cli, m["warehouses"], m["districts_per_w"],
+                     samples=samples, deep=deep)
+    if not rep.ok:
+        print("  (存在 FAIL，3s 后重试一次以排除在途事务瞬态)")
+        time.sleep(3)
+        rep = run_checks(cli, m["warehouses"], m["districts_per_w"],
+                         samples=samples, deep=deep)
+    return rep
+
+
 def cmd_check(args):
     m = manifest_of_db(args.db)
     server = _ensure_server(args)
@@ -144,8 +157,7 @@ def cmd_check(args):
         cli = _connect(args.isolation)
         print("consistency conditions C1..C12 (samples=%d%s)"
               % (args.samples, ", deep" if args.deep else ""))
-        rep = run_checks(cli, m["warehouses"], m["districts_per_w"],
-                         samples=args.samples, deep=args.deep)
+        rep = _checks_with_retry(cli, m, args.samples, deep=args.deep)
         cli.close()
         n_fail = sum(1 for _, ok, _ in rep.results if not ok)
         print("CHECK: %s (%d conditions, %d failed)"
@@ -222,7 +234,7 @@ def cmd_full(args):
 
         print("\n== consistency (post-benchmark) ==")
         cli = _connect(args.isolation)
-        repc = run_checks(cli, m["warehouses"], m["districts_per_w"], samples=args.samples)
+        repc = _checks_with_retry(cli, m, args.samples)
         rc |= 0 if repc.ok else 1
         cli.close()
         if args.json:

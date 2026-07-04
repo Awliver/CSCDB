@@ -20,7 +20,11 @@ void IxScan::release_cached() const {
 }
 
 bool IxScan::page_no_valid(int page_no) const {
-    return page_no > IX_NO_PAGE && page_no < ih_->file_hdr_->num_pages_;
+    // 叶链经 IX_LEAF_HEADER_PAGE 成环（尾叶 next → header → 首叶）。并发分裂会使
+    // 定位式 end_ 失效（页/槽被搬走后 iid_==end_ 永不成立），此时扫描必须在链尾
+    // （即走到 header 页）硬停，否则绕环无限扫描。
+    return page_no > IX_NO_PAGE && page_no != IX_LEAF_HEADER_PAGE &&
+           page_no < ih_->file_hdr_->num_pages_;
 }
 
 void IxScan::ensure_cached(int page_no) const {
