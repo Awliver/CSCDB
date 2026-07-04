@@ -67,6 +67,9 @@ class IndexScanExecutor : public AbstractExecutor {
     // 不做可见性重建会导致：事务读不到自己的 district 计数器更新 → o_id 错位 → 丢单/孤儿行。
     bool mvcc_on_ = false;
     std::string mvcc_buf_;              // 当前 rid 的可见版本字节（mvcc_on_ 时有效）
+    // 题9 SER：与 SeqScan 相同的 SSI 读跟踪（谓词读 + 逐行读检查）。有了这套钩子，
+    // SER 下单表点查可走索引而不必强制全表扫（旧实现强制 SeqScan 是 OJ 性能塌方主因）。
+    bool ser_on_ = false;
 
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
@@ -221,8 +224,8 @@ class IndexScanExecutor : public AbstractExecutor {
                 break;
             }
 
-            // Fast path：range 已精确，且无残余 cond，直接返回匹配（仅当无需 MVCC 重建）
-            if (!mvcc_on_ && !need_eval_ && !need_prefix_check_) {
+            // Fast path：range 已精确，且无残余 cond，直接返回匹配（无需 MVCC 重建/SER 跟踪时）
+            if (!mvcc_on_ && !ser_on_ && !need_eval_ && !need_prefix_check_) {
                 return;
             }
 
@@ -261,6 +264,13 @@ class IndexScanExecutor : public AbstractExecutor {
                     scan_->next();
                     continue;
                 }
+            }
+            if (ser_on_) {
+                // 题9 SER：记录读集 + 读侧 rw 反依赖检查（与 SeqScan 一致）
+                context_->txn_mgr_->ser_record_read(context_->txn_, tab_name_, rid_);
+                if (context_->txn_mgr_->ser_read_check(context_->txn_, tab_name_, rid_))
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
             }
             return;
         }
@@ -359,6 +369,16 @@ class IndexScanExecutor : public AbstractExecutor {
         // 题9：与 SeqScan 相同的 MVCC 开关——表被 MVCC 写过后必须按快照重建可见版本
         mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
                    context_->txn_mgr_->table_is_dirty(tab_name_);
+        // 题9 SER：与 SeqScan 相同的 SSI 读跟踪（仅 SELECT 记录读集）
+        ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
+                  context_->txn_mgr_->is_ser(context_->txn_);
+        if (ser_on_) {
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);
+            // 读侧(谓词)：匹配本谓词但快照不可见的他事务写(幻影插入) → rw 反依赖；危险结构则 abort
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                AbortReason::DEADLOCK_PREVENTION);
+        }
         auto ih = sm_manager_->ihs_.at(
             sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
 

@@ -709,6 +709,22 @@ void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t com
         for (txn_id_t o : it->second.out_rw) { auto p = ser_.find(o); if (p != ser_.end()) p->second.in_rw.erase(id); }
         ser_.erase(it);                          // 回滚视为从未发生
     }
+    // 水位 GC：已提交且 commit_ts <= 所有活跃事务最低 read_ts 的条目，不可能再与任何
+    // 现役/未来事务重叠（ser_overlap: committed && cts <= rts → 不重叠），可安全清除。
+    // 不清则 ser_ 随事务数无界增长——ser_write_check 每次写遍历全表 → 长跑衰减。
+    if (ser_.size() > 512) {
+        timestamp_t wm = active_rts_.empty() ? last_commit_ts_.load() : *active_rts_.begin();
+        for (auto sit = ser_.begin(); sit != ser_.end();) {
+            if (sit->second.committed && sit->second.commit_ts <= wm) {
+                txn_id_t gone = sit->first;
+                for (txn_id_t o : sit->second.in_rw)  { auto p = ser_.find(o); if (p != ser_.end()) p->second.out_rw.erase(gone); }
+                for (txn_id_t o : sit->second.out_rw) { auto p = ser_.find(o); if (p != ser_.end()) p->second.in_rw.erase(gone); }
+                sit = ser_.erase(sit);
+            } else {
+                ++sit;
+            }
+        }
+    }
 }
 
 bool TransactionManager::ser_overlap(txn_id_t a, txn_id_t b) {

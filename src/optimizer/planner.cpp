@@ -230,9 +230,12 @@ std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> quer
     return query;
 }
 
-// 题9：SER 下强制 SeqScan；SI 用 MVCC 感知 IndexScan
-static bool mvcc_force_seqscan(Context *context, const std::string &tab) {
-    return context && context->txn_ && context->txn_mgr_ &&
+// 题9：SER 下 join 的内/外表仍强制 SeqScan（INLJ 内表读尚无 SSI 跟踪钩子）。
+// 单表查询不再强制——IndexScanExecutor 已实现与 SeqScan 等价的 SSI 读跟踪
+// （谓词记录 + 逐行读检查）。旧的全量强制使 OJ（默认 SER）下所有点查退化为
+// 全表扫描（stock 10 万行/条），是 OJ tpmC 塌方的主因。
+static bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables) {
+    return n_tables > 1 && context && context->txn_ && context->txn_mgr_ &&
            context->txn_mgr_->is_ser(context->txn_) &&
            (context->txn_->get_txn_mode() || context->txn_mgr_->table_is_dirty(tab));
 }
@@ -254,7 +257,7 @@ std::shared_ptr<Plan> Planner::make_one_rel_sql_order(std::shared_ptr<Query> que
         auto curr_conds = pop_conds(query->conds, tables[i]);
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
-        if (index_exist && mvcc_force_seqscan(context, tables[i])) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, tables[i], tables.size())) index_exist = false;
         scans[i] = std::make_shared<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan, sm_manager_,
                                               tables[i], curr_conds, index_col_names);
     }
@@ -575,7 +578,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
         
-        if (index_exist && mvcc_force_seqscan(context, x->tab_name)) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1)) index_exist = false;
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
             table_scan_executors =
@@ -596,7 +599,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
 
-        if (index_exist && mvcc_force_seqscan(context, x->tab_name)) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1)) index_exist = false;
         if (index_exist == false) {  // 该表没有索引
         index_col_names.clear();
             table_scan_executors = 
