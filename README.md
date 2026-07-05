@@ -45,3 +45,7 @@ mkdir -p my_db && ./bin/rmdb my_db
 ```
 
 默认监听端口 `8765`，客户端发送以 `\0` 结尾的 SQL 文本。框架说明见 `docs_rmdb/` 目录下的 PDF 文档。
+
+## 提交约束
+
+**禁止修改任何 `CMakeLists.txt` 文件**（含根目录、`src/`、`src/parser/`、`rmdb_client/` 等）。OJ 评测使用赛方提供的原始构建脚本；改动 CMake 可能导致编译失败、链接错误或评测环境不一致。性能优化请只改 `src/` 等业务代码，通过 `cmake` 命令行参数调整构建类型（如 `-DCMAKE_BUILD_TYPE=Release`），勿改 CMake 文件本身。

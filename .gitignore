@@ -115,10 +115,7 @@ __pycache__/
 # ============================================
 Docs/
 docs/
-bench/
-test/
 tests/
-tests/test_dbs/
 题目一/
 scratch/
 notes/personal/

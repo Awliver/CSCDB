@@ -12,6 +12,73 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_manager.h"
 #include <cstring>
 
+void BufferPoolManager::start_cleaner() {
+    std::scoped_lock lk(cleaner_mtx_);
+    if (cleaner_started_) return;
+    cleaner_stop_ = false;
+    cleaner_started_ = true;
+    cleaner_thread_ = std::thread([this] { cleaner_loop(); });
+}
+
+void BufferPoolManager::stop_cleaner() {
+    {
+        std::scoped_lock lk(cleaner_mtx_);
+        if (!cleaner_started_) return;
+        cleaner_stop_ = true;
+    }
+    cleaner_cv_.notify_all();
+    if (cleaner_thread_.joinable()) cleaner_thread_.join();
+    std::scoped_lock lk(cleaner_mtx_);
+    cleaner_started_ = false;
+}
+
+// pin==0 且全程持分片 latch_；先 flush_log 再 write_page（同 flush_page）。
+void BufferPoolManager::cleaner_loop() {
+    const size_t low_water = pool_size_ / 16;
+    size_t next_shard = 0;
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(cleaner_mtx_);
+            if (cleaner_stop_) break;
+            cleaner_cv_.wait_for(lk, std::chrono::milliseconds(CLEANER_INTERVAL_MS),
+                                 [this] { return cleaner_stop_; });
+            if (cleaner_stop_) break;
+        }
+        {
+            std::scoped_lock evict_lock(evict_latch_);
+            if (free_list_.size() >= low_water) continue;
+        }
+        int flushed = 0;
+        for (size_t k = 0; k < BPM_NSHARDS && flushed < CLEANER_BATCH; ++k) {
+            BpmShard &sh = shards_[(next_shard + k) % BPM_NSHARDS];
+            while (flushed < CLEANER_BATCH) {
+                if (cleaner_stop_) return;
+                std::scoped_lock lock(sh.latch_);
+                frame_id_t target = INVALID_FRAME_ID;
+                PageId pid{-1, INVALID_PAGE_ID};
+                for (auto &entry : sh.page_table_) {
+                    frame_id_t f = entry.second;
+                    Page &pg = pages_[f];
+                    if (pg.pin_count_ != 0 || !pg.is_dirty_) continue;
+                    {
+                        std::scoped_lock io_lock(io_mutex_);
+                        if (frame_io_inflight_[f]) continue;
+                    }
+                    target = f;
+                    pid = pg.id_;
+                    break;
+                }
+                if (target == INVALID_FRAME_ID) break;
+                if (g_log_manager) g_log_manager->flush_log_to_disk();
+                disk_manager_->write_page(pid.fd, pid.page_no, pages_[target].data_, PAGE_SIZE);
+                pages_[target].is_dirty_ = false;
+                ++flushed;
+            }
+        }
+        next_shard = (next_shard + 1) % BPM_NSHARDS;
+    }
+}
+
 bool BufferPoolManager::reserve_victim_nolock(size_t pref_shard, frame_id_t* out_frame,
                                               PageId* old_page_id, bool* need_flush) {
     // 1) 优先使用全局空闲帧（无页帧，无需落盘/换出）

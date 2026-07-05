@@ -776,6 +776,7 @@ void start_server() {
     }
 
     // Clear
+    buffer_pool_manager->stop_cleaner();  // close_db 前
     std::cout << " Try to close all client-connection.\n";
     int ret = shutdown(sockfd_server, SHUT_WR);  // shut down the all or part of a full-duplex connection.
     if(ret == -1) { printf("%s\n", strerror(errno)); }
@@ -821,7 +822,9 @@ int main(int argc, char **argv) {
         recovery->analyze();
         recovery->redo();
         recovery->undo();
-        
+
+        buffer_pool_manager->start_cleaner();  // recovery 后
+
         // 开启服务端，开始接受客户端连接
         start_server();
     } catch (RMDBError &e) {

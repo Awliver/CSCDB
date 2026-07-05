@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <list>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -53,6 +54,17 @@ class BufferPoolManager {
     std::vector<bool> frame_io_inflight_;
     std::array<BpmShard, BPM_NSHARDS> shards_;
 
+    // 后台 Page Cleaner：free_list_ 偏低时刷 pin==0 脏页，减轻淘汰冷路径写盘。
+    static constexpr int CLEANER_INTERVAL_MS = 20;
+    static constexpr int CLEANER_BATCH = 256;
+    std::thread cleaner_thread_;
+    std::mutex cleaner_mtx_;
+    std::condition_variable cleaner_cv_;
+    bool cleaner_stop_ = false;
+    bool cleaner_started_ = false;
+
+    void cleaner_loop();
+
     size_t shard_of_page(PageId page_id) const {
         return PageIdHash{}(page_id) % BPM_NSHARDS;
     }
@@ -72,12 +84,17 @@ class BufferPoolManager {
     }
 
     ~BufferPoolManager() {
+        stop_cleaner();
         delete[] pages_;
     }
 
     static void mark_dirty(Page* page) { page->is_dirty_ = true; }
 
    public:
+    // recovery 后 start、关闭前 stop；幂等。
+    void start_cleaner();
+    void stop_cleaner();
+
     Page* fetch_page(PageId page_id);
 
     bool unpin_page(PageId page_id, bool is_dirty);
