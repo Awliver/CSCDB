@@ -262,7 +262,8 @@ private:
     static constexpr size_t MVCC_NSHARDS = 64;
     std::atomic<int> active_explicit_count_{0};   // 活跃显式事务数
     std::atomic<bool> any_mvcc_dirty_{false};
-    mutable std::mutex mvcc_meta_latch_;            // ser_ / active_rts_ 元数据
+    mutable std::mutex rts_latch_;              // active_rts_ 水位
+    mutable std::mutex ser_latch_;              // ser_ 图与反查索引
     mutable std::array<std::mutex, MVCC_NSHARDS> mvcc_shards_;  // mvcc_shards_[i] 保护 mvcc_shard_data_[i]
     // 每个分片拥有独立的版本存储/挂起写映射。(tab,rkey) 经 mvcc_shard_idx 固定映射到唯一分片，
     // 故同表不同 rkey 落在不同分片各自的 map，杜绝跨分片对同一 unordered_map 的并发结构改写
@@ -273,7 +274,7 @@ private:
     };
     std::array<MvccShardData, MVCC_NSHARDS> mvcc_shard_data_;
     // mvcc_dirty_ 仅增不减（表一旦被 MVCC 写过即永久脏）。用专用读写锁，使扫描打开时
-    // 的 table_is_dirty 走共享锁并发判定，与 SER/active_rts_ 的 mvcc_meta_latch_ 解耦。
+    // 的 table_is_dirty 走共享锁并发判定，与 active_rts_ / ser_ 分锁。
     mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
 
@@ -327,7 +328,7 @@ private:
         return it->second.writers > 0 || it->second.last_cts > txn->get_read_ts();
     }
 
-    /* 题9 SER (SSI) 状态 —— 由 mvcc_meta_latch_ 保护 */
+    /* 题9 SER (SSI) 状态 —— 由 ser_latch_ 保护 */
     struct SerInfo {
         timestamp_t read_ts = 0;
         timestamp_t commit_ts = 0;     // 0 = 未提交(活跃)
@@ -339,7 +340,7 @@ private:
     };
     std::unordered_map<txn_id_t, SerInfo> ser_;
 
-    /* 题9 性能：写方镜像检查(ser_write_check)的反查索引——均由 mvcc_meta_latch_ 保护。
+    /* 题9 性能：写方镜像检查(ser_write_check)的反查索引——均由 ser_latch_ 保护。
      * 旧实现每次写遍历全部 ser_ 条目 × 线性扫其读集 × 按列名字符串解析匹配谓词
      * (perf: ser_write_check 12.2% + ser_record_matches 12.3%)。改为：
      *   - (tab, rkey) → 读者集合：记录读时登记，写时 O(1) 直查；
@@ -381,8 +382,8 @@ private:
     void prune_mvcc_after_commit(const std::string &tab, const Rid &rid, timestamp_t watermark,
                                  timestamp_t just_committed_cts = 0);
     void physical_undo_write_record(Transaction *txn, WriteRecord *wr);
-    static std::string si_overlay_key(const std::string &tab, int64_t rkey) {
-        return tab + "#" + std::to_string(rkey);
+    static Transaction::SiOverlayKey si_overlay_key(const std::string &tab, int64_t rkey) {
+        return Transaction::SiOverlayKey{tab, rkey};
     }
     void restore_writers_from_overlays(Transaction *txn);
     void clear_pending_si_for_txn(Transaction *txn);

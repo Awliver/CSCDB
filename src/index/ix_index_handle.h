@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <shared_mutex>
+
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
@@ -167,7 +169,7 @@ class IxIndexHandle {
     BufferPoolManager *buffer_pool_manager_;
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
-    mutable std::mutex root_latch_;             // mutable: const readers (get_rid/leaf_begin/leaf_end/IxScan) also latch
+    mutable std::shared_mutex root_latch_;      // 读 shared、写 unique，分裂/合并与扫描并发
     page_id_t cached_leaf_no_ = IX_NO_PAGE;     // 顺序追加插入缓存的最右叶页号，命中则跳过从根遍历
 
    public:

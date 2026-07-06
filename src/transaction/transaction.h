@@ -119,12 +119,25 @@ class Transaction {
         std::string data;
         bool is_deleted = false;
     };
-    void put_si_overlay(const std::string &key, SiOverlay val) { si_overlay_[key] = std::move(val); }
-    const SiOverlay *get_si_overlay(const std::string &key) const {
+    // 语句间暂存的未提交写；(tab,rkey) 作键，避免 tab+"#"+数字 每次拼接
+    struct SiOverlayKey {
+        std::string tab;
+        int64_t rkey = 0;
+        bool operator==(const SiOverlayKey &o) const { return rkey == o.rkey && tab == o.tab; }
+    };
+    struct SiOverlayKeyHash {
+        size_t operator()(const SiOverlayKey &k) const {
+            size_t h = std::hash<std::string>{}(k.tab);
+            h ^= (size_t)k.rkey + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    void put_si_overlay(const SiOverlayKey &key, SiOverlay val) { si_overlay_[key] = std::move(val); }
+    const SiOverlay *get_si_overlay(const SiOverlayKey &key) const {
         auto it = si_overlay_.find(key);
         return it == si_overlay_.end() ? nullptr : &it->second;
     }
-    std::unordered_map<std::string, SiOverlay> &si_overlays() { return si_overlay_; }
+    std::unordered_map<SiOverlayKey, SiOverlay, SiOverlayKeyHash> &si_overlays() { return si_overlay_; }
 
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
@@ -174,7 +187,7 @@ class Transaction {
   * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。
   */
   std::vector<UndoLog> undo_logs_;
-  std::unordered_map<std::string, SiOverlay> si_overlay_;
+  std::unordered_map<SiOverlayKey, SiOverlay, SiOverlayKeyHash> si_overlay_;
   /** 用于访问事务级撤销日志的锁。 */
   std::mutex latch_;
 };

@@ -201,7 +201,7 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
-    std::scoped_lock<std::mutex> lock(root_latch_);
+    std::shared_lock<std::shared_mutex> lock(root_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, transaction);
     Rid *rid_ptr = nullptr;
     bool found = leaf->leaf_lookup(key, &rid_ptr);
@@ -328,7 +328,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
-    std::scoped_lock<std::mutex> lock(root_latch_);
+    std::unique_lock<std::shared_mutex> lock(root_latch_);
 
     // 顺序追加快路径：缓存的叶仍是最右叶且 key 不小于其首 key 时，落点必在此叶，
     // 直接取它（一次页查找）跳过从根逐层遍历；否则回退正常查找
@@ -384,7 +384,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
-    std::scoped_lock<std::mutex> lock(root_latch_);
+    std::unique_lock<std::shared_mutex> lock(root_latch_);
     cached_leaf_no_ = IX_NO_PAGE;   // 删除可能合并/重分配改变叶结构，作废顺序插入缓存
 
     auto [leaf, _] = find_leaf_page(key, Operation::DELETE, transaction);
@@ -625,7 +625,7 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
  * @note iid和rid存的不是一个东西，rid是上层传过来的记录位置，iid是索引内部生成的索引槽位置
  */
 Rid IxIndexHandle::get_rid(const Iid &iid) const {
-    std::scoped_lock<std::mutex> lock(root_latch_);  // 与并发 insert/delete(分裂/合并) 互斥，避免读到未生效页
+    std::shared_lock<std::shared_mutex> lock(root_latch_);  // 与写路径共享，分裂未完成前写方持独占锁
     IxNodeHandle *node = fetch_node(iid.page_no);
     if (iid.slot_no >= node->get_size()) {
         buffer_pool_manager_->unpin_page(node->get_page_id(), false);
@@ -648,7 +648,7 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char *key) {
-    std::scoped_lock<std::mutex> lock(root_latch_);
+    std::shared_lock<std::shared_mutex> lock(root_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
     int slot = leaf->lower_bound(key);
     Iid iid;
@@ -673,7 +673,7 @@ Iid IxIndexHandle::lower_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::upper_bound(const char *key) {
-    std::scoped_lock<std::mutex> lock(root_latch_);
+    std::shared_lock<std::shared_mutex> lock(root_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
     int slot = leaf->lower_bound(key);
     // 注意：IxNodeHandle::upper_bound 是为内部节点设计的（从 1 开始）
@@ -702,7 +702,7 @@ Iid IxIndexHandle::upper_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_end() const {
-    std::scoped_lock<std::mutex> lock(root_latch_);  // last_leaf_ 会随分裂变化，需与写操作互斥
+    std::shared_lock<std::shared_mutex> lock(root_latch_);  // last_leaf_ 随分裂变，与写方共享读
     IxNodeHandle *node = fetch_node(file_hdr_->last_leaf_);
     Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node->get_size()};
     buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
@@ -717,7 +717,7 @@ Iid IxIndexHandle::leaf_end() const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_begin() const {
-    std::scoped_lock<std::mutex> lock(root_latch_);  // 与写操作互斥读取 first_leaf_
+    std::shared_lock<std::shared_mutex> lock(root_latch_);  // first_leaf_ 与写方共享读
     Iid iid = {.page_no = file_hdr_->first_leaf_, .slot_no = 0};
     return iid;
 }

@@ -72,7 +72,7 @@ void IxScan::normalize_position() const {
 }
 
 void IxScan::next() {
-    std::scoped_lock<std::mutex> lock(ih_->root_latch_);  // 与 insert/delete 分裂/合并互斥，避免 num_pages_ TOCTOU 崩溃
+    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
     normalize_position();
     if (iid_ == end_) return;
     iid_.slot_no++;
@@ -84,7 +84,7 @@ void IxScan::next() {
 }
 
 Rid IxScan::rid() const {
-    std::scoped_lock<std::mutex> lock(ih_->root_latch_);  // 与 insert/delete 分裂/合并互斥，避免 num_pages_ TOCTOU 崩溃
+    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
     normalize_position();
     if (iid_ == end_) {
         return Rid{-1, -1};

@@ -146,10 +146,8 @@ void TransactionManager::clear_pending_si_for_txn(Transaction *txn) {
     if (txn == nullptr) return;
     txn_id_t me = txn->get_transaction_id();
     for (auto &kv : txn->si_overlays()) {
-        auto pos = kv.first.find('#');
-        if (pos == std::string::npos) continue;
-        std::string tab = kv.first.substr(0, pos);
-        int64_t rkey = std::stoll(kv.first.substr(pos + 1));
+        const std::string &tab = kv.first.tab;
+        int64_t rkey = kv.first.rkey;
         size_t sh = mvcc_shard_idx(tab, rkey);
         std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
         auto &pending = mvcc_shard_data_[sh].pending;
@@ -175,10 +173,8 @@ void TransactionManager::restore_writers_from_overlays(Transaction *txn) {
     if (txn == nullptr) return;
     txn_id_t me = txn->get_transaction_id();
     for (auto &kv : txn->si_overlays()) {
-        auto pos = kv.first.find('#');
-        if (pos == std::string::npos) continue;
-        std::string tab = kv.first.substr(0, pos);
-        int64_t rkey = std::stoll(kv.first.substr(pos + 1));
+        const std::string &tab = kv.first.tab;
+        int64_t rkey = kv.first.rkey;
         size_t sh = mvcc_shard_idx(tab, rkey);
         std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
         MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
@@ -209,7 +205,7 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         txn->set_read_ts(last_commit_ts_.load());
     }
     {
-        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+        std::scoped_lock<std::mutex> lck(rts_latch_);
         active_rts_.insert(txn->get_read_ts());
     }
     txn_map[txn->get_transaction_id()] = txn;
@@ -231,20 +227,20 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     const bool had_writes = !write_set->empty();
     std::unordered_set<std::string> touched_tabs;
     restore_writers_from_overlays(txn);
+    // commit_ts 原子递增；SI 只动 rts_latch_，SER 才碰 ser_latch_
+    if (!write_set->empty() || txn->get_txn_mode()) {
+        cts = last_commit_ts_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        txn->set_commit_ts(cts);
+    }
     {
-        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
-        if (!write_set->empty() || txn->get_txn_mode()) {
-            cts = ++last_commit_ts_;
-            txn->set_commit_ts(cts);
-        }
-        {
-            auto wit = active_rts_.find(txn->get_read_ts());
-            if (wit != active_rts_.end()) active_rts_.erase(wit);
-        }
-        ser_finish(txn->get_transaction_id(), true, cts);
-        // 剪枝水位：其余活跃事务的最低 read_ts；无活跃事务时用本次 cts
-        //（未来事务 read_ts >= cts，只会读最新版本）。
+        std::scoped_lock<std::mutex> lck(rts_latch_);
+        auto wit = active_rts_.find(txn->get_read_ts());
+        if (wit != active_rts_.end()) active_rts_.erase(wit);
         prune_wm = active_rts_.empty() ? cts : *active_rts_.begin();
+    }
+    if (is_ser(txn)) {
+        std::scoped_lock<std::mutex> lck(ser_latch_);
+        ser_finish(txn->get_transaction_id(), true, cts);
     }
     struct HeapFlush {
         std::string tab;
@@ -453,12 +449,15 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             physical_undo_write_record(txn, wr);
         }
     }
+    for (auto *wr : *write_set) delete wr;
+    write_set->clear();
     {
-        std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
-        for (auto *wr : *write_set) delete wr;
-        write_set->clear();
+        std::scoped_lock<std::mutex> lck(rts_latch_);
         auto wit = active_rts_.find(txn->get_read_ts());
         if (wit != active_rts_.end()) active_rts_.erase(wit);
+    }
+    if (is_ser(txn)) {
+        std::scoped_lock<std::mutex> lck(ser_latch_);
         ser_finish(txn->get_transaction_id(), false, 0);
     }
 
@@ -724,7 +723,7 @@ bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::s
 }
 
 /* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------
- * 锁约定：ser_record_read/pred、ser_write_check 自持 mvcc_meta_latch_；
+ * 锁约定：ser_record_read/pred、ser_write_check 自持 ser_latch_；
  * ser_read_check 持分片锁 + meta；表扫描持全分片锁。
  * 内部 helper 假定调用方已持对应锁。
  */
@@ -781,7 +780,7 @@ bool TransactionManager::ser_record_matches(const std::string &tab, const char *
 }
 
 void TransactionManager::ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid) {
-    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    std::scoped_lock<std::mutex> lck(ser_latch_);
     txn_id_t id = txn->get_transaction_id();
     SerInfo &info = ser_[id];
     info.read_ts = txn->get_read_ts();
@@ -792,7 +791,7 @@ void TransactionManager::ser_record_read(Transaction *txn, const std::string &ta
 
 void TransactionManager::ser_record_pred(Transaction *txn, const std::string &tab,
                                          const std::vector<Condition> &conds) {
-    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    std::scoped_lock<std::mutex> lck(ser_latch_);
     txn_id_t id = txn->get_transaction_id();
     SerInfo &info = ser_[id];
     info.read_ts = txn->get_read_ts();
@@ -927,7 +926,7 @@ bool TransactionManager::ser_write_check(Transaction *txn, const std::string &ta
                                          const Rid &rid, const char *data) {
     txn_id_t me = txn->get_transaction_id();
     int64_t key = mvcc_key(rid);
-    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    std::scoped_lock<std::mutex> lck(ser_latch_);
     SerInfo &my = ser_[me];
     my.read_ts = txn->get_read_ts();
     // 反查索引代替全表遍历（旧实现：遍历全部 ser_ 条目 × 线性扫其读集 × 按列名字符串
@@ -970,7 +969,7 @@ bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab
     int64_t key = mvcc_key(rid);
     size_t sh = mvcc_shard_idx(tab, key);
     std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
-    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    std::scoped_lock<std::mutex> lck(ser_latch_);
     SerInfo &my = ser_[me];
     my.read_ts = rts;
     bool dangerous = false;
@@ -1012,7 +1011,7 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
     }
     timestamp_t wm;
     {
-        std::scoped_lock<std::mutex> ml(mvcc_meta_latch_);
+        std::scoped_lock<std::mutex> ml(rts_latch_);
         wm = active_rts_.empty() ? last_commit_ts_.load() : *active_rts_.begin();
     }
 
@@ -1054,7 +1053,7 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
     }
     if (hit_writers.empty()) return false;
     // 统一在 meta latch 下做 ser_ 归属校验 + 建边 + 危险结构检测（与旧实现语义一致）
-    std::scoped_lock<std::mutex> lck(mvcc_meta_latch_);
+    std::scoped_lock<std::mutex> lck(ser_latch_);
     bool dangerous = false;
     for (txn_id_t w : hit_writers) {
         if (ser_.count(w) && ser_overlap(me, w)) {
