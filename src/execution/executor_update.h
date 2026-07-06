@@ -85,7 +85,7 @@ class UpdateExecutor : public AbstractExecutor {
         }
     }
 
-    // 识别 col=col±字面量（int/float），可走 mvcc_write_col_delta 避免整行拷贝
+    // col=col±常数（int/float）→ mvcc_write_col_delta
     struct ColArithDelta {
         bool hit = false;
         int col_off = -1;
@@ -114,6 +114,31 @@ class UpdateExecutor : public AbstractExecutor {
             r.delta_i = set.arith_neg ? -set.rhs.int_val : set.rhs.int_val;
         }
         return r;
+    }
+
+    std::vector<MvccColPatch> build_col_patches() const {
+        std::vector<MvccColPatch> patches;
+        patches.reserve(set_clauses_.size());
+        for (const auto &set : set_clauses_) {
+            auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                       [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+            if (col_it == tab_.cols.end()) continue;
+            MvccColPatch p;
+            p.offset = col_it->offset;
+            p.len = col_it->len;
+            p.type = col_it->type;
+            p.is_arith = set.is_arith;
+            p.arith_neg = set.arith_neg;
+            if (set.is_arith) {
+                p.rhs_col = set.rhs_col;
+                if (col_it->type == TYPE_FLOAT) p.arith_rhs_f = set.rhs.float_val;
+                else p.arith_rhs_i = set.rhs.int_val;
+            } else {
+                p.abs_value.assign(set.rhs.raw->data, col_it->len);
+            }
+            patches.push_back(std::move(p));
+        }
+        return patches;
     }
 
     /**
@@ -149,18 +174,26 @@ class UpdateExecutor : public AbstractExecutor {
                         col_delta.col_off, col_delta.col_type, col_delta.delta_f, col_delta.delta_i,
                         &mvcc_effective);
                 } else {
-                    std::vector<char> mv_old(record_size_);
-                    memcpy(mv_old.data(), visible.data(), record_size_);
-                    std::vector<char> mv_new = mv_old;
-                    for (const auto &set : set_clauses_) {
-                        auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
-                                                   [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
-                        if (col_it == tab_.cols.end()) continue;
-                        apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
+                    std::vector<MvccColPatch> patches = build_col_patches();
+                    // 多列 SET 走列 patch；单列仍整行写（并发写写 rebase 未对齐）
+                    if (set_clauses_.size() > 1 && !patches.empty()) {
+                        write_ok = context_->txn_mgr_->mvcc_write_col_patch(
+                            context_->txn_, tab_name_, rid, visible.data(), record_size_, patches,
+                            &mvcc_effective);
+                    } else {
+                        std::vector<char> mv_old(record_size_);
+                        memcpy(mv_old.data(), visible.data(), record_size_);
+                        std::vector<char> mv_new = mv_old;
+                        for (const auto &set : set_clauses_) {
+                            auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                                       [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                            if (col_it == tab_.cols.end()) continue;
+                            apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
+                        }
+                        write_ok = context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
+                                                                  mv_old.data(), mv_new.data(), record_size_, false,
+                                                                  &mvcc_effective);
                     }
-                    write_ok = context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
-                                                              mv_old.data(), mv_new.data(), record_size_, false,
-                                                              &mvcc_effective);
                 }
                 if (!write_ok) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),

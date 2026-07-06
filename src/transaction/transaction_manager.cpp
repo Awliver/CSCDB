@@ -93,6 +93,71 @@ bool rebase_write_delta(SmManager *sm, const std::string &tab,
     }
     return any;
 }
+
+static const ColMeta *find_col_meta(const TabMeta &meta, const std::string &name) {
+    for (const auto &c : meta.cols) {
+        if (c.name == name) return &c;
+    }
+    return nullptr;
+}
+
+static void apply_col_patch_abs(const MvccColPatch &p, char *dest) {
+    if ((int)p.abs_value.size() >= p.len) {
+        memcpy(dest + p.offset, p.abs_value.data(), p.len);
+    }
+}
+
+static bool apply_col_patch_from_visible(const MvccColPatch &p, const char *visible,
+                                         char *dest, int len, const TabMeta &meta) {
+    if (p.offset + p.len > len) return false;
+    if (!p.is_arith) {
+        apply_col_patch_abs(p, dest);
+        return true;
+    }
+    const ColMeta *rcol = find_col_meta(meta, p.rhs_col);
+    if (rcol == nullptr) return false;
+    if (p.type == TYPE_FLOAT && rcol->type == TYPE_FLOAT &&
+        p.len == (int)sizeof(float) && rcol->len == (int)sizeof(float)) {
+        float base = *reinterpret_cast<const float *>(visible + rcol->offset);
+        float delta = p.arith_neg ? -p.arith_rhs_f : p.arith_rhs_f;
+        *reinterpret_cast<float *>(dest + p.offset) = base + delta;
+        return true;
+    }
+    if (p.type == TYPE_INT && rcol->type == TYPE_INT &&
+        p.len == (int)sizeof(int) && rcol->len == (int)sizeof(int)) {
+        int base = *reinterpret_cast<const int *>(visible + rcol->offset);
+        int delta = p.arith_neg ? -p.arith_rhs_i : p.arith_rhs_i;
+        *reinterpret_cast<int *>(dest + p.offset) = base + delta;
+        return true;
+    }
+    return false;
+}
+
+static bool apply_col_patch_rebase(const MvccColPatch &p, const char *visible, const char *latest,
+                                   char *dest, int len, const TabMeta &meta) {
+    if (p.offset + p.len > len) return false;
+    if (!p.is_arith) {
+        apply_col_patch_abs(p, dest);
+        return true;
+    }
+    if (p.type == TYPE_INT && p.len == (int)sizeof(int)) {
+        int o = *reinterpret_cast<const int *>(visible + p.offset);
+        int delta = p.arith_neg ? -p.arith_rhs_i : p.arith_rhs_i;
+        int n = o + delta;
+        int l = *reinterpret_cast<const int *>(latest + p.offset);
+        *reinterpret_cast<int *>(dest + p.offset) = l + (n - o);
+        return true;
+    }
+    if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float)) {
+        float o = *reinterpret_cast<const float *>(visible + p.offset);
+        float delta = p.arith_neg ? -p.arith_rhs_f : p.arith_rhs_f;
+        float n = o + delta;
+        float l = *reinterpret_cast<const float *>(latest + p.offset);
+        *reinterpret_cast<float *>(dest + p.offset) = l + (n - o);
+        return true;
+    }
+    return false;
+}
 }  // namespace
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
@@ -677,6 +742,78 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
         }
     } else {
         return false;
+    }
+    if (first_touch) {
+        RmRecord undo_old(len);
+        memcpy(undo_old.data, visible_data, len);
+        txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab, rid, undo_old));
+    }
+    if (effective_out != nullptr) *effective_out = ch.writer_data;
+    return true;
+}
+
+bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
+                                              const char *visible_data, int len,
+                                              const std::vector<MvccColPatch> &patches,
+                                              std::string *effective_out) {
+    if (patches.empty()) return false;
+    note_table_write(txn, tab);
+    int64_t rkey = mvcc_key(rid);
+    recent_writes_add(tab, rkey);
+    size_t sh = mvcc_shard_idx(tab, rkey);
+    std::unique_lock<std::mutex> lck(mvcc_shards_[sh]);
+    {
+        std::unique_lock<std::shared_mutex> meta(mvcc_dirty_mutex_);
+        mvcc_dirty_.insert(tab);
+        any_mvcc_dirty_.store(true, std::memory_order_release);
+    }
+    auto &pending = mvcc_shard_data_[sh].pending;
+    MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
+    auto pit = pending[tab].find(rkey);
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+
+    const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay) {
+        MvccVer base;
+        base.data.assign(visible_data, len);
+        base.commit_ts = 0;
+        base.is_deleted = false;
+        ch.hist.push_back(std::move(base));
+    }
+
+    const bool reuse_writer = (ch.writer == txn->get_transaction_id());
+    bool need_rebase = false;
+    const char *base_rec = visible_data;
+    if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
+        if (ch.hist.back().is_deleted || (int)ch.hist.back().data.size() != len) return false;
+        base_rec = ch.hist.back().data.data();
+        need_rebase = true;
+    } else if (reuse_writer && !ch.writer_data.empty()) {
+        base_rec = ch.writer_data.data();
+    }
+
+    bool first_touch = !reuse_writer && (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
+    if (first_touch) {
+        for (auto *wr : *txn->get_write_set()) {
+            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
+                first_touch = false;
+                break;
+            }
+        }
+    }
+
+    TabMeta &tmeta = sm_manager_->db_.get_table(tab);
+    ch.writer = txn->get_transaction_id();
+    ch.writer_del = false;
+    if (!reuse_writer || ch.writer_data.empty()) {
+        ch.writer_data.assign(base_rec, len);
+    }
+    for (const auto &p : patches) {
+        bool ok = need_rebase
+                      ? apply_col_patch_rebase(p, visible_data, base_rec, ch.writer_data.data(), len, tmeta)
+                      : apply_col_patch_from_visible(p, visible_data, ch.writer_data.data(), len, tmeta);
+        if (!ok) return false;
     }
     if (first_touch) {
         RmRecord undo_old(len);

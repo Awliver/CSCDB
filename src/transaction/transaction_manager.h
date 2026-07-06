@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <set>
 #include <optional>
 #include <functional>
+#include <vector>
 #include <shared_mutex>
 
 #include "transaction.h"
@@ -28,6 +29,19 @@ See the Mulan PSL v2 for more details. */
 
 /* 系统采用的并发控制算法，当前题目中要求两阶段封锁并发控制算法 */
 enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
+
+// SET 子句对应的列级修改，由 executor 按 TabMeta 填充
+struct MvccColPatch {
+    int offset = 0;
+    int len = 0;
+    ColType type = TYPE_INT;
+    bool is_arith = false;
+    bool arith_neg = false;
+    std::string rhs_col;
+    std::string abs_value;
+    int arith_rhs_i = 0;
+    float arith_rhs_f = 0.f;
+};
 
 /// 版本链中的第一个撤销链接，将表堆元组链接到撤销日志。
 struct VersionUndoLink {
@@ -229,6 +243,11 @@ public:
     bool mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
                               const char *visible_data, int len, int col_off, ColType col_type,
                               float delta_f, int delta_i, std::string *effective_new = nullptr);
+    /* 多列 UPDATE：基底版本上按 patches 改列；写写 rebase 同 rebase_write_delta */
+    bool mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
+                              const char *visible_data, int len,
+                              const std::vector<MvccColPatch> &patches,
+                              std::string *effective_new = nullptr);
 
     /* ------------------------ 题9：SER（SSI 风格可串行化） ------------------------ */
     bool is_ser(Transaction *txn);
