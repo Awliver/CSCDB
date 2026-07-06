@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,7 +34,7 @@ class BufferPoolManager {
     static constexpr size_t BPM_NSHARDS = 64;
 
     struct BpmShard {
-        std::mutex latch_;                  // 保护 page_table_ + 本分片 replacer_ 的成员关系
+        std::shared_mutex latch_;           // 保护 page_table_ + 本分片 replacer_；读路径 shared、写/replacer unique
         std::mutex inflight_mtx_;
         std::condition_variable inflight_cv_;
         std::unordered_map<uint64_t, frame_id_t> page_table_;
