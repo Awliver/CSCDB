@@ -288,7 +288,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             }
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
-            prune_mvcc_after_commit(tab, wr->GetRid(), prune_wm);
+            prune_mvcc_after_commit(tab, wr->GetRid(), prune_wm, cts);
         }
     }
     for (const auto &hf : heap_flushes) {
@@ -525,6 +525,18 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
         out = ch.writer_data;
         return true;
     }
+    // warehouse/district：快照不早于最新提交时堆已是最新值（commit 才写堆）
+    if (is_mvcc_hot_row(tab) && ch.writer == INVALID_TXN_ID) {
+        if (ch.hist.empty()) {
+            out.assign(heap_data, len);
+            return true;
+        }
+        if (txn->get_read_ts() >= ch.hist.back().commit_ts) {
+            if (ch.hist.back().is_deleted) return false;
+            out.assign(heap_data, len);
+            return true;
+        }
+    }
     // 其余情况按事务级快照读最新已提交版本（忽略他人未提交写）。
     // 从新到旧反向扫：读者绝大多数只要最新版本，典型 O(1)；正向扫会随链长线性退化
     // （热点行如 warehouse/district 链长 ∝ 已提交事务数 → 吞吐随运行时间衰减）。
@@ -628,6 +640,66 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
         memcpy(undo_old.data, old_data, len);
         txn->append_write_record(new WriteRecord(
             is_delete ? WType::DELETE_TUPLE : WType::UPDATE_TUPLE, tab, rid, undo_old));
+    }
+    if (effective_out != nullptr) *effective_out = ch.writer_data;
+    return true;
+}
+
+bool TransactionManager::mvcc_write_ytd_delta(Transaction *txn, const std::string &tab, const Rid &rid,
+                                              const char *visible_data, int len, int col_off, float delta,
+                                              std::string *effective_out) {
+    note_table_write(txn, tab);
+    int64_t rkey = mvcc_key(rid);
+    recent_writes_add(tab, rkey);
+    size_t sh = mvcc_shard_idx(tab, rkey);
+    std::unique_lock<std::mutex> lck(mvcc_shards_[sh]);
+    {
+        std::unique_lock<std::shared_mutex> meta(mvcc_dirty_mutex_);
+        mvcc_dirty_.insert(tab);
+        any_mvcc_dirty_.store(true, std::memory_order_release);
+    }
+    auto &pending = mvcc_shard_data_[sh].pending;
+    MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
+    auto pit = pending[tab].find(rkey);
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+    const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay) {
+        MvccVer base;
+        base.data.assign(visible_data, len);
+        base.commit_ts = 0;
+        base.is_deleted = false;
+        ch.hist.push_back(std::move(base));
+    }
+    const char *base_rec = visible_data;
+    if (ch.writer != txn->get_transaction_id() && !ch.hist.empty() &&
+        ch.hist.back().commit_ts > txn->get_read_ts()) {
+        base_rec = ch.hist.back().data.data();
+    }
+    const bool reuse_writer = (ch.writer == txn->get_transaction_id());
+    bool first_touch = !reuse_writer && (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
+    if (first_touch) {
+        for (auto *wr : *txn->get_write_set()) {
+            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
+                first_touch = false;
+                break;
+            }
+        }
+    }
+    ch.writer = txn->get_transaction_id();
+    ch.writer_del = false;
+    if (col_off + (int)sizeof(float) > len) return false;
+    if (reuse_writer && !ch.writer_data.empty()) {
+        *reinterpret_cast<float *>(ch.writer_data.data() + col_off) += delta;
+    } else {
+        ch.writer_data.assign(base_rec, len);
+        *reinterpret_cast<float *>(ch.writer_data.data() + col_off) =
+            *reinterpret_cast<const float *>(base_rec + col_off) + delta;
+    }
+    if (first_touch) {
+        RmRecord undo_old(len);
+        memcpy(undo_old.data, visible_data, len);
+        txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab, rid, undo_old));
     }
     if (effective_out != nullptr) *effective_out = ch.writer_data;
     return true;
@@ -999,26 +1071,40 @@ bool TransactionManager::table_is_dirty(const std::string &tab) {
 }
 
 void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid,
-                                                 timestamp_t watermark) {
-    // 调用方(commit)已持 mvcc_shards_[mvcc_shard_idx(tab, rkey)]。
-    // 剪枝规则：任何读者的可见版本 = 最新的 commit_ts <= 其 read_ts 的版本。所有活跃
-    // 事务 read_ts >= watermark、未来事务 read_ts >= 本次 cts >= watermark，因此
-    // 「低于等于水位的版本中除最新一个以外」不可能被任何人选中，可安全删除。
-    // 高于水位的版本全部保留（可能被某个较旧快照选中或供 SER rw 反依赖检测）。
-    // 注意保留水位版本本身（含墓碑）：它区分"快照可见旧值/已删"与"未跟踪读堆"。
-    auto &store = mvcc_shard_data_[mvcc_shard_idx(tab, mvcc_key(rid))].store;
+                                                 timestamp_t watermark, timestamp_t just_committed_cts) {
+    // 调用方已持本 rid 分片锁。水位以下除最新外可删；watermark>=本次提交时热行可摘链。
+    int64_t rkey = mvcc_key(rid);
+    auto &store = mvcc_shard_data_[mvcc_shard_idx(tab, rkey)].store;
     auto tit = store.find(tab);
     if (tit == store.end()) return;
-    auto cit = tit->second.find(mvcc_key(rid));
+    auto cit = tit->second.find(rkey);
     if (cit == tit->second.end()) return;
     MvccChain &ch = cit->second;
-    if (ch.hist.size() <= 1) return;
+    if (ch.hist.size() <= 1) {
+        if (is_mvcc_hot_row(tab) && ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+            just_committed_cts > 0 && watermark >= just_committed_cts) {
+            tit->second.erase(cit);
+            if (tit->second.empty()) store.erase(tit);
+        }
+        return;
+    }
     int keep_from = -1;                    // 最新的 commit_ts <= watermark 的版本下标
     for (int i = (int)ch.hist.size() - 1; i >= 0; --i) {
         if (ch.hist[i].commit_ts <= watermark) { keep_from = i; break; }
     }
     if (keep_from > 0) {
         ch.hist.erase(ch.hist.begin(), ch.hist.begin() + keep_from);
+    }
+    if (is_mvcc_hot_row(tab) && ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+        just_committed_cts > 0 && watermark >= just_committed_cts) {
+        if (ch.hist.size() == 1) {
+            tit->second.erase(cit);
+            if (tit->second.empty()) store.erase(tit);
+        } else {
+            MvccVer sole = std::move(ch.hist.back());
+            ch.hist.clear();
+            ch.hist.push_back(std::move(sole));
+        }
     }
 }
 

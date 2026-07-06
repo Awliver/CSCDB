@@ -224,6 +224,13 @@ public:
     bool mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
                     const char *old_data, const char *new_data, int len, bool is_delete,
                     std::string *effective_new = nullptr);
+    /* payment：w_ytd / d_ytd 只改一个 float */
+    bool mvcc_write_ytd_delta(Transaction *txn, const std::string &tab, const Rid &rid,
+                              const char *visible_data, int len, int col_off, float delta,
+                              std::string *effective_new = nullptr);
+    static bool is_mvcc_hot_row(const std::string &tab) {
+        return tab == "warehouse" || tab == "district";
+    }
 
     /* ------------------------ 题9：SER（SSI 风格可串行化） ------------------------ */
     bool is_ser(Transaction *txn);
@@ -371,7 +378,8 @@ private:
     friend struct MvccAllShardsGuard;
     /* commit 时按活跃事务最低 read_ts 水位剪枝版本链：低于水位的版本只保留最新一个，
      * 其余对任何现役/未来事务都不可见（未来事务 read_ts >= 本次 commit_ts > 水位）。 */
-    void prune_mvcc_after_commit(const std::string &tab, const Rid &rid, timestamp_t watermark);
+    void prune_mvcc_after_commit(const std::string &tab, const Rid &rid, timestamp_t watermark,
+                                 timestamp_t just_committed_cts = 0);
     void physical_undo_write_record(Transaction *txn, WriteRecord *wr);
     static std::string si_overlay_key(const std::string &tab, int64_t rkey) {
         return tab + "#" + std::to_string(rkey);

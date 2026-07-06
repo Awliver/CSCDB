@@ -104,41 +104,70 @@ class UpdateExecutor : public AbstractExecutor {
 
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
             if (mvcc_path) {
-                std::vector<char> mv_old(record_size_);
                 std::string visible;
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid,
                                                      slot, record_size_, visible)) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
-                memcpy(mv_old.data(), visible.data(), record_size_);
-                std::vector<char> mv_new = mv_old;
-                for (const auto &set : set_clauses_) {
-                    auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
-                                               [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
-                    if (col_it == tab_.cols.end()) continue;
-                    apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
-                }
-                // 并发 NewOrder：客户端用旧快照发绝对 d_next_o_id，须钳制为 > 当前可见值。
-                // 仅当本语句确实改动了计数器(proposed != visible)且回退(proposed < visible)才钳制；
-                // payment 只改 d_ytd、计数器原样带过(proposed == visible)，不得误 +1。
-                if (tab_name_ == "district" && (int)mv_new.size() > 97) {
-                    int visible = *reinterpret_cast<int *>(mv_old.data() + 97);
-                    int proposed = *reinterpret_cast<int *>(mv_new.data() + 97);
-                    if (proposed < visible) {
-                        *reinterpret_cast<int *>(mv_new.data() + 97) = visible + 1;
+                // w_ytd/d_ytd 的 col=col+? 不必整行拷一份再写回
+                bool ytd_delta_only = false;
+                int ytd_col_off = -1;
+                float ytd_delta = 0.f;
+                if (set_clauses_.size() == 1) {
+                    const auto &set = set_clauses_[0];
+                    if (set.is_arith && set.lhs.col_name == set.rhs_col &&
+                        (tab_name_ == "warehouse" || tab_name_ == "district")) {
+                        const char *hot_col = (tab_name_ == "warehouse") ? "w_ytd" : "d_ytd";
+                        if (set.lhs.col_name == hot_col) {
+                            auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                                       [&](const ColMeta &c) { return c.name == hot_col; });
+                            if (col_it != tab_.cols.end() && col_it->type == TYPE_FLOAT &&
+                                col_it->len == (int)sizeof(float)) {
+                                ytd_delta_only = true;
+                                ytd_col_off = col_it->offset;
+                                ytd_delta = set.arith_neg ? -set.rhs.float_val : set.rhs.float_val;
+                            }
+                        }
                     }
                 }
-                if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
-                                                    mv_old.data(), mv_new.data(), record_size_, false,
-                                                    &mvcc_effective)) {
+                bool write_ok = false;
+                if (ytd_delta_only) {
+                    write_ok = context_->txn_mgr_->mvcc_write_ytd_delta(
+                        context_->txn_, tab_name_, rid, visible.data(), record_size_,
+                        ytd_col_off, ytd_delta, &mvcc_effective);
+                } else {
+                    std::vector<char> mv_old(record_size_);
+                    memcpy(mv_old.data(), visible.data(), record_size_);
+                    std::vector<char> mv_new = mv_old;
+                    for (const auto &set : set_clauses_) {
+                        auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                                   [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                        if (col_it == tab_.cols.end()) continue;
+                        apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
+                    }
+                    // 并发 NewOrder：客户端用旧快照发绝对 d_next_o_id，须钳制为 > 当前可见值。
+                    // 仅当本语句确实改动了计数器(proposed != visible)且回退(proposed < visible)才钳制；
+                    // payment 只改 d_ytd、计数器原样带过(proposed == visible)，不得误 +1。
+                    if (tab_name_ == "district" && (int)mv_new.size() > 97) {
+                        int visible_oid = *reinterpret_cast<int *>(mv_old.data() + 97);
+                        int proposed = *reinterpret_cast<int *>(mv_new.data() + 97);
+                        if (proposed < visible_oid) {
+                            *reinterpret_cast<int *>(mv_new.data() + 97) = visible_oid + 1;
+                        }
+                    }
+                    write_ok = context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
+                                                              mv_old.data(), mv_new.data(), record_size_, false,
+                                                              &mvcc_effective);
+                }
+                if (!write_ok) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
                 // 未提交版本仅存 MVCC 链/overlay；堆在 commit 时物化，避免 overlay 释放后脏堆暴露
                 if (context_->txn_mgr_->is_ser(context_->txn_)) {
-                    bool d1 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mv_old.data());
-                    bool d2 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mv_new.data());
+                    bool d1 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, visible.data());
+                    bool d2 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mvcc_effective.data());
                     if (d1 || d2)
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                         AbortReason::DEADLOCK_PREVENTION);
