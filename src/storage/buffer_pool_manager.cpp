@@ -106,7 +106,7 @@ bool BufferPoolManager::reserve_victim_nolock(size_t pref_shard, frame_id_t* out
         *old_page_id = victim.id_;
         *need_flush = victim.is_dirty_;
         if (victim.id_.page_no != INVALID_PAGE_ID) {
-            sh.page_table_.erase(victim.id_);       // victim 页归属分片 s，本锁内删除
+            sh.page_table_.erase(page_key(victim.id_));
         }
         victim.pin_count_ = 1;                       // 预占，防止被并发再次选中
         std::scoped_lock io_lock(io_mutex_);
@@ -117,6 +117,7 @@ bool BufferPoolManager::reserve_victim_nolock(size_t pref_shard, frame_id_t* out
 }
 
 Page* BufferPoolManager::fetch_page(PageId page_id) {
+    const uint64_t key = page_key(page_id);
     const size_t si = shard_of_page(page_id);
     BpmShard &shard = shards_[si];
     PageId old_page_id{-1, INVALID_PAGE_ID};
@@ -125,9 +126,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     while (true) {
         {
             std::unique_lock<std::mutex> infl_lock(shard.inflight_mtx_);
-            if (shard.page_io_inflight_.count(page_id)) {
+            if (shard.page_io_inflight_.count(key)) {
                 shard.inflight_cv_.wait(infl_lock, [&] {
-                    return shard.page_io_inflight_.count(page_id) == 0;
+                    return shard.page_io_inflight_.count(key) == 0;
                 });
                 continue;
             }
@@ -136,7 +137,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         frame_id_t wait_frame = INVALID_FRAME_ID;
         {
             std::scoped_lock lock(shard.latch_);
-            auto it = shard.page_table_.find(page_id);
+            auto it = shard.page_table_.find(key);
             if (it != shard.page_table_.end()) {
                 hit_frame = it->second;
                 if (pages_[hit_frame].pin_count_ > 0) {
@@ -158,32 +159,32 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 io_cv_.wait(io_lock, [&] { return !frame_io_inflight_[wait_frame]; });
                 continue;
             }
-            std::scoped_lock lock(shard.latch_);     // 仅分片锁：与该分片淘汰/unpin 互斥即可
-            auto it = shard.page_table_.find(page_id);
-            if (it == shard.page_table_.end() || it->second != hit_frame) continue;
+            std::scoped_lock lock(shard.latch_);
+            Page &p = pages_[hit_frame];
+            if (!(p.id_ == page_id)) continue;     // 锁外期间帧已被换出/复用，无需再查 map
             {
                 std::scoped_lock io_lock(io_mutex_);
                 if (frame_io_inflight_[hit_frame]) continue;
             }
-            if (pages_[hit_frame].pin_count_ == 0) shard.replacer_->pin(hit_frame);
-            pages_[hit_frame].pin_count_++;
-            return &pages_[hit_frame];
+            if (p.pin_count_ == 0) shard.replacer_->pin(hit_frame);
+            p.pin_count_++;
+            return &p;
         }
         {
             // 未命中：在全局 evict_latch_ 下预占 victim（冷路径）
             std::scoped_lock evict_lock(evict_latch_);
             {
                 std::scoped_lock infl_lock(shard.inflight_mtx_);
-                if (shard.page_io_inflight_.count(page_id)) continue;
+                if (shard.page_io_inflight_.count(key)) continue;
             }
             {
                 std::scoped_lock lock(shard.latch_);
-                if (shard.page_table_.find(page_id) != shard.page_table_.end()) continue;  // 他人已载入
+                if (shard.page_table_.find(key) != shard.page_table_.end()) continue;  // 他人已载入
             }
             if (!reserve_victim_nolock(si, &frame_id, &old_page_id, &need_flush_old)) return nullptr;
             {
                 std::scoped_lock infl_lock(shard.inflight_mtx_);
-                shard.page_io_inflight_.insert(page_id);
+                shard.page_io_inflight_.insert(key);
             }
         }
         break;
@@ -208,7 +209,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
         {
             std::scoped_lock infl_lock(shard.inflight_mtx_);
-            shard.page_io_inflight_.erase(page_id);
+            shard.page_io_inflight_.erase(key);
             shard.inflight_cv_.notify_all();
         }
         throw;
@@ -218,11 +219,11 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         Page &victim = pages_[frame_id];
         victim.id_ = page_id;
         victim.is_dirty_ = false;
-        shard.page_table_[page_id] = frame_id;
+        shard.page_table_[key] = frame_id;
     }
     {
         std::scoped_lock infl_lock(shard.inflight_mtx_);
-        shard.page_io_inflight_.erase(page_id);
+        shard.page_io_inflight_.erase(key);
         shard.inflight_cv_.notify_all();
     }
     {
@@ -235,8 +236,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 
 bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     BpmShard &shard = shard_for_page(page_id);
+    const uint64_t key = page_key(page_id);
     std::scoped_lock<std::mutex> lock(shard.latch_);
-    auto it = shard.page_table_.find(page_id);
+    auto it = shard.page_table_.find(key);
     if (it == shard.page_table_.end()) return false;
     frame_id_t frame_id = it->second;
     Page& page = pages_[frame_id];
@@ -250,8 +252,9 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
 
 bool BufferPoolManager::flush_page(PageId page_id) {
     BpmShard &shard = shard_for_page(page_id);
+    const uint64_t key = page_key(page_id);
     std::scoped_lock lock(shard.latch_);
-    auto it = shard.page_table_.find(page_id);
+    auto it = shard.page_table_.find(key);
     if (it == shard.page_table_.end()) return false;
     frame_id_t frame_id = it->second;
     if (g_log_manager) g_log_manager->flush_log_to_disk();
@@ -283,7 +286,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         p.is_dirty_ = false;
         p.pin_count_ = 1;           // reserve 已置 1，此处冗余保险
         p.reset_memory();
-        shard.page_table_[*page_id] = frame_id;
+        shard.page_table_[page_key(*page_id)] = frame_id;
     }
     {
         std::scoped_lock io_lock(io_mutex_);
@@ -295,13 +298,14 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
 
 bool BufferPoolManager::delete_page(PageId page_id) {
     BpmShard &shard = shard_for_page(page_id);
+    const uint64_t key = page_key(page_id);
     frame_id_t frame_id = INVALID_FRAME_ID;
     PageId flush_id{-1, INVALID_PAGE_ID};
     char flush_buf[PAGE_SIZE];
     bool need_flush = false;
     {
         std::scoped_lock lock(shard.latch_);
-        auto it = shard.page_table_.find(page_id);
+        auto it = shard.page_table_.find(key);
         if (it == shard.page_table_.end()) return true;
         frame_id = it->second;
         Page& page = pages_[frame_id];
@@ -335,7 +339,8 @@ void BufferPoolManager::flush_all_pages(int fd) {
     for (auto &shard : shards_) {
         std::scoped_lock lock(shard.latch_);
         for (auto& entry : shard.page_table_) {
-            const PageId& pid = entry.first;
+            const PageId pid{static_cast<int>(entry.first >> 32),
+                             static_cast<page_id_t>(entry.first)};
             if (pid.fd != fd) continue;
             frame_id_t frame_id = entry.second;
             disk_manager_->write_page(pid.fd, pid.page_no, pages_[frame_id].data_, PAGE_SIZE);
@@ -350,7 +355,8 @@ void BufferPoolManager::delete_all_pages(int fd) {
     for (auto &shard : shards_) {
         std::scoped_lock lock(shard.latch_);
         for (auto it = shard.page_table_.begin(); it != shard.page_table_.end(); ) {
-            const PageId& pid = it->first;
+            const PageId pid{static_cast<int>(it->first >> 32),
+                             static_cast<page_id_t>(it->first)};
             if (pid.fd != fd) { ++it; continue; }
             frame_id_t frame_id = it->second;
             Page& page = pages_[frame_id];

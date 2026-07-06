@@ -36,8 +36,8 @@ class BufferPoolManager {
         std::mutex latch_;                  // 保护 page_table_ + 本分片 replacer_ 的成员关系
         std::mutex inflight_mtx_;
         std::condition_variable inflight_cv_;
-        std::unordered_map<PageId, frame_id_t, PageIdHash> page_table_;
-        std::unordered_set<PageId, PageIdHash> page_io_inflight_;
+        std::unordered_map<uint64_t, frame_id_t> page_table_;
+        std::unordered_set<uint64_t> page_io_inflight_;
         // 本分片 LRU：仅存放“归属本分片(hash(page)%N==s)且 pin_count==0、非 I/O 中”的帧。
         // 所有 replacer 增删（pin/unpin/victim）必须在本分片 latch_ 下进行，故命中/unpin 热路径无全局锁。
         std::unique_ptr<Replacer> replacer_;
@@ -65,6 +65,11 @@ class BufferPoolManager {
 
     void cleaner_loop();
 
+    static uint64_t page_key(const PageId &pid) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(pid.fd)) << 32) |
+               static_cast<uint32_t>(pid.page_no);
+    }
+
     size_t shard_of_page(PageId page_id) const {
         return PageIdHash{}(page_id) % BPM_NSHARDS;
     }
@@ -77,6 +82,7 @@ class BufferPoolManager {
         pages_ = new Page[pool_size_];
         for (auto &shard : shards_) {
             shard.replacer_ = std::make_unique<LRUReplacer>(pool_size_);
+            shard.page_table_.reserve(pool_size_ / BPM_NSHARDS + 1);
         }
         for (size_t i = 0; i < pool_size_; ++i) {
             free_list_.emplace_back(static_cast<frame_id_t>(i));
