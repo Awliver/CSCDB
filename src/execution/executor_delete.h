@@ -85,7 +85,8 @@ class DeleteExecutor : public AbstractExecutor {
 
             // 题9 MVCC：逻辑删除——写写冲突检测 + 登记删除版本，保留堆槽与索引供快照读
             if (versioning) {
-                if (context_->lock_mgr_ && (tab_name_ == "district" || tab_name_ == "warehouse")) {
+                // 显式事务：行锁持有到 commit/abort（与 update 对称，语句尾不 unlock）
+                if (context_->lock_mgr_ && context_->txn_->get_txn_mode()) {
                     context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
                 }
                 if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
@@ -106,10 +107,6 @@ class DeleteExecutor : public AbstractExecutor {
                     Rid r = rid;
                     DeleteLogRecord lr(context_->txn_->get_transaction_id(), old_rec, r, tab_name_);
                     context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
-                }
-                if (context_->lock_mgr_ && (tab_name_ == "district" || tab_name_ == "warehouse")) {
-                    LockDataId lid(fh_->GetFd(), rid, LockDataType::RECORD);
-                    context_->lock_mgr_->unlock(context_->txn_, lid);
                 }
                 continue;
             }

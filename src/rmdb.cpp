@@ -101,7 +101,7 @@ static bool write_all(int fd, const char *buf, int len) {
     return true;
 }
 
-/* ---------- TPC-C 热路径 SQL 快解析（绕过全局 yacc 锁） ---------- */
+/* 常见 DML/事务语句快解析（绕过全局 yacc 锁，失败回退 yacc） */
 static const char *fp_skipws(const char *p) {
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
     return p;
@@ -500,13 +500,6 @@ void *client_handler(void *sock_fd) {
             continue;
         }
 
-        // 性能测试：关闭 output.txt 写入（无分号）
-        if (parse_set_output_file_off(stmt)) {
-            data_send[0] = '\0';
-            if (!write_all(fd, data_send, 1)) break;
-            continue;
-        }
-
         // 题9：会话级隔离级别设置——单独处理，不进解析器、不开启事务、无多余输出
         {
             IsolationLevel new_iso;
@@ -689,7 +682,7 @@ void *client_handler(void *sock_fd) {
         txn_manager->reap(context->txn_);
     }
 
-    // 客户端断开时回滚显式事务并释放行锁，避免热行锁泄漏拖死后续连接
+    // 客户端断开：回滚未结束的显式事务并 unlock_all，避免行锁泄漏
     if (txn_id != INVALID_TXN_ID) {
         Transaction *t = txn_manager->get_transaction(txn_id);
         if (t != nullptr) {

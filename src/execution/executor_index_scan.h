@@ -64,7 +64,7 @@ class IndexScanExecutor : public AbstractExecutor {
 
     // 题9 MVCC：索引扫描与 SeqScan 同等对待——表进入 MVCC 脏态后，堆上的裸记录可能
     // 包含未提交写或缺少本事务自己的链上写(未提交版本仅存链/overlay，commit 才物化到堆)。
-    // 不做可见性重建会导致：事务读不到自己的 district 计数器更新 → o_id 错位 → 丢单/孤儿行。
+    // 不做可见性重建会导致：事务读不到自己的未提交更新 → 计数器错位 → 丢单/孤儿行。
     bool mvcc_on_ = false;
     std::string mvcc_buf_;              // 当前 rid 的可见版本字节（mvcc_on_ 时有效）
     // 题9 SER：与 SeqScan 相同的 SSI 读跟踪（谓词读 + 逐行读检查）。有了这套钩子，

@@ -240,15 +240,14 @@ static bool has_range_cond(const std::vector<Condition> &conds, const std::strin
 }
 
 // 题9：SER 显式事务下是否强制 SeqScan（放弃 IndexScan）。仅影响显式 SER 事务
-// （is_ser 要求 txn_mode）——TPC-C 压测与题九并发测试都在此路径，autocommit 不受影响。
+// （is_ser 要求 txn_mode）；autocommit 单语句不走此分支。
 //
 // 两种情况必须强制 SeqScan：
 //   1) join（n_tables>1）：INLJ 内表读尚无 SSI 跟踪钩子，走索引会漏检危险结构；
 //   2) 单表【范围查询】：IndexScan 按索引序返回、SeqScan 按堆(插入)序返回，行序不同；
 //      题九并发测试逐字比对 SELECT 输出、期望值是旧的强制 SeqScan(插入序)所生成，
 //      范围查询改走 IndexScan 会因行序不符而失败。
-// 单表【等值点查】放行 IndexScan：TPC-C 热路径几乎全是全键等值(唯一键返回单行/定序)，
-// 这是 OJ(默认SER)tpmC 从 53 拉起来的关键——旧实现把等值点查也退化成全表扫(stock 10万行/条)。
+// 单表等值点查可走 IndexScan；join 内表或范围条件仍强制 SeqScan（SER 谓词读保序）。
 static bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables,
                                const std::vector<Condition> &conds) {
     if (!(context && context->txn_ && context->txn_mgr_ &&

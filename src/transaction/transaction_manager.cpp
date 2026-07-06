@@ -20,11 +20,6 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
-static int district_next_oid(const std::string &data) {
-    if (data.size() < 101) return -1;
-    return *reinterpret_cast<const int *>(data.data() + 97);
-}
-
 void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const Rid &rid,
                              WType wtype, const std::string &old_data, const std::string &new_data) {
     if (sm == nullptr) return;
@@ -69,9 +64,9 @@ void restore_index_if_missing(SmManager *sm, const std::string &tab_name, const 
     }
 }
 
-/* SI 写写冲突：将基于旧快照的增量写重定位到最新已提交版本（TPC-C read-then-write 模式）。
- * 基底必须取 latest_rec：本事务未改动的列要保留最新已提交值（如 new_order 全行镜像里
- * 顺带携带的 d_ytd），若以旧快照为基底会把并发 payment 已提交的增量覆盖回旧值（丢钱）。 */
+/* SI 写写冲突：将基于旧快照的增量写重定位到最新已提交版本（read-then-write 模式）。
+ * 基底必须取 latest_rec：本事务未改动的列要保留最新已提交值，
+ * 若以旧快照为基底会把并发已提交的增量覆盖回旧值。 */
 bool rebase_write_delta(SmManager *sm, const std::string &tab,
                         const char *old_rec, const char *new_rec, const char *latest_rec,
                         int len, std::string &out) {
@@ -117,10 +112,9 @@ void TransactionManager::unlock_all_mvcc_shards() const {
 void TransactionManager::release_statement_writes(Transaction *txn) {
     if (txn == nullptr || !txn->get_txn_mode()) return;
     txn_id_t me = txn->get_transaction_id();
-    // 仅扫描本事务 write_set，避免每条 SQL 后遍历全库 mvcc_store_（TPC-C 下可达 10 万+ 链）
+    // 仅扫描本事务 write_set；hold_writer_to_commit 的链跳过（跨语句累加增量）
     for (auto *wr : *txn->get_write_set()) {
         const std::string &tab = wr->GetTableName();
-        if (tab == "district" || tab == "warehouse") continue;
         int64_t rkey = mvcc_key(wr->GetRid());
         size_t sh = mvcc_shard_idx(tab, rkey);
         std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
@@ -131,6 +125,7 @@ void TransactionManager::release_statement_writes(Transaction *txn) {
         if (cit == tit->second.end()) continue;
         MvccChain &ch = cit->second;
         if (ch.writer != me) continue;
+        if (ch.hold_writer_to_commit) continue;
         Transaction::SiOverlay ov;
         ov.is_deleted = ch.writer_del;
         ov.data = ch.writer_data;
@@ -247,8 +242,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         Rid rid;
         std::string data;
     };
-    std::vector<HeapFlush> heap_flushes;
-    heap_flushes.reserve(write_set->size());
     for (auto *wr : *write_set) {
         const std::string &tab = wr->GetTableName();
         touched_tabs.insert(tab);
@@ -267,28 +260,17 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             v.is_deleted = ch.writer_del;
             v.writer_txn = txn->get_transaction_id();
             if (!ch.writer_del) v.data = ch.writer_data;
-            // district 计数器在并发 SI 下必须单调不减，禁止陈旧写把计数器拉低。
-            // payment 等不改计数器的更新 new_n == back_n 属正常，不得误 +1（否则每笔
-            // payment 幽灵递增一次 d_next_o_id → 大量 o_id 空洞/丢单）。
-            if (tab == "district" && !ch.writer_del && !v.data.empty() && !ch.hist.empty()) {
-                int back_n = district_next_oid(ch.hist.back().data);
-                int new_n = district_next_oid(v.data);
-                if (new_n < back_n) {
-                    *(int *)(v.data.data() + 97) = back_n + 1;
-                    ch.writer_data = v.data;
-                }
-            }
             ch.hist.push_back(std::move(v));
+            // 先物化堆再 prune：否则摘链后读者会读到未刷新的堆页
             if (!ch.writer_del && !ch.writer_data.empty()) {
-                heap_flushes.push_back({tab, wr->GetRid(), ch.writer_data});
+                sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(),
+                                                         (char *)ch.writer_data.data(), nullptr);
             }
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
+            ch.hold_writer_to_commit = false;
             prune_mvcc_after_commit(tab, wr->GetRid(), prune_wm, cts);
         }
-    }
-    for (const auto &hf : heap_flushes) {
-        sm_manager_->fhs_.at(hf.tab)->update_record(hf.rid, (char *)hf.data.data(), nullptr);
     }
     // 每表写活动收尾：记录含写提交的 cts、写者计数 -1（与 note_table_write 对称）。
     // 顺序：cts 更新与减计数同锁原子——读者要么见 writers>0 要么见 last_cts>其快照，
@@ -410,6 +392,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                     ch.writer = INVALID_TXN_ID;
                     ch.writer_data.clear();
                     ch.writer_del = false;
+                    ch.hold_writer_to_commit = false;
                     RmFileHandle *fh = sm_manager_->fhs_.at(tab).get();
                     if (ch.hist.empty()) {
                         if (new_data.empty() && insert_then_deleted && fh->is_record(wr->GetRid())) {
@@ -422,15 +405,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                         }
                     } else {
                         const MvccVer &last = ch.hist.back();
-                        bool restore_heap = !last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid());
-                        if (restore_heap && tab == "district") {
-                            auto cur = fh->get_record(wr->GetRid(), nullptr);
-                            int heap_next = district_next_oid(
-                                std::string(cur->data, (size_t)fh->get_file_hdr().record_size));
-                            int restore_next = district_next_oid(last.data);
-                            if (heap_next > restore_next) restore_heap = false;
-                        }
-                        if (restore_heap) {
+                        if (!last.is_deleted && !last.data.empty() && fh->is_record(wr->GetRid())) {
                             fh->update_record(wr->GetRid(), (char *)last.data.data(), nullptr);
                         }
                         if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty()) {
@@ -524,21 +499,14 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
         out = ch.writer_data;
         return true;
     }
-    // warehouse/district：快照不早于最新提交时堆已是最新值（commit 才写堆）
-    if (is_mvcc_hot_row(tab) && ch.writer == INVALID_TXN_ID) {
-        if (ch.hist.empty()) {
-            out.assign(heap_data, len);
-            return true;
-        }
-        if (txn->get_read_ts() >= ch.hist.back().commit_ts) {
-            if (ch.hist.back().is_deleted) return false;
-            out.assign(heap_data, len);
-            return true;
-        }
+    // 快照已覆盖链顶：读 hist.back()（hist 为空时不能读堆，abort 插入会误可见）
+    if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+        txn->get_read_ts() >= ch.hist.back().commit_ts) {
+        if (ch.hist.back().is_deleted) return false;
+        out = ch.hist.back().data;
+        return true;
     }
-    // 其余情况按事务级快照读最新已提交版本（忽略他人未提交写）。
-    // 从新到旧反向扫：读者绝大多数只要最新版本，典型 O(1)；正向扫会随链长线性退化
-    // （热点行如 warehouse/district 链长 ∝ 已提交事务数 → 吞吐随运行时间衰减）。
+    // 反向扫 hist：多数读者只碰最新版本；链过长时避免正向线性退化。
     timestamp_t rts = txn->get_read_ts();
     const MvccVer *vis = nullptr;
     for (auto it = ch.hist.rbegin(); it != ch.hist.rend(); ++it) {   // commit_ts 降序
@@ -644,8 +612,9 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     return true;
 }
 
-bool TransactionManager::mvcc_write_ytd_delta(Transaction *txn, const std::string &tab, const Rid &rid,
-                                              const char *visible_data, int len, int col_off, float delta,
+bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
+                                              const char *visible_data, int len, int col_off,
+                                              ColType col_type, float delta_f, int delta_i,
                                               std::string *effective_out) {
     note_table_write(txn, tab);
     int64_t rkey = mvcc_key(rid);
@@ -687,13 +656,27 @@ bool TransactionManager::mvcc_write_ytd_delta(Transaction *txn, const std::strin
     }
     ch.writer = txn->get_transaction_id();
     ch.writer_del = false;
-    if (col_off + (int)sizeof(float) > len) return false;
-    if (reuse_writer && !ch.writer_data.empty()) {
-        *reinterpret_cast<float *>(ch.writer_data.data() + col_off) += delta;
+    ch.hold_writer_to_commit = true;
+    if (col_type == TYPE_FLOAT) {
+        if (col_off + (int)sizeof(float) > len) return false;
+        if (reuse_writer && !ch.writer_data.empty()) {
+            *reinterpret_cast<float *>(ch.writer_data.data() + col_off) += delta_f;
+        } else {
+            ch.writer_data.assign(base_rec, len);
+            *reinterpret_cast<float *>(ch.writer_data.data() + col_off) =
+                *reinterpret_cast<const float *>(base_rec + col_off) + delta_f;
+        }
+    } else if (col_type == TYPE_INT) {
+        if (col_off + (int)sizeof(int) > len) return false;
+        if (reuse_writer && !ch.writer_data.empty()) {
+            *reinterpret_cast<int *>(ch.writer_data.data() + col_off) += delta_i;
+        } else {
+            ch.writer_data.assign(base_rec, len);
+            *reinterpret_cast<int *>(ch.writer_data.data() + col_off) =
+                *reinterpret_cast<const int *>(base_rec + col_off) + delta_i;
+        }
     } else {
-        ch.writer_data.assign(base_rec, len);
-        *reinterpret_cast<float *>(ch.writer_data.data() + col_off) =
-            *reinterpret_cast<const float *>(base_rec + col_off) + delta;
+        return false;
     }
     if (first_touch) {
         RmRecord undo_old(len);
@@ -707,8 +690,7 @@ bool TransactionManager::mvcc_write_ytd_delta(Transaction *txn, const std::strin
 bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
                                                   const char *rec_data, int key_off, int key_len) {
     // 被删键索引 O(1) 点查（原实现持全部分片锁全表扫版本链，占 87% CPU）。
-    // 语义与原扫描同为"记录首列"粒度；略保守——不再验证被删旧版本对本快照可见，
-    // 误报仅多一次 abort（安全），TPC-C 键单调递增实际不撞。
+    // 略保守：不再验证被删旧版本对本快照是否可见，误报仅多一次 abort。
     std::scoped_lock<std::mutex> lck(del_meta_latch_);
     auto tit = del_keys_.find(tab);
     if (tit == del_keys_.end()) return false;
@@ -1071,7 +1053,7 @@ bool TransactionManager::table_is_dirty(const std::string &tab) {
 
 void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid,
                                                  timestamp_t watermark, timestamp_t just_committed_cts) {
-    // 调用方已持本 rid 分片锁。水位以下除最新外可删；watermark>=本次提交时热行可摘链。
+    // 调用方已持分片锁。水位以下可剪枝；堆已物化且水位覆盖本次提交时可整链删除。
     int64_t rkey = mvcc_key(rid);
     auto &store = mvcc_shard_data_[mvcc_shard_idx(tab, rkey)].store;
     auto tit = store.find(tab);
@@ -1080,7 +1062,7 @@ void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const R
     if (cit == tit->second.end()) return;
     MvccChain &ch = cit->second;
     if (ch.hist.size() <= 1) {
-        if (is_mvcc_hot_row(tab) && ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+        if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
             just_committed_cts > 0 && watermark >= just_committed_cts) {
             tit->second.erase(cit);
             if (tit->second.empty()) store.erase(tit);
@@ -1094,7 +1076,7 @@ void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const R
     if (keep_from > 0) {
         ch.hist.erase(ch.hist.begin(), ch.hist.begin() + keep_from);
     }
-    if (is_mvcc_hot_row(tab) && ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
+    if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         just_committed_cts > 0 && watermark >= just_committed_cts) {
         if (ch.hist.size() == 1) {
             tit->second.erase(cit);

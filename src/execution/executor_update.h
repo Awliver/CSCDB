@@ -85,6 +85,37 @@ class UpdateExecutor : public AbstractExecutor {
         }
     }
 
+    // 识别 col=col±字面量（int/float），可走 mvcc_write_col_delta 避免整行拷贝
+    struct ColArithDelta {
+        bool hit = false;
+        int col_off = -1;
+        ColType col_type = TYPE_INT;
+        float delta_f = 0.f;
+        int delta_i = 0;
+    };
+
+    ColArithDelta detect_col_arith_delta() const {
+        ColArithDelta r;
+        if (set_clauses_.size() != 1) return r;
+        const auto &set = set_clauses_[0];
+        if (!set.is_arith || set.lhs.col_name != set.rhs_col) return r;
+        auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                   [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+        if (col_it == tab_.cols.end()) return r;
+        if (col_it->type == TYPE_FLOAT && col_it->len == (int)sizeof(float)) {
+            r.hit = true;
+            r.col_off = col_it->offset;
+            r.col_type = TYPE_FLOAT;
+            r.delta_f = set.arith_neg ? -set.rhs.float_val : set.rhs.float_val;
+        } else if (col_it->type == TYPE_INT && col_it->len == (int)sizeof(int)) {
+            r.hit = true;
+            r.col_off = col_it->offset;
+            r.col_type = TYPE_INT;
+            r.delta_i = set.arith_neg ? -set.rhs.int_val : set.rhs.int_val;
+        }
+        return r;
+    }
+
     /**
      * @description: 遍历所有匹配的 rid，对每条记录应用 SET 修改后写回
      */
@@ -96,9 +127,9 @@ class UpdateExecutor : public AbstractExecutor {
                                    context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
             std::string mvcc_effective;
 
-            // district/warehouse 行锁：MVCC 与 SI 快路径均须持有到 commit/abort，防并发丢增量
+            // 显式事务 MVCC 写：行锁与 delete 对称，持有到 commit/abort
             if (context_ && context_->lock_mgr_ && context_->txn_ && context_->txn_->get_txn_mode() &&
-                (tab_name_ == "district" || tab_name_ == "warehouse")) {
+                mvcc_path) {
                 context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
             }
 
@@ -110,32 +141,13 @@ class UpdateExecutor : public AbstractExecutor {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
                 }
-                // w_ytd/d_ytd 的 col=col+? 不必整行拷一份再写回
-                bool ytd_delta_only = false;
-                int ytd_col_off = -1;
-                float ytd_delta = 0.f;
-                if (set_clauses_.size() == 1) {
-                    const auto &set = set_clauses_[0];
-                    if (set.is_arith && set.lhs.col_name == set.rhs_col &&
-                        (tab_name_ == "warehouse" || tab_name_ == "district")) {
-                        const char *hot_col = (tab_name_ == "warehouse") ? "w_ytd" : "d_ytd";
-                        if (set.lhs.col_name == hot_col) {
-                            auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
-                                                       [&](const ColMeta &c) { return c.name == hot_col; });
-                            if (col_it != tab_.cols.end() && col_it->type == TYPE_FLOAT &&
-                                col_it->len == (int)sizeof(float)) {
-                                ytd_delta_only = true;
-                                ytd_col_off = col_it->offset;
-                                ytd_delta = set.arith_neg ? -set.rhs.float_val : set.rhs.float_val;
-                            }
-                        }
-                    }
-                }
+                ColArithDelta col_delta = detect_col_arith_delta();
                 bool write_ok = false;
-                if (ytd_delta_only) {
-                    write_ok = context_->txn_mgr_->mvcc_write_ytd_delta(
+                if (col_delta.hit) {
+                    write_ok = context_->txn_mgr_->mvcc_write_col_delta(
                         context_->txn_, tab_name_, rid, visible.data(), record_size_,
-                        ytd_col_off, ytd_delta, &mvcc_effective);
+                        col_delta.col_off, col_delta.col_type, col_delta.delta_f, col_delta.delta_i,
+                        &mvcc_effective);
                 } else {
                     std::vector<char> mv_old(record_size_);
                     memcpy(mv_old.data(), visible.data(), record_size_);
@@ -145,16 +157,6 @@ class UpdateExecutor : public AbstractExecutor {
                                                    [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                         if (col_it == tab_.cols.end()) continue;
                         apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
-                    }
-                    // 并发 NewOrder：客户端用旧快照发绝对 d_next_o_id，须钳制为 > 当前可见值。
-                    // 仅当本语句确实改动了计数器(proposed != visible)且回退(proposed < visible)才钳制；
-                    // payment 只改 d_ytd、计数器原样带过(proposed == visible)，不得误 +1。
-                    if (tab_name_ == "district" && (int)mv_new.size() > 97) {
-                        int visible_oid = *reinterpret_cast<int *>(mv_old.data() + 97);
-                        int proposed = *reinterpret_cast<int *>(mv_new.data() + 97);
-                        if (proposed < visible_oid) {
-                            *reinterpret_cast<int *>(mv_new.data() + 97) = visible_oid + 1;
-                        }
                     }
                     write_ok = context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
                                                               mv_old.data(), mv_new.data(), record_size_, false,
@@ -258,12 +260,6 @@ class UpdateExecutor : public AbstractExecutor {
                                            [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
                 if (col_it == tab_.cols.end()) continue;
                 apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
-            }
-            // 同上：只钳制真正回退的计数器写；未触及计数器的更新(*nxt == visible)不得误 +1
-            if (tab_name_ == "district" && record_size_ > 97) {
-                int visible = *reinterpret_cast<int *>(orig_rec.data() + 97);
-                int *nxt = reinterpret_cast<int *>(slot + 97);
-                if (*nxt < visible) *nxt = visible + 1;
             }
             }
 

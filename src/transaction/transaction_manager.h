@@ -165,6 +165,7 @@ public:
         txn_id_t writer = INVALID_TXN_ID;   // 未提交写者（同一时刻至多一个，否则写写冲突）
         bool writer_del = false;            // 未提交写是否为删除
         std::string writer_data;            // 未提交写的新值（非删除时有效）
+        bool hold_writer_to_commit = false; // col=col±常数：writer 保留到 commit，语句尾不迁 overlay
     };
     static inline int64_t mvcc_key(const Rid &rid) {
         return ((int64_t)rid.page_no << 32) | (uint32_t)rid.slot_no;
@@ -181,8 +182,8 @@ public:
     void inc_explicit() { active_explicit_count_++; }
     /* 该表是否被 MVCC 写过（读时才需查版本链，未脏表直接读堆，保持非事务负载性能） */
     bool table_is_dirty(const std::string &tab);
-    /* 单连接 SI 显式事务快路径：仅无并发且库尚未进入 MVCC 脏态时跳过版本维护。
-     * 一旦 any_mvcc_dirty_ 置位，必须走 MVCC，否则堆与版本链分叉 → district 计数器错乱。 */
+    /* 单连接 SI 快路径：无并发且库未脏时可跳过版本维护；一旦 any_mvcc_dirty_ 置位必须走 MVCC，
+     * 否则堆与版本链长期分叉。 */
     bool uses_si_fast_path(Transaction *txn) const {
         return txn && txn->get_txn_mode() &&
                active_explicit_count_.load(std::memory_order_acquire) <= 1 &&
@@ -224,13 +225,10 @@ public:
     bool mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
                     const char *old_data, const char *new_data, int len, bool is_delete,
                     std::string *effective_new = nullptr);
-    /* payment：w_ytd / d_ytd 只改一个 float */
-    bool mvcc_write_ytd_delta(Transaction *txn, const std::string &tab, const Rid &rid,
-                              const char *visible_data, int len, int col_off, float delta,
-                              std::string *effective_new = nullptr);
-    static bool is_mvcc_hot_row(const std::string &tab) {
-        return tab == "warehouse" || tab == "district";
-    }
+    /* 单列 col=col±字面量（int/float）；配合 hold_writer_to_commit，跨语句累加增量 */
+    bool mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
+                              const char *visible_data, int len, int col_off, ColType col_type,
+                              float delta_f, int delta_i, std::string *effective_new = nullptr);
 
     /* ------------------------ 题9：SER（SSI 风格可串行化） ------------------------ */
     bool is_ser(Transaction *txn);
@@ -278,10 +276,7 @@ private:
     mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
 
-    /* 题9 性能：被删键索引（del_keys_）——插入端删-插冲突检测的 O(1) 点查。
-     * 曾经的实现对每次 INSERT 持全部分片锁全表扫版本链，perf 实测占 87% CPU 且
-     * 随累计事务数 O(n²) 恶化。此索引只登记"被删除过的键"（TPC-C 中仅 new_orders），
-     * 天然很小；键粒度与原扫描一致（记录首列字节）。 */
+    /* 被删键索引（del_keys_）：插入端删-插冲突 O(1) 点查，按记录首列登记。 */
     struct DelKeyState {
         std::unordered_set<txn_id_t> writers;   // 未提交删除者（同键可有多行、多事务）
         timestamp_t last_del_cts = 0;           // 最近已提交删除的 commit_ts
