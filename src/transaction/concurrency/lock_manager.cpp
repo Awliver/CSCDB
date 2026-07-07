@@ -10,7 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "lock_manager.h"
 
-#include <chrono>
 #include <vector>
 
 LockManager::RecordLockEntry &LockManager::get_record_lock(const LockDataId &id) {
@@ -52,6 +51,7 @@ void LockManager::mark_victim_abort(txn_id_t victim) {
     }
     if (victim_txn != nullptr) victim_txn->request_lock_abort();
     if (entry == nullptr) return;
+    // 等锁方在 cv.wait 内会释放 entry.mtx；try_lock 成功则 notify，失败则靠谓词读 lock_abort_
     std::unique_lock<std::mutex> lk(entry->mtx, std::try_to_lock);
     if (lk.owns_lock()) entry->cv.notify_all();
 }
@@ -131,8 +131,8 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
             return false;
         }
 
-        // 1ms 超时：notify 可能在对方尚未 wait 时丢失，靠轮询 lock_abort_ 兜底
-        entry.cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
+        // 阻塞等待：unlock / WFG notify 唤醒；lock_abort_ 在谓词入口检查（无需 1ms 轮询）
+        entry.cv.wait(lk, [&] {
             return entry.owner == INVALID_TXN_ID || entry.owner == me || txn->lock_abort_requested();
         });
 

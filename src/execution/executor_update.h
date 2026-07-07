@@ -185,12 +185,31 @@ class UpdateExecutor : public AbstractExecutor {
                         &mvcc_effective);
                 } else {
                     std::vector<MvccColPatch> patches = build_col_patches();
-                    // 多列 SET 走列 patch；单列仍整行写（并发写写 rebase 未对齐）
-                    if (set_clauses_.size() > 1 && !patches.empty()) {
+                    // 单列绝对 int/float（如 d_next_o_id = ?）→ col_delta，rebase 与 hold_writer_to_commit
+                    // 与 payment 一致，保证语句后 re-read 可见本事务写入
+                    if (patches.size() == 1 && !patches[0].is_arith) {
+                        const auto &p = patches[0];
+                        if (p.type == TYPE_INT && p.len == (int)sizeof(int) &&
+                            (int)p.abs_value.size() >= p.len) {
+                            int o = *reinterpret_cast<const int *>(visible.data() + p.offset);
+                            int n = *reinterpret_cast<const int *>(p.abs_value.data());
+                            write_ok = context_->txn_mgr_->mvcc_write_col_delta(
+                                context_->txn_, tab_name_, rid, visible.data(), record_size_,
+                                p.offset, TYPE_INT, 0.f, n - o, &mvcc_effective);
+                        } else if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float) &&
+                                   (int)p.abs_value.size() >= p.len) {
+                            float o = *reinterpret_cast<const float *>(visible.data() + p.offset);
+                            float n = *reinterpret_cast<const float *>(p.abs_value.data());
+                            write_ok = context_->txn_mgr_->mvcc_write_col_delta(
+                                context_->txn_, tab_name_, rid, visible.data(), record_size_,
+                                p.offset, TYPE_FLOAT, n - o, 0, &mvcc_effective);
+                        }
+                    }
+                    if (!write_ok && set_clauses_.size() > 1 && !patches.empty()) {
                         write_ok = context_->txn_mgr_->mvcc_write_col_patch(
                             context_->txn_, tab_name_, rid, visible.data(), record_size_, patches,
                             &mvcc_effective);
-                    } else {
+                    } else if (!write_ok) {
                         std::vector<char> mv_old(record_size_);
                         memcpy(mv_old.data(), visible.data(), record_size_);
                         std::vector<char> mv_new = mv_old;

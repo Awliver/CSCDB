@@ -137,6 +137,22 @@ static bool apply_col_patch_rebase(const MvccColPatch &p, const char *visible, c
                                    char *dest, int len, const TabMeta &meta) {
     if (p.offset + p.len > len) return false;
     if (!p.is_arith) {
+        if (p.type == TYPE_INT && p.len == (int)sizeof(int) &&
+            (int)p.abs_value.size() >= p.len) {
+            int o = *reinterpret_cast<const int *>(visible + p.offset);
+            int n = *reinterpret_cast<const int *>(p.abs_value.data());
+            int l = *reinterpret_cast<const int *>(latest + p.offset);
+            *reinterpret_cast<int *>(dest + p.offset) = l + (n - o);
+            return true;
+        }
+        if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float) &&
+            (int)p.abs_value.size() >= p.len) {
+            float o = *reinterpret_cast<const float *>(visible + p.offset);
+            float n = *reinterpret_cast<const float *>(p.abs_value.data());
+            float l = *reinterpret_cast<const float *>(latest + p.offset);
+            *reinterpret_cast<float *>(dest + p.offset) = l + (n - o);
+            return true;
+        }
         apply_col_patch_abs(p, dest);
         return true;
     }
@@ -400,15 +416,22 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 此时 had_writes 为假。若仅凭 had_writes/txn_mode 判定，会漏写 commit 记录 → 恢复时该事务
     // 被当作 loser 撤销，已提交数据丢失。凡产生过 redo 日志（prev_lsn 有效）必须落 commit 记录。
     const bool wrote_log = txn->get_prev_lsn() != INVALID_LSN;
-    if (log_manager != nullptr && (had_writes || txn->get_txn_mode() || wrote_log)) {
+    const bool need_commit_log =
+        log_manager != nullptr && (had_writes || txn->get_txn_mode() || wrote_log);
+    lsn_t commit_lsn = INVALID_LSN;
+    if (need_commit_log) {
         CommitLogRecord lr(txn->get_transaction_id());
-        lsn_t lsn = log_manager->add_log_to_buffer(&lr);
-        log_manager->wait_for_persist(lsn);
+        commit_lsn = log_manager->add_log_to_buffer(&lr);
+    }
+
+    // MVCC 版本与堆已物化后先放锁，再 wait_for_persist：减 district 行锁与组提交 fsync 重叠
+    if (lock_manager_ != nullptr) lock_manager_->unlock_all(txn);
+    if (need_commit_log) {
+        log_manager->wait_for_persist(commit_lsn);
     }
 
     if (txn->get_txn_mode() && active_explicit_count_.load() > 0) active_explicit_count_--;
     clear_pending_si_for_txn(txn);
-    if (lock_manager_ != nullptr) lock_manager_->unlock_all(txn);
     txn->si_overlays().clear();
     txn->set_state(TransactionState::COMMITTED);
 }
