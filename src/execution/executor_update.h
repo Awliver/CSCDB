@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <algorithm>
+
 #include "execution_defs.h"
 #include "common/output_control.h"
 #include "execution_manager.h"
@@ -145,7 +147,12 @@ class UpdateExecutor : public AbstractExecutor {
      * @description: 遍历所有匹配的 rid，对每条记录应用 SET 修改后写回
      */
     std::unique_ptr<RmRecord> Next() override {
-        for (const auto &rid : rids_) {
+        std::vector<Rid> ordered = rids_;
+        std::sort(ordered.begin(), ordered.end(), [](const Rid &a, const Rid &b) {
+            if (a.page_no != b.page_no) return a.page_no < b.page_no;
+            return a.slot_no < b.slot_no;
+        });
+        for (const auto &rid : ordered) {
             char *slot = get_slot_ptr(rid);
             std::vector<char> orig_rec(slot, slot + record_size_);
             const bool mvcc_path = context_ && context_->txn_mgr_ && context_->txn_ &&
@@ -155,7 +162,10 @@ class UpdateExecutor : public AbstractExecutor {
             // 显式事务 MVCC 写：行锁与 delete 对称，持有到 commit/abort
             if (context_ && context_->lock_mgr_ && context_->txn_ && context_->txn_->get_txn_mode() &&
                 mvcc_path) {
-                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+                if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+                }
             }
 
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本

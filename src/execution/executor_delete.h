@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <algorithm>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -79,7 +81,12 @@ class DeleteExecutor : public AbstractExecutor {
         // 重插行总在末尾)不一致。差分测试已证实该行序分歧。
         bool versioning = context_ && context_->txn_mgr_ && context_->txn_ &&
                           context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
-        for (const auto &rid : rids_) {
+        std::vector<Rid> ordered = rids_;
+        std::sort(ordered.begin(), ordered.end(), [](const Rid &a, const Rid &b) {
+            if (a.page_no != b.page_no) return a.page_no < b.page_no;
+            return a.slot_no < b.slot_no;
+        });
+        for (const auto &rid : ordered) {
             cache_page(rid.page_no);
             char *slot = cached_slots_ + rid.slot_no * record_size_;
 
@@ -87,7 +94,10 @@ class DeleteExecutor : public AbstractExecutor {
             if (versioning) {
                 // 显式事务：行锁持有到 commit/abort（与 update 对称，语句尾不 unlock）
                 if (context_->lock_mgr_ && context_->txn_->get_txn_mode()) {
-                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+                    if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                        AbortReason::DEADLOCK_PREVENTION);
+                    }
                 }
                 if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
                                                     slot, nullptr, record_size_, true)) {

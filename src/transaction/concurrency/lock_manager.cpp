@@ -47,6 +47,10 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     std::unique_lock<std::mutex> lk(entry.mtx);
     txn_id_t me = txn->get_transaction_id();
     while (entry.owner != INVALID_TXN_ID && entry.owner != me) {
+        // wait-die：仅老事务等年轻持有者；年轻事务直接放弃，避免 wait-for 环
+        if (me > entry.owner) {
+            return false;
+        }
         entry.cv.wait(lk);
     }
     entry.owner = me;
