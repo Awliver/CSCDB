@@ -10,10 +10,11 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <mutex>
 #include <condition_variable>
-#include <unordered_map>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -47,7 +48,7 @@ class LockManager {
     struct RecordLockEntry {
         std::mutex mtx;
         std::condition_variable cv;
-        txn_id_t owner = INVALID_TXN_ID;
+        txn_id_t owner = INVALID_TXN_ID;  // 排他持有者；INVALID 表示空闲
     };
 
 public:
@@ -74,7 +75,17 @@ public:
 private:
     RecordLockEntry &get_record_lock(const LockDataId &id);
 
+    bool detect_deadlock_victim(txn_id_t start, txn_id_t &victim);
+    void mark_victim_abort(txn_id_t victim);
+    void clear_wfg_state(txn_id_t txn);
+
     std::mutex latch_;      // 用于锁表的并发
     std::unordered_map<LockDataId, LockRequestQueue> lock_table_;   // 全局锁表
     std::unordered_map<LockDataId, std::unique_ptr<RecordLockEntry>> record_locks_;
+
+    // WFG：wait_for_[T]=H 表示 T 等 H 的行锁；成环时 abort 环内 txn_id 最大者
+    std::mutex wfg_latch_;
+    std::unordered_map<txn_id_t, txn_id_t> wait_for_;
+    std::unordered_map<txn_id_t, RecordLockEntry *> waiting_on_entry_;  // 等锁方 → 正在等的 entry
+    std::unordered_map<txn_id_t, Transaction *> waiting_txn_;           // 供牺牲者打 abort 标记
 };

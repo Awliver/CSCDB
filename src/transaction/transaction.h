@@ -109,6 +109,10 @@ class Transaction {
 
     inline std::shared_ptr<std::unordered_set<LockDataId>> get_lock_set() { return lock_set_; }
 
+    inline void request_lock_abort() { lock_abort_.store(true, std::memory_order_release); }
+    inline bool lock_abort_requested() const { return lock_abort_.load(std::memory_order_acquire); }
+    inline void clear_lock_abort() { lock_abort_.store(false, std::memory_order_release); }
+
     inline timestamp_t get_read_ts() const { return read_ts_; }
     inline timestamp_t get_commit_ts() const { return commit_ts_; }
     inline void set_read_ts(timestamp_t read_ts) { read_ts_ = read_ts; }
@@ -173,6 +177,7 @@ class Transaction {
     lsn_t prev_lsn_;                  // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
     txn_id_t txn_id_;                 // 事务的ID，唯一标识符
     timestamp_t start_ts_;            // 事务的开始时间戳
+    std::atomic<bool> lock_abort_{false};  // WFG 牺牲标记；LockManager 置位，等锁方读到后返回 false
 
     std::shared_ptr<std::deque<WriteRecord *>> write_set_;  // 事务包含的所有写操作
     std::shared_ptr<std::unordered_set<LockDataId>> lock_set_;  // 事务申请的所有锁
