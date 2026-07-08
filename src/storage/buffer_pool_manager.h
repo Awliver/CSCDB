@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <array>
 #include <cassert>
 #include <condition_variable>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -34,7 +35,7 @@ class BufferPoolManager {
     static constexpr size_t BPM_NSHARDS = 64;
 
     struct BpmShard {
-        std::shared_mutex latch_;           // 保护 page_table_ + 本分片 replacer_；读路径 shared、写/replacer unique
+        std::shared_mutex latch_;           // 保护 page_table_ + replacer_ + free_frames_；读路径 shared、写/replacer/free_frames_ unique
         std::mutex inflight_mtx_;
         std::condition_variable inflight_cv_;
         std::unordered_map<uint64_t, frame_id_t> page_table_;
@@ -42,20 +43,21 @@ class BufferPoolManager {
         // 本分片 LRU：仅存放“归属本分片(hash(page)%N==s)且 pin_count==0、非 I/O 中”的帧。
         // 所有 replacer 增删（pin/unpin/victim）必须在本分片 latch_ 下进行，故命中/unpin 热路径无全局锁。
         std::unique_ptr<Replacer> replacer_;
+        // 空闲帧（无页帧）按 frame_id % BPM_NSHARDS 静态分片持有，缺页/归还都只碰本分片
+        // latch_，不再需要一把全局锁——这是 evict 从"全局串行"改成"分片并发"的关键。
+        std::deque<frame_id_t> free_frames_;
     };
 
     size_t pool_size_;
     Page *pages_;
     std::unordered_map<PageId, frame_id_t, PageIdHash> page_table_; // 题一接口保留
-    std::list<frame_id_t> free_list_;          // 全局空闲帧（无页帧），由 evict_latch_ 保护
     DiskManager *disk_manager_;
-    std::mutex evict_latch_;                    // 仅冷路径：守护 free_list_ + 串行跨分片 victim 扫描
     std::mutex io_mutex_;
     std::condition_variable io_cv_;
     std::vector<bool> frame_io_inflight_;
     std::array<BpmShard, BPM_NSHARDS> shards_;
 
-    // 后台 Page Cleaner：free_list_ 偏低时刷 pin==0 脏页，减轻淘汰冷路径写盘。
+    // 后台 Page Cleaner：全局空闲帧总数偏低时刷 pin==0 脏页，减轻淘汰冷路径写盘。
     static constexpr int CLEANER_INTERVAL_MS = 20;
     static constexpr int CLEANER_BATCH = 256;
     std::thread cleaner_thread_;
@@ -86,7 +88,7 @@ class BufferPoolManager {
             shard.page_table_.reserve(pool_size_ / BPM_NSHARDS + 1);
         }
         for (size_t i = 0; i < pool_size_; ++i) {
-            free_list_.emplace_back(static_cast<frame_id_t>(i));
+            shards_[i % BPM_NSHARDS].free_frames_.push_back(static_cast<frame_id_t>(i));
         }
     }
 
@@ -117,9 +119,10 @@ class BufferPoolManager {
     void delete_all_pages(int fd);
 
    private:
-    // 调用方须持 evict_latch_。预占一个可用帧：优先全局空闲帧，否则从 pref_shard 起跨分片
-    // 扫描淘汰一个 victim。成功时帧已被预占（pin_count_=1、frame_io_inflight_=true），若该帧
-    // 此前承载页，则已从其所属分片 page_table_ 删除，并经 old_page_id/need_flush 返回落盘信息。
+    // 调用方无需持有任何全局锁：内部从 pref_shard 起逐个分片加各自 latch_ 尝试取帧
+    // （先看该分片 free_frames_，再看该分片 replacer_ 能否淘汰一个 victim）。成功时帧已被
+    // 预占（pin_count_=1、frame_io_inflight_=true），若该帧此前承载页，则已从其所属分片
+    // page_table_ 删除，并经 old_page_id/need_flush 返回落盘信息。
     bool reserve_victim_nolock(size_t pref_shard, frame_id_t* out_frame,
                                PageId* old_page_id, bool* need_flush);
 };

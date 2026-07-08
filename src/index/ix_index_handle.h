@@ -172,8 +172,15 @@ class IxIndexHandle {
     mutable std::shared_mutex root_latch_;      // 读 shared、写 unique，分裂/合并与扫描并发
     page_id_t cached_leaf_no_ = IX_NO_PAGE;     // 顺序追加插入缓存的最右叶页号，命中则跳过从根遍历
 
+    // 顺序插入落在同一叶时，把上次的 pin 一直攥着不放：命中时连 fetch_node 都不用调，
+    // 免了一次 BPM 往返。只要叶结构没变就一直有效；分裂/删除/析构都要放掉。
+    page_id_t pinned_leaf_no_ = IX_NO_PAGE;
+    Page *pinned_leaf_page_ = nullptr;
+    void release_pinned_leaf();
+
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
+    ~IxIndexHandle();
 
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);

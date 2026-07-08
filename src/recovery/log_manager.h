@@ -353,12 +353,12 @@ public:
 
     // 题10：以磁盘上既有日志长度初始化追加偏移（启动恢复后调用）
     void init_offset(long disk_bytes) {
-        std::scoped_lock<std::mutex> lock(latch_);
+        std::scoped_lock<std::mutex> lock(append_mtx_);
         total_offset_ = disk_bytes;
     }
     // 题10：当前日志总长（含缓冲区未刷部分）= 下一条记录的起始偏移
     long cur_offset() {
-        std::scoped_lock<std::mutex> lock(latch_);
+        std::scoped_lock<std::mutex> lock(append_mtx_);
         return total_offset_;
     }
 
@@ -366,24 +366,30 @@ private:
     void flush_worker();
 
     std::atomic<lsn_t> global_lsn_{0};  // 全局lsn，递增，用于为每条记录分发lsn
-    std::mutex latch_;                  // 保护双缓冲/lsn 元数据（IO 在锁外进行）
-    std::condition_variable cv_;         // 唤醒 flush worker
-    std::condition_variable persist_cv_; // 等待持久化的 committer
-    std::condition_variable space_cv_;   // active 缓冲满时等待换出的写日志者
+    std::atomic<bool> stop_{false};      // 两把锁都要看到，用 atomic 免得互相等锁
+
+    /* 锁拆分：append_mtx_ 只护"往缓冲区写"这条路径（add_log_to_buffer + worker 摘缓冲），
+     * persist_mtx_ 只护"等持久化"这条路径（persist_lsn_/requested_lsn_ + persist_cv_）。
+     * 拆开之前两者共用一把锁，高并发 commit 时一堆线程在 persist_cv_ 上排队醒来，
+     * 会跟正在写日志的线程抢同一把锁；分开后 commit 线程之间的排队不再挡 add_log。 */
+    std::mutex append_mtx_;
+    std::mutex persist_mtx_;
+    std::condition_variable cv_;         // 配 append_mtx_，唤醒 flush worker
+    std::condition_variable persist_cv_; // 配 persist_mtx_，唤醒等持久化的 committer
+    std::condition_variable space_cv_;   // 配 append_mtx_，active 缓冲满时等待换出的写日志者
     std::thread flush_thread_;
-    bool stop_{false};
-    bool flush_requested_{false};
+    bool flush_requested_{false};        // append_mtx_
     /* 双缓冲组提交：worker 把 active 换出后在【锁外】write+fsync，期间到达的日志
      * 进入新 active 排队——fsync 时长天然成为聚合窗口，一次 fsync 覆盖一批 commit。
      * 旧实现 write+fsync 在锁内：fsync 期间所有日志追加被锁死，每笔 commit 实付一次
      * fsync，慢盘上吞吐上限 = 1/fsync 延迟（OJ tpmC 天花板主因）。 */
-    LogBuffer bufs_[2];
-    int active_ = 0;                    // 当前接收写入的缓冲下标
-    lsn_t persist_lsn_ = INVALID_LSN;   // 记录已经持久化到磁盘中的最后一条日志的日志号
-    lsn_t requested_lsn_ = INVALID_LSN; // 被等待持久化的最大 lsn（只为它们 fsync——
+    LogBuffer bufs_[2];                 // append_mtx_
+    int active_ = 0;                    // append_mtx_，当前接收写入的缓冲下标
+    lsn_t persist_lsn_ = INVALID_LSN;   // persist_mtx_，已经持久化到磁盘的最后一条日志号
+    lsn_t requested_lsn_ = INVALID_LSN; // persist_mtx_，被等待持久化的最大 lsn（只为它们 fsync——
                                         // 无人等待时不刷，避免后台连续 fsync 抢占慢盘 IO）
-    int space_waiters_ = 0;             // 等待缓冲空间的写日志者数
-    long total_offset_ = 0;             // 题10：日志文件逻辑总长（磁盘已刷 + 缓冲未刷）
+    int space_waiters_ = 0;             // append_mtx_，等待缓冲空间的写日志者数
+    long total_offset_ = 0;             // append_mtx_，题10：日志文件逻辑总长（磁盘已刷 + 缓冲未刷）
     DiskManager* disk_manager_;
 };
 

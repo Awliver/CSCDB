@@ -45,8 +45,12 @@ void BufferPoolManager::cleaner_loop() {
             if (cleaner_stop_) break;
         }
         {
-            std::scoped_lock evict_lock(evict_latch_);
-            if (free_list_.size() >= low_water) continue;
+            size_t total_free = 0;
+            for (auto &sh : shards_) {
+                std::shared_lock<std::shared_mutex> lk(sh.latch_);
+                total_free += sh.free_frames_.size();
+            }
+            if (total_free >= low_water) continue;
         }
         int flushed = 0;
         for (size_t k = 0; k < BPM_NSHARDS && flushed < CLEANER_BATCH; ++k) {
@@ -91,26 +95,27 @@ void BufferPoolManager::cleaner_loop() {
 
 bool BufferPoolManager::reserve_victim_nolock(size_t pref_shard, frame_id_t* out_frame,
                                               PageId* old_page_id, bool* need_flush) {
-    // 1) 优先使用全局空闲帧（无页帧，无需落盘/换出）
-    if (!free_list_.empty()) {
-        frame_id_t f = free_list_.front();
-        free_list_.pop_front();
-        *out_frame = f;
-        *old_page_id = PageId{-1, INVALID_PAGE_ID};
-        *need_flush = false;
-        pages_[f].pin_count_ = 1;
-        std::scoped_lock io_lock(io_mutex_);
-        frame_io_inflight_[f] = true;
-        return true;
-    }
-    // 2) 跨分片扫描可淘汰帧（从 pref_shard 起以提升局部性）。
-    //    不变式：shards_[s].replacer_ 中的帧必承载 hash%N==s 的页且 pin_count==0、非 I/O 中。
+    // 从 pref_shard 起挨个分片找一个可用帧，每次只碰当前扫到的这一个分片的 latch_，
+    // 从不同时握两个分片的锁，因此不会跟别的线程反向扫描时互相等待。
+    // 不变式：shards_[s].replacer_ 中的帧必承载 hash%N==s 的页且 pin_count==0、非 I/O 中；
+    // shards_[s].free_frames_ 里的帧按 frame_id%N==s 静态划分，与页无关。
     for (size_t k = 0; k < BPM_NSHARDS; ++k) {
         size_t s = (pref_shard + k) % BPM_NSHARDS;
         BpmShard &sh = shards_[s];
         std::unique_lock<std::shared_mutex> lk(sh.latch_);
+        if (!sh.free_frames_.empty()) {
+            frame_id_t f = sh.free_frames_.front();
+            sh.free_frames_.pop_front();
+            *out_frame = f;
+            *old_page_id = PageId{-1, INVALID_PAGE_ID};
+            *need_flush = false;
+            pages_[f].pin_count_ = 1;
+            std::scoped_lock io_lock(io_mutex_);
+            frame_io_inflight_[f] = true;
+            return true;
+        }
         frame_id_t f;
-        if (!sh.replacer_->victim(&f)) continue;   // 本分片无可淘汰帧
+        if (!sh.replacer_->victim(&f)) continue;   // 本分片无可淘汰帧，试下一个
         Page &victim = pages_[f];
         *out_frame = f;
         *old_page_id = victim.id_;
@@ -183,21 +188,23 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             }
         }
         {
-            // 未命中：在全局 evict_latch_ 下预占 victim（冷路径）
-            std::scoped_lock evict_lock(evict_latch_);
-            {
-                std::scoped_lock infl_lock(shard.inflight_mtx_);
-                if (shard.page_io_inflight_.count(key)) continue;
-            }
+            // 未命中（冷路径）：占坑只碰本分片 inflight_mtx_，不再需要全局锁。占坑和查重
+            // 用同一把锁包起来，避免两个线程同时把这个 key 判定为"该我来淘汰换入"。
+            std::unique_lock<std::mutex> infl_lock(shard.inflight_mtx_);
+            if (shard.page_io_inflight_.count(key)) continue;
+            bool already_present;
             {
                 std::shared_lock<std::shared_mutex> lock(shard.latch_);
-                if (shard.page_table_.find(key) != shard.page_table_.end()) continue;
+                already_present = shard.page_table_.find(key) != shard.page_table_.end();
             }
-            if (!reserve_victim_nolock(si, &frame_id, &old_page_id, &need_flush_old)) return nullptr;
-            {
-                std::scoped_lock infl_lock(shard.inflight_mtx_);
-                shard.page_io_inflight_.insert(key);
-            }
+            if (already_present) continue;
+            shard.page_io_inflight_.insert(key);
+        }
+        if (!reserve_victim_nolock(si, &frame_id, &old_page_id, &need_flush_old)) {
+            std::scoped_lock infl_lock(shard.inflight_mtx_);
+            shard.page_io_inflight_.erase(key);
+            shard.inflight_cv_.notify_all();
+            return nullptr;
         }
         break;
     }
@@ -208,12 +215,15 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
         disk_manager_->read_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
     } catch (...) {
-        std::scoped_lock evict_lock(evict_latch_);
         Page &victim = pages_[frame_id];
         victim.id_ = PageId{-1, INVALID_PAGE_ID};
         victim.pin_count_ = 0;
         victim.is_dirty_ = false;
-        free_list_.push_back(frame_id);
+        {
+            BpmShard &fshard = shards_[frame_id % BPM_NSHARDS];
+            std::unique_lock<std::shared_mutex> flock(fshard.latch_);
+            fshard.free_frames_.push_back(frame_id);
+        }
         {
             std::scoped_lock io_lock(io_mutex_);
             frame_io_inflight_[frame_id] = false;
@@ -282,10 +292,9 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     frame_id_t frame_id = INVALID_FRAME_ID;
     PageId old_page_id{-1, INVALID_PAGE_ID};
     bool need_flush_old = false;
-    {
-        std::scoped_lock evict_lock(evict_latch_);
-        if (!reserve_victim_nolock(si, &frame_id, &old_page_id, &need_flush_old)) return nullptr;
-    }
+    // page_id 刚分配、尚未进任何分片 page_table_，不会有别的线程盯着同一个 key 抢，
+    // 不需要像 fetch_page 那样先占 inflight 位再淘汰。
+    if (!reserve_victim_nolock(si, &frame_id, &old_page_id, &need_flush_old)) return nullptr;
     // 锁外刷旧脏页（与 fetch_page 一致的 WAL 顺序：先 flush_log 再写数据页）
     if (need_flush_old) {
         if (g_log_manager) g_log_manager->flush_log_to_disk();
@@ -340,8 +349,9 @@ bool BufferPoolManager::delete_page(PageId page_id) {
         disk_manager_->write_page(flush_id.fd, flush_id.page_no, flush_buf, PAGE_SIZE);
     }
     {
-        std::scoped_lock evict_lock(evict_latch_);
-        free_list_.push_back(frame_id);
+        BpmShard &fshard = shards_[frame_id % BPM_NSHARDS];
+        std::unique_lock<std::shared_mutex> flock(fshard.latch_);
+        fshard.free_frames_.push_back(frame_id);
     }
     return true;
 }
@@ -384,10 +394,9 @@ void BufferPoolManager::delete_all_pages(int fd) {
             it = shard.page_table_.erase(it);
         }
     }
-    if (!freed.empty()) {
-        std::scoped_lock evict_lock(evict_latch_);
-        for (frame_id_t frame_id : freed) {
-            free_list_.push_back(frame_id);
-        }
+    for (frame_id_t frame_id : freed) {
+        BpmShard &fshard = shards_[frame_id % BPM_NSHARDS];
+        std::unique_lock<std::shared_mutex> flock(fshard.latch_);
+        fshard.free_frames_.push_back(frame_id);
     }
 }

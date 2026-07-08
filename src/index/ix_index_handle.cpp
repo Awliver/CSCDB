@@ -171,6 +171,21 @@ IxIndexHandle::IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffe
     disk_manager_->set_fd2pageno(fd, now_page_no + 1);
 }
 
+IxIndexHandle::~IxIndexHandle() {
+    release_pinned_leaf();
+}
+
+// 放掉顺序插入长期攥着的那个叶页 pin（如果有）。close_index 在此之前已经
+// delete_all_pages 强制清空过这个 fd 的所有页，此时 unpin_page 找不到页会直接
+// 返回 false，是安全的空操作。
+void IxIndexHandle::release_pinned_leaf() {
+    if (pinned_leaf_page_ != nullptr) {
+        buffer_pool_manager_->unpin_page(pinned_leaf_page_->get_page_id(), true);
+        pinned_leaf_page_ = nullptr;
+        pinned_leaf_no_ = IX_NO_PAGE;
+    }
+}
+
 /**
  * @brief 用于查找指定键所在的叶子结点
  * @param key 要查找的目标key值
@@ -330,17 +345,30 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
     std::unique_lock<std::shared_mutex> lock(root_latch_);
 
-    // 顺序追加快路径：缓存的叶仍是最右叶且 key 不小于其首 key 时，落点必在此叶，
-    // 直接取它（一次页查找）跳过从根逐层遍历；否则回退正常查找
+    // 顺序追加快路径：缓存的叶仍是最右叶且 key 不小于其首 key 时，落点必在此叶。
+    // 若上次那页的 pin 还攥着（pinned_leaf_no_ 命中），直接用，连 fetch_node 都省了；
+    // 否则退化成"只查一次页"（跳过从根逐层遍历），仍比整树查找快。
     IxNodeHandle *leaf = nullptr;
+    bool leaf_pin_owned_by_cache = false;   // leaf 用的是 pinned_leaf_page_ 那份 pin，末尾不能常规 unpin
     if (cached_leaf_no_ != IX_NO_PAGE && cached_leaf_no_ == file_hdr_->last_leaf_) {
-        IxNodeHandle *c = fetch_node(cached_leaf_no_);
-        if (c->is_leaf_page() && c->get_size() > 0 &&
-            ix_compare(key, c->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) >= 0) {
-            leaf = c;
+        if (pinned_leaf_no_ == cached_leaf_no_ && pinned_leaf_page_ != nullptr) {
+            IxNodeHandle *c = new IxNodeHandle(file_hdr_, pinned_leaf_page_);
+            if (c->is_leaf_page() && c->get_size() > 0 &&
+                ix_compare(key, c->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) >= 0) {
+                leaf = c;
+                leaf_pin_owned_by_cache = true;
+            } else {
+                delete c;   // 不 unpin：这页仍是 pinned_leaf_page_，pin 继续留着
+            }
         } else {
-            buffer_pool_manager_->unpin_page(c->get_page_id(), false);
-            delete c;
+            IxNodeHandle *c = fetch_node(cached_leaf_no_);
+            if (c->is_leaf_page() && c->get_size() > 0 &&
+                ix_compare(key, c->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) >= 0) {
+                leaf = c;
+            } else {
+                buffer_pool_manager_->unpin_page(c->get_page_id(), false);
+                delete c;
+            }
         }
     }
     if (leaf == nullptr) {
@@ -351,8 +379,10 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     page_id_t leaf_page = leaf->get_page_no();
 
     if (new_size == old_size) {
-        // 重复 key，未插入（唯一索引语义）
-        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        // 重复 key，未插入（唯一索引语义）；没碰这页，是长期 pin 就什么都不用做
+        if (!leaf_pin_owned_by_cache) {
+            buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        }
         delete leaf;
         return leaf_page;
     }
@@ -364,17 +394,32 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
 
     // 满了则分裂并把新节点上插
     if (new_size >= leaf->get_max_size()) {
+        // 分裂改变了旧叶结构，不能再长期攥着它的 pin：先清掉记录，底下的
+        // unpin_page(leaf, ...) 会把这份 pin 正常还回去，不会重复 unpin。
+        if (leaf_pin_owned_by_cache) {
+            pinned_leaf_no_ = IX_NO_PAGE;
+            pinned_leaf_page_ = nullptr;
+        }
         IxNodeHandle *new_leaf = split(leaf);
         insert_into_parent(leaf, new_leaf->get_key(0), new_leaf, transaction);
         buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
         delete new_leaf;
         cached_leaf_no_ = file_hdr_->last_leaf_;   // 分裂改变了最右叶，缓存指向新的最右叶
+
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+        delete leaf;
     } else {
         cached_leaf_no_ = leaf_page;               // 记住本次落点叶，供下次顺序插入复用
+        if (leaf_pin_owned_by_cache) {
+            delete leaf;    // 同一份 pin 继续留着，只删这次用的包装对象
+        } else {
+            // 换到了新叶：先放掉旧的长期 pin，再把这次 fetch 到的 pin 转交出去（不 unpin）
+            release_pinned_leaf();
+            pinned_leaf_no_ = leaf_page;
+            pinned_leaf_page_ = leaf->page;
+            delete leaf;
+        }
     }
-
-    buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
-    delete leaf;
     return leaf_page;
 }
 
@@ -386,6 +431,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
     std::unique_lock<std::shared_mutex> lock(root_latch_);
     cached_leaf_no_ = IX_NO_PAGE;   // 删除可能合并/重分配改变叶结构，作废顺序插入缓存
+    release_pinned_leaf();         // 同时放掉顺序插入长期攥着的 pin，避免和 coalesce/redistribute 冲突
 
     auto [leaf, _] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
