@@ -392,11 +392,14 @@ private:
     long total_offset_ = 0;             // append_mtx_，题10：日志文件逻辑总长（磁盘已刷 + 缓冲未刷）
     DiskManager* disk_manager_;
 
-    /* S5.2：组提交微批窗口（微秒）。默认非零开启（OJ 评测机启动 rmdb 时大概率无法注入
-     * 自定义环境变量，若默认关闭则这项优化永远不会在评测环境生效）；仍可用
-     * RMDB_GROUP_COMMIT_WINDOW_US 覆盖（设 0 显式关闭，本地 A/B 用）。
+    /* S5.2：组提交微批窗口（微秒）。2026-07-09 曾把默认改成硬编码 80，
+     * 上线后 OJ tpmC 从 ~950 掉到 ~800——本机裸机 sleep_for 精度好测不出问题，
+     * OJ 判题机大概率是虚拟化/共享环境，sleep_for(80us) 实际唤醒延迟可能是
+     * 几百微秒到毫秒级，而 first_round 几乎每个刷盘批次都会触发一次，等于
+     * 给几乎每次 commit 都加了一次不可控的调度延迟税。已回退默认关闭（0），
+     * 只能靠 RMDB_GROUP_COMMIT_WINDOW_US 显式开启做受控实验，不再默认生效。
      * 只读，构造后不再修改，flush_worker 里访问不用加锁。 */
-    long group_commit_window_us_ = 80;
+    long group_commit_window_us_ = 0;
 };
 
 // 题10：全局日志管理器指针——缓冲池在把任意脏页写盘前先刷日志（WAL 顺序）
