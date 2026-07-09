@@ -9,12 +9,23 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
 #include "log_manager.h"
 
 LogManager* g_log_manager = nullptr;
 
 LogManager::LogManager(DiskManager* disk_manager) {
     disk_manager_ = disk_manager;
+    // S5.2：默认窗口见成员声明处注释；env 存在且能解析出合法非负整数时覆盖
+    // （允许显式设 0 关闭，本地 A/B 用；env 缺失/非法时维持代码默认值）。
+    if (const char* env = std::getenv("RMDB_GROUP_COMMIT_WINDOW_US")) {
+        char* end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env && v >= 0) {
+            group_commit_window_us_ = v;
+        }
+    }
     flush_thread_ = std::thread(&LogManager::flush_worker, this);
 }
 
@@ -98,6 +109,7 @@ void LogManager::flush_worker() {
     while (true) {
         cv_.wait(lock, [&] { return stop_.load() || flush_requested_; });
         flush_requested_ = false;
+        bool first_round = true;   // S5.2：只在本批第一轮判断是否微批等待，避免变成无差别后台 fsync
         while (bufs_[active_].offset_ > 0) {
             // 只为"有人等待"的目标刷盘：有 committer 等 lsn、有写者等缓冲空间、或正在停机。
             // 不做无差别排空——否则语句日志一到就被后台连续 fsync，慢盘上抢占数据页 IO
@@ -108,6 +120,21 @@ void LogManager::flush_worker() {
                 need_flush = persist_lsn_ < requested_lsn_;
             }
             if (!need_flush && space_waiters_ == 0 && !stop_.load()) break;
+
+            // S5.2 微批：worker 刚从空闲被唤醒（本批第一轮）、确有 committer 在等、
+            // 且不是被"缓冲写满"逼着刷（space_waiters_==0）时，先放开 append_mtx_
+            // 睡一个短窗口，让几乎同时到达的其它 commit 把 requested_lsn_ 再抬高，
+            // 一次 fsync 覆盖更多 commit。仅本批第一轮生效；同一批内后续因缓冲写满
+            // 或仍有等待者触发的续轮不再等，防止退化成无差别后台 fsync。
+            if (first_round && group_commit_window_us_ > 0 && need_flush &&
+                space_waiters_ == 0 && !stop_.load()) {
+                first_round = false;
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(group_commit_window_us_));
+                lock.lock();
+                continue;   // 重新评估 need_flush/space_waiters_（窗口内可能有新请求或 stop_）
+            }
+            first_round = false;
             int fl = active_;
             active_ ^= 1;                       // 单 worker 串行 ⇒ 换入的缓冲此刻必为空
             lsn_t target = global_lsn_.load() - 1;
