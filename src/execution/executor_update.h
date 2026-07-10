@@ -325,15 +325,21 @@ class UpdateExecutor : public AbstractExecutor {
             }
             }
 
-            // 题10 WAL：记录更新前后镜像
+            // 题10 WAL：优先写增量差分；省不到 1/3 或段过多则回退全量镜像
             if (context_ && context_->log_mgr_ && context_->txn_) {
-                RmRecord old_rec(record_size_), new_rec(record_size_);
-                memcpy(old_rec.data, orig_rec.data(), record_size_);
-                if (mvcc_path) memcpy(new_rec.data, mvcc_effective.data(), record_size_);
-                else memcpy(new_rec.data, slot, record_size_);
+                const char* new_ptr = mvcc_path ? mvcc_effective.data() : slot;
                 Rid r = rid;
-                UpdateLogRecord lr(context_->txn_->get_transaction_id(), old_rec, new_rec, r, tab_name_);
-                context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+                UpdateDeltaLogRecord dlr(context_->txn_->get_transaction_id(),
+                                        orig_rec.data(), new_ptr, record_size_, r, tab_name_);
+                if (dlr.useful()) {
+                    context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&dlr));
+                } else {
+                    RmRecord old_rec(record_size_), new_rec(record_size_);
+                    memcpy(old_rec.data, orig_rec.data(), record_size_);
+                    memcpy(new_rec.data, new_ptr, record_size_);
+                    UpdateLogRecord lr(context_->txn_->get_transaction_id(), old_rec, new_rec, r, tab_name_);
+                    context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+                }
             }
 
             if (context_ && context_->txn_ && context_->txn_mgr_ &&
