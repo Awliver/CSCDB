@@ -31,6 +31,10 @@ struct PendingOp {
     Rid rid;
     std::string old_data;   // DELETE/UPDATE 的旧值
     std::string new_data;   // INSERT/UPDATE 的新值
+    // P2：UPDATE_DELTA 的差异段（redo 用 new，undo 用 old）
+    std::vector<WalDiffRange> delta_ranges;
+    std::vector<std::string> delta_old;
+    std::vector<std::string> delta_new;
 };
 
 class RecoveryManager {
@@ -51,6 +55,8 @@ public:
 private:
     // 从 offset 读出一条完整日志到 scratch；返回总长，0 表示到尾/截断
     int read_one(long offset, std::vector<char>& scratch);
+    // P1：读并校验一批；成功返回 12+len，失败返回 0
+    int read_batch(long offset, long& body_off, uint32_t& body_len);
     RmFileHandle* table_fh(const std::string& tab);
     void ensure_pages(RmFileHandle* fh, int page_no);
     void apply_insert(RmFileHandle* fh, const Rid& rid, const char* data);
@@ -72,6 +78,7 @@ private:
 
     long start_offset_ = 0;                                         // 扫描起点（restart 文件）
     long log_end_ = 0;                                              // 有效日志终点
+    bool use_batch_ = false;                                        // P1：是否批帧格式
     std::unordered_set<txn_id_t> committed_;                        // redo list
     std::map<txn_id_t, std::vector<PendingOp>> uncommitted_;        // undo list（操作按记录序）
     bool touched_ = false;                                          // 本次恢复是否有重放动作

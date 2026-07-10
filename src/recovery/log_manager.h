@@ -15,9 +15,24 @@ See the Mulan PSL v2 for more details. */
 #include <thread>
 #include <vector>
 #include <iostream>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
 #include "log_defs.h"
 #include "common/config.h"
 #include "record/rm_defs.h"
+
+/* P0：WAL 管道统计（relaxed atomic，常开；RMDB_WAL_STATS=1 时 flush 线程每 10s 打一行） */
+struct WalStats {
+    std::atomic<uint64_t> n_fsync{0};
+    std::atomic<uint64_t> fsync_us_total{0};
+    std::atomic<uint64_t> fsync_us_max{0};
+    std::atomic<uint64_t> n_bytes{0};
+    std::atomic<uint64_t> n_batches{0};
+    std::atomic<uint64_t> n_commit_waits{0};  // wait_for_persist 慢路径进入次数
+    // fsync 延迟桶：<1 / 1-5 / 5-10 / 10-20 / 20-50 / >50 ms
+    std::atomic<uint64_t> lat_bucket[6]{};
+};
 
 /* 日志记录对应操作的类型 */
 enum LogType: int {
@@ -27,7 +42,8 @@ enum LogType: int {
     begin,
     commit,
     ABORT,
-    CKPT        // 题10：静态检查点记录
+    CKPT,           // 题10：静态检查点记录
+    UPDATE_DELTA    // P2：update 字节差分增量日志
 };
 static std::string LogTypeStr[] = {
     "UPDATE",
@@ -36,8 +52,49 @@ static std::string LogTypeStr[] = {
     "BEGIN",
     "COMMIT",
     "ABORT",
-    "CKPT"
+    "CKPT",
+    "UPDATE_DELTA"
 };
+
+/* P2：字节差分段（最多 8 段） */
+struct WalDiffRange {
+    uint16_t off = 0;
+    uint16_t len = 0;
+};
+
+/* 扫 old/new，合并连续差异（间隙 ≤8B 并入同段）；返回段数，>8 返回 -1 */
+inline int wal_byte_diff(const char* a, const char* b, int n, WalDiffRange out[8]) {
+    int nr = 0;
+    int i = 0;
+    while (i < n) {
+        while (i < n && a[i] == b[i]) i++;
+        if (i >= n) break;
+        int start = i;
+        int end = i + 1;
+        while (end < n) {
+            if (a[end] != b[end]) {
+                end++;
+                continue;
+            }
+            // 相同字节：若后续 8B 内还有差异则吞掉间隙
+            int look = end;
+            int gap_end = end + 8 < n ? end + 8 : n;
+            bool more = false;
+            while (look < gap_end) {
+                if (a[look] != b[look]) { more = true; break; }
+                look++;
+            }
+            if (!more) break;
+            end = look + 1;
+        }
+        if (nr >= 8) return -1;
+        out[nr].off = (uint16_t)start;
+        out[nr].len = (uint16_t)(end - start);
+        nr++;
+        i = end;
+    }
+    return nr;
+}
 
 class LogRecord {
 public:
@@ -320,6 +377,118 @@ public:
     size_t table_name_size_;
 };
 
+/* P2：update 增量日志 —— 仅存差异字节段（old/new 各一份）
+ * payload: u8 tab_len | name | Rid | u8 n_ranges |
+ *          n × { u16 off, u16 len, old[len], new[len] } */
+class UpdateDeltaLogRecord: public LogRecord {
+public:
+    static constexpr int MAX_RANGES = 8;
+
+    UpdateDeltaLogRecord() {
+        log_type_ = LogType::UPDATE_DELTA;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        prev_lsn_ = INVALID_LSN;
+        table_name_ = nullptr;
+        table_name_size_ = 0;
+        n_ranges_ = 0;
+        memset(ranges_, 0, sizeof(ranges_));
+        memset(old_ptrs_, 0, sizeof(old_ptrs_));
+        memset(new_ptrs_, 0, sizeof(new_ptrs_));
+    }
+
+    /* 从全行 old/new 构造；若不宜用增量则 ranges 为空（调用方应回退全量） */
+    UpdateDeltaLogRecord(txn_id_t txn_id, const char* old_data, const char* new_data, int rec_size,
+                         Rid& rid, const std::string& table_name)
+        : UpdateDeltaLogRecord() {
+        log_tid_ = txn_id;
+        rid_ = rid;
+        table_name_size_ = table_name.length();
+        if (table_name_size_ > 255) table_name_size_ = 255;
+        table_name_ = new char[table_name_size_];
+        memcpy(table_name_, table_name.c_str(), table_name_size_);
+
+        WalDiffRange diffs[MAX_RANGES];
+        int nr = wal_byte_diff(old_data, new_data, rec_size, diffs);
+        if (nr <= 0) {
+            // 无差异或段过多：保持 n_ranges_=0，调用方回退
+            return;
+        }
+        // 估算增量 payload vs 全量（old+new 各 rec_size + 两 size_t 表名等粗算）
+        int delta_payload = 1 + (int)table_name_size_ + (int)sizeof(Rid) + 1;
+        for (int i = 0; i < nr; i++) delta_payload += 4 + 2 * diffs[i].len;
+        int full_payload = 2 * (int)sizeof(int) + 2 * rec_size + (int)sizeof(Rid)
+                           + (int)sizeof(size_t) + (int)table_name_size_;
+        if (delta_payload >= full_payload * 2 / 3) {
+            return;  // 省不到 1/3，回退全量
+        }
+
+        n_ranges_ = (uint8_t)nr;
+        log_tot_len_ = LOG_HEADER_SIZE + delta_payload;
+        for (int i = 0; i < nr; i++) {
+            ranges_[i] = diffs[i];
+            old_ptrs_[i] = new char[diffs[i].len];
+            new_ptrs_[i] = new char[diffs[i].len];
+            memcpy(old_ptrs_[i], old_data + diffs[i].off, diffs[i].len);
+            memcpy(new_ptrs_[i], new_data + diffs[i].off, diffs[i].len);
+        }
+    }
+
+    ~UpdateDeltaLogRecord() {
+        delete[] table_name_;
+        for (int i = 0; i < MAX_RANGES; i++) {
+            delete[] old_ptrs_[i];
+            delete[] new_ptrs_[i];
+        }
+    }
+
+    bool useful() const { return n_ranges_ > 0; }
+
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        uint8_t tlen = (uint8_t)table_name_size_;
+        memcpy(dest + offset, &tlen, 1); offset += 1;
+        memcpy(dest + offset, table_name_, table_name_size_); offset += (int)table_name_size_;
+        memcpy(dest + offset, &rid_, sizeof(Rid)); offset += sizeof(Rid);
+        memcpy(dest + offset, &n_ranges_, 1); offset += 1;
+        for (int i = 0; i < n_ranges_; i++) {
+            memcpy(dest + offset, &ranges_[i].off, 2); offset += 2;
+            memcpy(dest + offset, &ranges_[i].len, 2); offset += 2;
+            memcpy(dest + offset, old_ptrs_[i], ranges_[i].len); offset += ranges_[i].len;
+            memcpy(dest + offset, new_ptrs_[i], ranges_[i].len); offset += ranges_[i].len;
+        }
+    }
+
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        uint8_t tlen = *reinterpret_cast<const uint8_t*>(src + offset); offset += 1;
+        table_name_size_ = tlen;
+        table_name_ = new char[table_name_size_];
+        memcpy(table_name_, src + offset, table_name_size_); offset += (int)table_name_size_;
+        rid_ = *reinterpret_cast<const Rid*>(src + offset); offset += sizeof(Rid);
+        n_ranges_ = *reinterpret_cast<const uint8_t*>(src + offset); offset += 1;
+        for (int i = 0; i < n_ranges_; i++) {
+            ranges_[i].off = *reinterpret_cast<const uint16_t*>(src + offset); offset += 2;
+            ranges_[i].len = *reinterpret_cast<const uint16_t*>(src + offset); offset += 2;
+            old_ptrs_[i] = new char[ranges_[i].len];
+            new_ptrs_[i] = new char[ranges_[i].len];
+            memcpy(old_ptrs_[i], src + offset, ranges_[i].len); offset += ranges_[i].len;
+            memcpy(new_ptrs_[i], src + offset, ranges_[i].len); offset += ranges_[i].len;
+        }
+    }
+
+    Rid rid_;
+    char* table_name_;
+    size_t table_name_size_;
+    uint8_t n_ranges_;
+    WalDiffRange ranges_[MAX_RANGES];
+    char* old_ptrs_[MAX_RANGES];
+    char* new_ptrs_[MAX_RANGES];
+};
+
 /* 日志缓冲区，只有一个buffer，因此需要阻塞地去把日志写入缓冲区中 */
 
 class LogBuffer {
@@ -362,8 +531,11 @@ public:
         return total_offset_;
     }
 
+    WalStats& wal_stats() { return wal_stats_; }
+
 private:
     void flush_worker();
+    void dump_wal_stats(const char* tag);
 
     std::atomic<lsn_t> global_lsn_{0};  // 全局lsn，递增，用于为每条记录分发lsn
     std::atomic<bool> stop_{false};      // 两把锁都要看到，用 atomic 免得互相等锁
@@ -400,6 +572,17 @@ private:
      * 只能靠 RMDB_GROUP_COMMIT_WINDOW_US 显式开启做受控实验，不再默认生效。
      * 只读，构造后不再修改，flush_worker 里访问不用加锁。 */
     long group_commit_window_us_ = 0;
+
+    /* P3：字节/等待者阈值组提交（默认关）。与 S5.2 sleep_for 的区别：
+     * cv_.wait_until + 谓词，新 committer 的 notify 立刻打断；阈值满足零延迟开刷。
+     * RMDB_GC_WAITERS / RMDB_GC_BYTES / RMDB_GC_DEADLINE_US */
+    int gc_waiters_ = 0;            // ≥N 个 persist 等待者才刷；0=忽略
+    int gc_bytes_ = 0;              // 积压 ≥M 字节才刷；0=忽略
+    long gc_deadline_us_ = 200;     // 孤独 committer 最长等待
+    std::atomic<int> persist_waiters_{0};  // wait_for_persist 慢路径在途数
+
+    WalStats wal_stats_;
+    bool wal_stats_print_ = false;  // RMDB_WAL_STATS=1
 };
 
 // 题10：全局日志管理器指针——缓冲池在把任意脏页写盘前先刷日志（WAL 顺序）

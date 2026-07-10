@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "log_recovery.h"
+#include <cstdio>
 #include <fstream>
 #include <unistd.h>
 #include "record/rm_defs.h"
@@ -19,7 +20,10 @@ See the Mulan PSL v2 for more details. */
  *   该事务一旦 COMMIT 即丢弃暂存（内存只保留崩溃时未完成事务的操作）。
  * - redo：第二遍流式扫描，按日志序重放 redo list 事务的操作（物理镜像，幂等）。
  * - undo：对未完成事务暂存操作逆序撤销。
- * - 末尾重建全部索引（崩溃后索引文件不可信），并做一次内部检查点，使再次重启零扫描。 */
+ * - 末尾重建全部索引（崩溃后索引文件不可信），并做一次内部检查点，使再次重启零扫描。
+ *
+ * P1：日志按批帧落盘 [magic|len|crc|records...]。恢复外层按批推进，CRC 不过则整批丢弃；
+ * 批内仍用 per-record 解析。预分配后文件大小 ≠ 逻辑终点，不能再靠文件大小挡残尾。 */
 
 // 滚动缓冲:保证 [offset, offset+need) 可由连续内存返回;失败返回 nullptr
 const char* RecoveryManager::ensure_bytes(long offset, int need) {
@@ -49,6 +53,23 @@ int RecoveryManager::read_one(long offset, std::vector<char>& scratch) {
     if (rec == nullptr) return 0;
     scratch.assign(rec, rec + tot);
     return (int)tot;
+}
+
+int RecoveryManager::read_batch(long offset, long& body_off, uint32_t& body_len) {
+    if (offset + WAL_BATCH_HDR_SIZE > log_end_) return 0;
+    const char* hdr = ensure_bytes(offset, WAL_BATCH_HDR_SIZE);
+    if (hdr == nullptr) return 0;
+    uint32_t magic = *reinterpret_cast<const uint32_t*>(hdr + 0);
+    uint32_t blen = *reinterpret_cast<const uint32_t*>(hdr + 4);
+    uint32_t expect_crc = *reinterpret_cast<const uint32_t*>(hdr + 8);
+    if (magic != WAL_BATCH_MAGIC || blen == 0) return 0;
+    if (offset + WAL_BATCH_HDR_SIZE + (long)blen > log_end_) return 0;
+    const char* body = ensure_bytes(offset + WAL_BATCH_HDR_SIZE, (int)blen);
+    if (body == nullptr) return 0;
+    if (wal_crc32(body, blen) != expect_crc) return 0;
+    body_off = offset + WAL_BATCH_HDR_SIZE;
+    body_len = blen;
+    return WAL_BATCH_HDR_SIZE + (int)blen;
 }
 
 RmFileHandle* RecoveryManager::table_fh(const std::string& tab) {
@@ -96,14 +117,15 @@ void RecoveryManager::analyze() {
     committed_.clear();
     uncommitted_.clear();
     touched_ = false;
+    use_batch_ = false;
 
     if (!disk_manager_->is_file(LOG_FILE_NAME)) {
         log_end_ = 0;
         return;
     }
+    // 物理大小（含预分配零尾）；逻辑终点由扫描决定
     log_end_ = disk_manager_->get_file_size(LOG_FILE_NAME);
 
-    // restart 文件：最近一次静态检查点记录之后的扫描起点
     start_offset_ = 0;
     std::ifstream rf("db.restart", std::ios::binary);
     if (rf) {
@@ -112,23 +134,31 @@ void RecoveryManager::analyze() {
         if (rf.gcount() == sizeof(off) && off >= 0 && off <= log_end_) start_offset_ = off;
     }
 
+    // 探测批帧格式；旧日志无 magic 则走遗留 per-record 路径
+    if (start_offset_ + WAL_BATCH_HDR_SIZE <= log_end_) {
+        const char* peek = ensure_bytes(start_offset_, WAL_BATCH_HDR_SIZE);
+        if (peek != nullptr &&
+            *reinterpret_cast<const uint32_t*>(peek) == WAL_BATCH_MAGIC) {
+            use_batch_ = true;
+        }
+    }
+
     std::vector<char> rec;
     long pos = start_offset_;
-    int len;
-    while ((len = read_one(pos, rec)) > 0) {
-        LogType type = *reinterpret_cast<const LogType*>(rec.data());
-        txn_id_t tid = *reinterpret_cast<const txn_id_t*>(rec.data() + OFFSET_LOG_TID);
+
+    auto handle_rec = [&](const char* data) {
+        LogType type = *reinterpret_cast<const LogType*>(data);
+        txn_id_t tid = *reinterpret_cast<const txn_id_t*>(data + OFFSET_LOG_TID);
         switch (type) {
             case LogType::commit:
                 committed_.insert(tid);
-                uncommitted_.erase(tid);     // 其操作交给 redo 流式重放
+                uncommitted_.erase(tid);
                 break;
             case LogType::ABORT:
-                // 运行期已就地回滚；其插入留存堆中需 undo，操作保留在 uncommitted_
                 break;
             case LogType::INSERT: {
                 InsertLogRecord lr;
-                lr.deserialize(rec.data());
+                lr.deserialize(data);
                 PendingOp op;
                 op.type = LogType::INSERT;
                 op.table.assign(lr.table_name_, lr.table_name_size_);
@@ -140,7 +170,7 @@ void RecoveryManager::analyze() {
             }
             case LogType::DELETE: {
                 DeleteLogRecord lr;
-                lr.deserialize(rec.data());
+                lr.deserialize(data);
                 PendingOp op;
                 op.type = LogType::DELETE;
                 op.table.assign(lr.table_name_, lr.table_name_size_);
@@ -152,7 +182,7 @@ void RecoveryManager::analyze() {
             }
             case LogType::UPDATE: {
                 UpdateLogRecord lr;
-                lr.deserialize(rec.data());
+                lr.deserialize(data);
                 PendingOp op;
                 op.type = LogType::UPDATE;
                 op.table.assign(lr.table_name_, lr.table_name_size_);
@@ -163,14 +193,53 @@ void RecoveryManager::analyze() {
                 delete[] lr.table_name_;
                 break;
             }
+            case LogType::UPDATE_DELTA: {
+                UpdateDeltaLogRecord lr;
+                lr.deserialize(data);
+                PendingOp op;
+                op.type = LogType::UPDATE_DELTA;
+                op.table.assign(lr.table_name_, lr.table_name_size_);
+                op.rid = lr.rid_;
+                for (int i = 0; i < lr.n_ranges_; i++) {
+                    op.delta_ranges.push_back(lr.ranges_[i]);
+                    op.delta_old.emplace_back(lr.old_ptrs_[i], lr.ranges_[i].len);
+                    op.delta_new.emplace_back(lr.new_ptrs_[i], lr.ranges_[i].len);
+                }
+                uncommitted_[tid].push_back(std::move(op));
+                break;
+            }
             case LogType::begin:
             case LogType::CKPT:
             default:
                 break;
         }
-        pos += len;
+    };
+
+    if (use_batch_) {
+        long body_off = 0;
+        uint32_t body_len = 0;
+        int span;
+        long file_end = log_end_;
+        while ((span = read_batch(pos, body_off, body_len)) > 0) {
+            log_end_ = body_off + body_len;  // 限制 read_one 在批内
+            long bpos = body_off;
+            int len;
+            while ((len = read_one(bpos, rec)) > 0) {
+                handle_rec(rec.data());
+                bpos += len;
+            }
+            log_end_ = file_end;
+            pos += span;
+        }
+        log_end_ = pos;
+    } else {
+        int len;
+        while ((len = read_one(pos, rec)) > 0) {
+            handle_rec(rec.data());
+            pos += len;
+        }
+        log_end_ = pos;
     }
-    log_end_ = pos;   // 有效日志终点（忽略截断尾）
 }
 
 /**
@@ -185,50 +254,97 @@ void RecoveryManager::redo() {
     if (committed_.empty()) return;
     std::vector<char> rec;
     long pos = start_offset_;
-    int len;
-    while (pos < log_end_ && (len = read_one(pos, rec)) > 0) {
-        LogType type = *reinterpret_cast<const LogType*>(rec.data());
-        txn_id_t tid = *reinterpret_cast<const txn_id_t*>(rec.data() + OFFSET_LOG_TID);
-        if (committed_.count(tid)) {
-            switch (type) {
-                case LogType::INSERT: {
-                    InsertLogRecord lr;
-                    lr.deserialize(rec.data());
-                    std::string tab(lr.table_name_, lr.table_name_size_);
-                    delete[] lr.table_name_;
-                    if (RmFileHandle* fh = table_fh(tab)) {
-                        apply_insert(fh, lr.rid_, lr.insert_value_.data);
-                        touched_ = true;
-                    }
-                    break;
+
+    auto redo_one = [&](const char* data) {
+        LogType type = *reinterpret_cast<const LogType*>(data);
+        txn_id_t tid = *reinterpret_cast<const txn_id_t*>(data + OFFSET_LOG_TID);
+        if (!committed_.count(tid)) return;
+        switch (type) {
+            case LogType::INSERT: {
+                InsertLogRecord lr;
+                lr.deserialize(data);
+                std::string tab(lr.table_name_, lr.table_name_size_);
+                delete[] lr.table_name_;
+                if (RmFileHandle* fh = table_fh(tab)) {
+                    apply_insert(fh, lr.rid_, lr.insert_value_.data);
+                    touched_ = true;
                 }
-                case LogType::DELETE: {
-                    DeleteLogRecord lr;
-                    lr.deserialize(rec.data());
-                    std::string tab(lr.table_name_, lr.table_name_size_);
-                    delete[] lr.table_name_;
-                    if (RmFileHandle* fh = table_fh(tab)) {
-                        apply_delete(fh, lr.rid_);
-                        touched_ = true;
-                    }
-                    break;
-                }
-                case LogType::UPDATE: {
-                    UpdateLogRecord lr;
-                    lr.deserialize(rec.data());
-                    std::string tab(lr.table_name_, lr.table_name_size_);
-                    delete[] lr.table_name_;
-                    if (RmFileHandle* fh = table_fh(tab)) {
-                        apply_update(fh, lr.rid_, lr.new_value_.data);
-                        touched_ = true;
-                    }
-                    break;
-                }
-                default:
-                    break;
+                break;
             }
+            case LogType::DELETE: {
+                DeleteLogRecord lr;
+                lr.deserialize(data);
+                std::string tab(lr.table_name_, lr.table_name_size_);
+                delete[] lr.table_name_;
+                if (RmFileHandle* fh = table_fh(tab)) {
+                    apply_delete(fh, lr.rid_);
+                    touched_ = true;
+                }
+                break;
+            }
+            case LogType::UPDATE: {
+                UpdateLogRecord lr;
+                lr.deserialize(data);
+                std::string tab(lr.table_name_, lr.table_name_size_);
+                delete[] lr.table_name_;
+                if (RmFileHandle* fh = table_fh(tab)) {
+                    apply_update(fh, lr.rid_, lr.new_value_.data);
+                    touched_ = true;
+                }
+                break;
+            }
+            case LogType::UPDATE_DELTA: {
+                UpdateDeltaLogRecord lr;
+                lr.deserialize(data);
+                std::string tab(lr.table_name_, lr.table_name_size_);
+                if (RmFileHandle* fh = table_fh(tab)) {
+                    ensure_pages(fh, lr.rid_.page_no);
+                    if (fh->is_record(lr.rid_)) {
+                        auto cur = fh->get_record(lr.rid_, nullptr);
+                        std::vector<char> buf(cur->data, cur->data + cur->size);
+                        for (int i = 0; i < lr.n_ranges_; i++) {
+                            if ((int)lr.ranges_[i].off + (int)lr.ranges_[i].len > (int)buf.size()) continue;
+                            memcpy(buf.data() + lr.ranges_[i].off, lr.new_ptrs_[i], lr.ranges_[i].len);
+                        }
+                        apply_update(fh, lr.rid_, buf.data());
+                        touched_ = true;
+                    } else {
+                        fprintf(stderr, "[recovery] UPDATE_DELTA redo: row missing %s(%d,%d)\n",
+                                tab.c_str(), lr.rid_.page_no, lr.rid_.slot_no);
+                    }
+                }
+                break;
+            }
+            default:
+                break;
         }
-        pos += len;
+    };
+
+    if (use_batch_) {
+        long file_end = log_end_;
+        // analyze 已把 log_end_ 收成逻辑终点；读批时需能读到该终点内的批头
+        // 批扫描用「逻辑终点」作上限即可（残缺批已在 analyze 丢弃）
+        long body_off = 0;
+        uint32_t body_len = 0;
+        int span;
+        while (pos < file_end && (span = read_batch(pos, body_off, body_len)) > 0) {
+            long saved = log_end_;
+            log_end_ = body_off + body_len;
+            long bpos = body_off;
+            int len;
+            while ((len = read_one(bpos, rec)) > 0) {
+                redo_one(rec.data());
+                bpos += len;
+            }
+            log_end_ = saved;
+            pos += span;
+        }
+    } else {
+        int len;
+        while (pos < log_end_ && (len = read_one(pos, rec)) > 0) {
+            redo_one(rec.data());
+            pos += len;
+        }
     }
 }
 
@@ -248,6 +364,23 @@ void RecoveryManager::undo_pass() {
                 case LogType::UPDATE:
                     apply_update(fh, it->rid, it->old_data.data());
                     break;
+                case LogType::UPDATE_DELTA: {
+                    ensure_pages(fh, it->rid.page_no);
+                    if (fh->is_record(it->rid)) {
+                        auto cur = fh->get_record(it->rid, nullptr);
+                        std::vector<char> buf(cur->data, cur->data + cur->size);
+                        for (size_t i = 0; i < it->delta_ranges.size(); i++) {
+                            auto& rg = it->delta_ranges[i];
+                            if ((int)rg.off + (int)rg.len > (int)buf.size()) continue;
+                            memcpy(buf.data() + rg.off, it->delta_old[i].data(), rg.len);
+                        }
+                        apply_update(fh, it->rid, buf.data());
+                    } else {
+                        fprintf(stderr, "[recovery] UPDATE_DELTA undo: row missing %s(%d,%d)\n",
+                                it->table.c_str(), it->rid.page_no, it->rid.slot_no);
+                    }
+                    break;
+                }
                 case LogType::DELETE:
                     // 题9 删除为纯逻辑（堆未动）；若曾被物理删且落盘，则重插旧值
                     ensure_pages(fh, it->rid.page_no);
@@ -271,11 +404,9 @@ void RecoveryManager::undo() {
 
     // 内部检查点：恢复完成的状态全量落盘并推进 restart 起点，使重复重启零扫描、幂等
     if (log_manager_ != nullptr) {
-        // 物理截断到有效终点：残留半条记录/垃圾尾不切除的话，
-        // 追加会把残桩夹在日志中间，未来全量扫描在此失步丢事务
-        if (disk_manager_->is_file(LOG_FILE_NAME) &&
-            disk_manager_->get_file_size(LOG_FILE_NAME) > log_end_) {
-            truncate(LOG_FILE_NAME.c_str(), (off_t)log_end_);
+        // 物理截断到有效终点：切除崩溃残尾 / 预分配零区；并重置预分配水位
+        if (disk_manager_->is_file(LOG_FILE_NAME)) {
+            disk_manager_->reset_log_prealloc(log_end_);
         }
         log_manager_->init_offset(log_end_);
         sm_manager_->do_checkpoint(log_manager_);

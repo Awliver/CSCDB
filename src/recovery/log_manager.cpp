@@ -11,9 +11,27 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
+#include <cstdio>
 #include "log_manager.h"
 
 LogManager* g_log_manager = nullptr;
+
+static inline void record_fsync_latency(WalStats& s, uint64_t us) {
+    s.n_fsync.fetch_add(1, std::memory_order_relaxed);
+    s.fsync_us_total.fetch_add(us, std::memory_order_relaxed);
+    uint64_t cur = s.fsync_us_max.load(std::memory_order_relaxed);
+    while (us > cur &&
+           !s.fsync_us_max.compare_exchange_weak(cur, us, std::memory_order_relaxed)) {
+    }
+    int bucket;
+    if (us < 1000) bucket = 0;
+    else if (us < 5000) bucket = 1;
+    else if (us < 10000) bucket = 2;
+    else if (us < 20000) bucket = 3;
+    else if (us < 50000) bucket = 4;
+    else bucket = 5;
+    s.lat_bucket[bucket].fetch_add(1, std::memory_order_relaxed);
+}
 
 LogManager::LogManager(DiskManager* disk_manager) {
     disk_manager_ = disk_manager;
@@ -26,7 +44,58 @@ LogManager::LogManager(DiskManager* disk_manager) {
             group_commit_window_us_ = v;
         }
     }
+    if (const char* env = std::getenv("RMDB_WAL_STATS")) {
+        wal_stats_print_ = (env[0] == '1' && env[1] == '\0');
+    }
+    // P3：阈值组提交（默认关；须 P0 显示 waits/fsync 低才值得开）
+    if (const char* env = std::getenv("RMDB_GC_WAITERS")) {
+        char* end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env && v >= 0 && v <= 1024) gc_waiters_ = (int)v;
+    }
+    if (const char* env = std::getenv("RMDB_GC_BYTES")) {
+        char* end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env && v >= 0 && v <= (1 << 30)) gc_bytes_ = (int)v;
+    }
+    if (const char* env = std::getenv("RMDB_GC_DEADLINE_US")) {
+        char* end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env && v >= 0) gc_deadline_us_ = v;
+    }
     flush_thread_ = std::thread(&LogManager::flush_worker, this);
+}
+
+void LogManager::dump_wal_stats(const char* tag) {
+    if (!wal_stats_print_) return;
+    uint64_t n_fsync = wal_stats_.n_fsync.load(std::memory_order_relaxed);
+    uint64_t fsync_us = wal_stats_.fsync_us_total.load(std::memory_order_relaxed);
+    uint64_t fsync_max = wal_stats_.fsync_us_max.load(std::memory_order_relaxed);
+    uint64_t n_bytes = wal_stats_.n_bytes.load(std::memory_order_relaxed);
+    uint64_t n_batches = wal_stats_.n_batches.load(std::memory_order_relaxed);
+    uint64_t n_waits = wal_stats_.n_commit_waits.load(std::memory_order_relaxed);
+    uint64_t avg_us = n_fsync ? fsync_us / n_fsync : 0;
+    double bytes_per_batch = n_batches ? (double)n_bytes / (double)n_batches : 0.0;
+    double waits_per_fsync = n_fsync ? (double)n_waits / (double)n_fsync : 0.0;
+    fprintf(stderr,
+            "[WAL_STATS %s] fsync=%llu avg_us=%llu max_us=%llu bytes=%llu batches=%llu "
+            "bytes/batch=%.0f commit_waits=%llu waits/fsync=%.2f "
+            "lat_ms[<1=%llu 1-5=%llu 5-10=%llu 10-20=%llu 20-50=%llu >50=%llu]\n",
+            tag,
+            (unsigned long long)n_fsync,
+            (unsigned long long)avg_us,
+            (unsigned long long)fsync_max,
+            (unsigned long long)n_bytes,
+            (unsigned long long)n_batches,
+            bytes_per_batch,
+            (unsigned long long)n_waits,
+            waits_per_fsync,
+            (unsigned long long)wal_stats_.lat_bucket[0].load(std::memory_order_relaxed),
+            (unsigned long long)wal_stats_.lat_bucket[1].load(std::memory_order_relaxed),
+            (unsigned long long)wal_stats_.lat_bucket[2].load(std::memory_order_relaxed),
+            (unsigned long long)wal_stats_.lat_bucket[3].load(std::memory_order_relaxed),
+            (unsigned long long)wal_stats_.lat_bucket[4].load(std::memory_order_relaxed),
+            (unsigned long long)wal_stats_.lat_bucket[5].load(std::memory_order_relaxed));
 }
 
 LogManager::~LogManager() {
@@ -39,6 +108,7 @@ LogManager::~LogManager() {
     space_cv_.notify_all();
     persist_cv_.notify_all();
     if (flush_thread_.joinable()) flush_thread_.join();
+    dump_wal_stats("shutdown");
 }
 
 /**
@@ -93,11 +163,15 @@ void LogManager::flush_log_to_disk() {
 void LogManager::wait_for_persist(lsn_t target_lsn) {
     std::unique_lock<std::mutex> plock(persist_mtx_);
     if (persist_lsn_ >= target_lsn) return;
+    // P0：慢路径——需要真正等待 fsync
+    wal_stats_.n_commit_waits.fetch_add(1, std::memory_order_relaxed);
+    persist_waiters_.fetch_add(1, std::memory_order_relaxed);  // P3
     if (target_lsn > requested_lsn_) requested_lsn_ = target_lsn;
     plock.unlock();
     request_flush(append_mtx_, cv_, flush_requested_);
     plock.lock();
     persist_cv_.wait(plock, [&] { return persist_lsn_ >= target_lsn || stop_.load(); });
+    persist_waiters_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 /* 双缓冲组提交：换出 active 后在【锁外】write+fsync——fsync 期间新日志进入新 active
@@ -106,6 +180,7 @@ void LogManager::wait_for_persist(lsn_t target_lsn) {
  * 两把锁不嵌套持有，避免和 wait_for_persist 互相等待。 */
 void LogManager::flush_worker() {
     std::unique_lock<std::mutex> lock(append_mtx_);
+    auto last_stats = std::chrono::steady_clock::now();
     while (true) {
         cv_.wait(lock, [&] { return stop_.load() || flush_requested_; });
         flush_requested_ = false;
@@ -121,27 +196,66 @@ void LogManager::flush_worker() {
             }
             if (!need_flush && space_waiters_ == 0 && !stop_.load()) break;
 
-            // S5.2 微批：worker 刚从空闲被唤醒（本批第一轮）、确有 committer 在等、
-            // 且不是被"缓冲写满"逼着刷（space_waiters_==0）时，先放开 append_mtx_
-            // 睡一个短窗口，让几乎同时到达的其它 commit 把 requested_lsn_ 再抬高，
-            // 一次 fsync 覆盖更多 commit。仅本批第一轮生效；同一批内后续因缓冲写满
-            // 或仍有等待者触发的续轮不再等，防止退化成无差别后台 fsync。
-            if (first_round && group_commit_window_us_ > 0 && need_flush &&
+            // P3 阈值组提交（优先于 S5.2）：阈值已满足 → 零延迟刷；
+            // 否则 wait_until(deadline)，新 committer 的 notify 立刻打断重查。
+            // 仅本批第一轮；space_waiters_>0 时不拖（缓冲满必须立刻腾空间）。
+            const bool p3_on = (gc_waiters_ > 0 || gc_bytes_ > 0);
+            if (first_round && p3_on && need_flush &&
                 space_waiters_ == 0 && !stop_.load()) {
+                first_round = false;
+                auto thresh_met = [&] {
+                    if (space_waiters_ > 0 || stop_.load()) return true;
+                    if (gc_waiters_ > 0 &&
+                        persist_waiters_.load(std::memory_order_relaxed) >= gc_waiters_)
+                        return true;
+                    if (gc_bytes_ > 0 && bufs_[active_].offset_ >= gc_bytes_) return true;
+                    return false;
+                };
+                if (!thresh_met()) {
+                    auto deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::microseconds(gc_deadline_us_);
+                    cv_.wait_until(lock, deadline, thresh_met);
+                    continue;  // 重新评估 need_flush / 是否该刷
+                }
+                // 阈值已满足：直接落入下方换缓冲刷盘
+            } else if (first_round && group_commit_window_us_ > 0 && need_flush &&
+                space_waiters_ == 0 && !stop_.load()) {
+                // S5.2 微批（默认关；与 P3 互斥，P3 开时不走这条）
                 first_round = false;
                 lock.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(group_commit_window_us_));
                 lock.lock();
-                continue;   // 重新评估 need_flush/space_waiters_（窗口内可能有新请求或 stop_）
+                continue;
             }
             first_round = false;
             int fl = active_;
             active_ ^= 1;                       // 单 worker 串行 ⇒ 换入的缓冲此刻必为空
+            int batch_bytes = bufs_[fl].offset_;
+            // P1：批头占 12B；batch_off 为批头文件偏移（= 本批记录追加前的 total_offset_）
+            long batch_off = total_offset_ - batch_bytes;
+            total_offset_ += WAL_BATCH_HDR_SIZE;
             lsn_t target = global_lsn_.load() - 1;
             space_cv_.notify_all();             // 新 active 可写
             lock.unlock();
-            disk_manager_->write_log(bufs_[fl].buffer_, bufs_[fl].offset_);
+
+            // 批帧：magic + len + crc32(body)，再写 body（一次 ensure 覆盖头+体）
+            char hdr[WAL_BATCH_HDR_SIZE];
+            uint32_t magic = WAL_BATCH_MAGIC;
+            uint32_t blen = (uint32_t)batch_bytes;
+            uint32_t crc = wal_crc32(bufs_[fl].buffer_, (size_t)batch_bytes);
+            memcpy(hdr + 0, &magic, 4);
+            memcpy(hdr + 4, &blen, 4);
+            memcpy(hdr + 8, &crc, 4);
+            disk_manager_->write_log(hdr, WAL_BATCH_HDR_SIZE, batch_off);
+            disk_manager_->write_log(bufs_[fl].buffer_, batch_bytes, batch_off + WAL_BATCH_HDR_SIZE);
+            int total_write = batch_bytes + WAL_BATCH_HDR_SIZE;
+            wal_stats_.n_bytes.fetch_add((uint64_t)total_write, std::memory_order_relaxed);
+            wal_stats_.n_batches.fetch_add(1, std::memory_order_relaxed);
+            auto t0 = std::chrono::steady_clock::now();
             disk_manager_->sync_log();
+            auto t1 = std::chrono::steady_clock::now();
+            uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            record_fsync_latency(wal_stats_, us);
             {
                 std::lock_guard<std::mutex> plock(persist_mtx_);
                 persist_lsn_ = target;
@@ -150,6 +264,14 @@ void LogManager::flush_worker() {
             lock.lock();
             bufs_[fl].offset_ = 0;
             space_cv_.notify_all();
+
+            if (wal_stats_print_) {
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_stats >= std::chrono::seconds(10)) {
+                    last_stats = now;
+                    dump_wal_stats("periodic");
+                }
+            }
         }
         if (stop_.load()) break;
     }

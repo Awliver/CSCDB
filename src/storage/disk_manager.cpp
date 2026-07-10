@@ -11,9 +11,10 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 
 #include <assert.h>    // for assert
+#include <errno.h>     // for errno / EINTR
 #include <string.h>    // for memset
 #include <sys/stat.h>  // for stat
-#include <unistd.h>    // for lseek
+#include <unistd.h>    // for lseek / pwrite / ftruncate / fdatasync
 
 #include "defs.h"
 
@@ -197,6 +198,8 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
     // read log file from the previous end
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
+        int fs = get_file_size(LOG_FILE_NAME);
+        if (fs > 0) log_prealloc_end_ = fs;
     }
     int file_size = get_file_size(LOG_FILE_NAME);
     if (offset > file_size) {
@@ -211,28 +214,53 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
     return bytes_read;
 }
 
-
-/**
- * @description: 写日志内容
- * @param {char} *log_data 要写入的日志内容
- * @param {int} size 要写入的内容大小
- */
-void DiskManager::write_log(char *log_data, int size) {
+void DiskManager::ensure_log_capacity(long need_end) {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
+        int fs = get_file_size(LOG_FILE_NAME);
+        if (fs > 0) log_prealloc_end_ = fs;
     }
+    if (need_end <= log_prealloc_end_) return;
+    long new_end = ((need_end / LOG_PREALLOC_CHUNK) + 1) * LOG_PREALLOC_CHUNK;
+    if (ftruncate(log_fd_, new_end) != 0) {
+        throw UnixError();
+    }
+    log_prealloc_end_ = new_end;
+}
 
-    // write from the file_end
-    lseek(log_fd_, 0, SEEK_END);
+void DiskManager::reset_log_prealloc(long size) {
+    if (log_fd_ == -1) {
+        if (!is_file(LOG_FILE_NAME)) return;
+        log_fd_ = open_file(LOG_FILE_NAME);
+    }
+    if (ftruncate(log_fd_, size) != 0) {
+        throw UnixError();
+    }
+    log_prealloc_end_ = size;
+}
+
+/**
+ * @description: 按逻辑偏移写日志（P1：pwrite + 预分配，避免每次 fdatasync 写 inode journal）
+ */
+void DiskManager::write_log(char *log_data, int size, long offset) {
+    if (log_fd_ == -1) {
+        log_fd_ = open_file(LOG_FILE_NAME);
+        int fs = get_file_size(LOG_FILE_NAME);
+        if (fs > 0) log_prealloc_end_ = fs;
+    }
+    ensure_log_capacity(offset + size);
+
     int remain = size;
     char *p = log_data;
+    long off = offset;
     while (remain > 0) {
-        ssize_t n = write(log_fd_, p, remain);
+        ssize_t n = pwrite(log_fd_, p, remain, off);
         if (n < 0) {
             if (errno == EINTR) continue;
             throw UnixError();
         }
         p += n;
+        off += n;
         remain -= (int)n;
     }
 }

@@ -67,12 +67,18 @@ class DiskManager {
     /*日志操作*/
     int read_log(char *log_data, int size, int offset);
 
-    void write_log(char *log_data, int size);
+    // P1：按逻辑偏移 pwrite；内部 ensure_log_capacity，正常运行期 fdatasync 不再碰 inode 大小
+    void write_log(char *log_data, int size, long offset);
     void sync_log();
+    void ensure_log_capacity(long need_end);
+    // 恢复 truncate 后同步预分配水位（否则 ensure 以为仍有空间但文件已缩短）
+    void reset_log_prealloc(long size);
 
     void SetLogFd(int log_fd) { log_fd_ = log_fd; }
 
     int GetLogFd() { return log_fd_; }
+
+    static constexpr long LOG_PREALLOC_CHUNK = 16L << 20;  // 16MB
 
     /**
      * @description: 设置文件已经分配的页面个数
@@ -96,5 +102,6 @@ class DiskManager {
     std::unordered_map<int, std::string> fd2path_;  //<Page fd,Page文件磁盘路径>哈希表
 
     int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    long log_prealloc_end_ = 0;                   // P1：已预分配（零填充）终点
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
 };
