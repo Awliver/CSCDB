@@ -1139,6 +1139,12 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
     // 门：表无在飞写者且最近写提交 <= 本快照 ⇒ 整跳（item 等只读表）。
     // 调用方保证先 ser_record_pred 再调本函数——门后出现的匹配写由写方 ser_write_check 建边。
     if (!ser_needs_read_check(txn, tab)) return false;
+
+    // 谓词只依赖 schema：编译一次后循环内用 O(1) 偏移比较，避免每条记录重复 find_if。
+    // 编译失败＝引用不存在的列，旧 ser_record_matches 对任何记录恒 false，语义等价。
+    std::vector<SerCompiledCond> cc;
+    if (!ser_compile_pred(tab, conds, cc)) return false;
+
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
 
@@ -1170,14 +1176,14 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
         MvccChain &ch = cit->second;
         // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
         if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
-            !ch.writer_data.empty() && ser_record_matches(tab, ch.writer_data.data(), conds)) {
+            !ch.writer_data.empty() && ser_compiled_match(ch.writer_data.data(), cc)) {
             hit_writers.push_back(ch.writer);
         }
         // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
         for (auto &v : ch.hist) {
             if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
                 v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
-                ser_record_matches(tab, v.data.data(), conds)) {
+                ser_compiled_match(v.data.data(), cc)) {
                 hit_writers.push_back(v.writer_txn);
             }
         }
