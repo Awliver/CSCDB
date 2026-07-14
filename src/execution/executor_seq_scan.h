@@ -116,6 +116,10 @@ class SeqScanExecutor : public AbstractExecutor {
 
     void position_to_next_match() {
         while (!scan_->is_end()) {
+            // 扫描中途他事务可能刚把表写脏：每行重查，避免 mvcc_on_ 卡在 beginTuple 的 false
+            if (!mvcc_on_ && context_ && context_->txn_mgr_ && context_->txn_) {
+                mvcc_on_ = context_->txn_mgr_->table_is_dirty(tab_name_);
+            }
             rid_ = scan_->rid();
             char *slot = get_slot_ptr(rid_);
             const char *eval_data = slot;

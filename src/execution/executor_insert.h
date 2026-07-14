@@ -120,26 +120,41 @@ class InsertExecutor : public AbstractExecutor {
         }
 
         // Insert into record file
-        rid_ = fh_->insert_record(rec.data, context_);
-
-        // 题10 WAL：插入即时记日志（含记录镜像与 rid）
-        if (context_ && context_->log_mgr_ && context_->txn_) {
-            InsertLogRecord lr(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
-            context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
-        }
-
-        // 题9：有活跃显式事务时，登记为未提交插入版本（提交后才对他人可见，回滚则物理删除）
-        if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_)) {
-            context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,
-                                            (int)fh_->get_file_hdr().record_size);
-            // 题9 SER：新插入记录 vs 其他事务谓词读 → rw 反依赖；成 SSI 危险结构则 abort
-            if (context_->txn_mgr_->is_ser(context_->txn_) &&
-                context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid_, rec.data)) {
-                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // MVCC：先占槽并登记版本链，再 publish bitmap——避免 dirty 门未开时他事务直读堆看见未提交插入
+        bool do_mvcc = context_ && context_->txn_mgr_ && context_->txn_ &&
+                       context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
+        bool reserved = false;
+        if (do_mvcc) {
+            rid_ = fh_->reserve_insert_slot();
+            reserved = true;
+            try {
+                if (context_->log_mgr_) {
+                    InsertLogRecord lr(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+                    context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+                }
+                context_->txn_mgr_->mvcc_insert(context_->txn_, tab_name_, rid_, rec.data,
+                                                (int)fh_->get_file_hdr().record_size);
+                fh_->publish_insert_slot(rid_, rec.data);
+                reserved = false;
+                if (context_->txn_mgr_->is_ser(context_->txn_) &&
+                    context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid_, rec.data)) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                    AbortReason::DEADLOCK_PREVENTION);
+                }
+            } catch (...) {
+                if (reserved) fh_->cancel_insert_slot(rid_);
+                throw;
             }
-        } else if (context_ && context_->txn_ && context_->txn_mgr_ &&
-                   context_->txn_mgr_->uses_si_fast_path(context_->txn_)) {
-            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, rec));
+        } else {
+            rid_ = fh_->insert_record(rec.data, context_);
+            if (context_ && context_->log_mgr_ && context_->txn_) {
+                InsertLogRecord lr(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+                context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
+            }
+            if (context_ && context_->txn_ && context_->txn_mgr_ &&
+                context_->txn_mgr_->uses_si_fast_path(context_->txn_)) {
+                context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, rec));
+            }
         }
 
         // Insert into index

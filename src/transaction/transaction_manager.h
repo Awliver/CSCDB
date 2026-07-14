@@ -204,22 +204,32 @@ public:
                !any_mvcc_dirty_.load(std::memory_order_acquire) &&
                txn->get_isolation_level() != IsolationLevel::SERIALIZABLE;
     }
-    /* 写是否需维护版本：并发显式事务 / SER / 脏表隐式写 才走 MVCC；单连接 SI 显式事务走快路径。 */
+    /* 写是否需维护版本：并发显式事务 / SER / 脏表隐式写 才走 MVCC；单连接 SI 显式事务走快路径。
+     * 有活跃显式事务时，隐式（autocommit）写也必须走版本——否则会原地改堆，破坏并行 SI 快照。 */
     bool needs_versioning(Transaction *txn, const std::string &tab) {
         if (uses_si_fast_path(txn)) return false;
         if (txn != nullptr && txn->get_txn_mode()) return true;
+        if (active_explicit_count_.load(std::memory_order_acquire) > 0) return true;
         if (!any_mvcc_dirty_.load()) return false;
         return table_is_dirty(tab);
     }
     /* 题9 唯一索引: 该 (table,rid) 是否被另一活跃事务持写(未提交插入/更新/删除)。用于
-       并发同键插入的写写冲突检测——避免 MVCC 感知唯一检查把他人未提交插入误判为可重插。*/
+       并发同键插入的写写冲突检测——避免 MVCC 感知唯一检查把他人未提交插入误判为可重插。
+       须同时查 chain.writer 与 pending（语句结束落到 SI overlay 后 writer 已清）。*/
     bool mvcc_other_writer(const std::string &tab, const Rid &rid, txn_id_t me) {
         size_t sh = mvcc_shard_idx(tab, mvcc_key(rid));
         std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
-        auto &store = mvcc_shard_data_[sh].store;
-        auto tit = store.find(tab);
-        if (tit == store.end()) return false;
-        auto cit = tit->second.find(mvcc_key(rid));
+        auto &sd = mvcc_shard_data_[sh];
+        int64_t rkey = mvcc_key(rid);
+        auto pit = sd.pending.find(tab);
+        if (pit != sd.pending.end()) {
+            auto it = pit->second.find(rkey);
+            if (it != pit->second.end() && it->second != INVALID_TXN_ID && it->second != me)
+                return true;
+        }
+        auto tit = sd.store.find(tab);
+        if (tit == sd.store.end()) return false;
+        auto cit = tit->second.find(rkey);
         if (cit == tit->second.end()) return false;
         txn_id_t w = cit->second.writer;
         return w != INVALID_TXN_ID && w != me;

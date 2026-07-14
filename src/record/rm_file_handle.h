@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 #include "rm_defs.h"
 #include <mutex>
+#include <unordered_set>
 
 class RmManager;
 
@@ -57,6 +58,13 @@ class RmFileHandle {
     RmPageHdr *cached_insert_hdr_ = nullptr;
     char *cached_insert_bitmap_ = nullptr;
     char *cached_insert_slots_ = nullptr;
+    // MVCC 插入两阶段：bitmap 发布前先占槽，避免扫描落到未登记版本的堆行
+    std::unordered_set<int64_t> reserved_inserts_;
+
+    static int64_t rid_key(const Rid &rid) {
+        return (static_cast<int64_t>(rid.page_no) << 32) |
+               static_cast<uint32_t>(rid.slot_no);
+    }
 
    public:
     RmFileHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd)
@@ -87,6 +95,11 @@ class RmFileHandle {
 
     void insert_record(const Rid &rid, char *buf);
 
+    /* 两阶段插入（MVCC）：先占槽位但不置 bitmap，登记版本后再 publish */
+    Rid reserve_insert_slot();
+    void publish_insert_slot(const Rid &rid, char *buf);
+    void cancel_insert_slot(const Rid &rid);
+
     void delete_record(const Rid &rid, Context *context);
 
     void update_record(const Rid &rid, char *buf, Context *context);
@@ -105,6 +118,9 @@ class RmFileHandle {
     std::mutex op_latch_;   // 题10:结构性操作(槽位分配/位图)互斥,多线程并发插入防竞态
 
    private:
+    int find_free_slot_on_cached_page();
+    void ensure_insert_page_cached();
+
     RmPageHandle create_page_handle();
 
     void release_page_handle(RmPageHandle &page_handle);

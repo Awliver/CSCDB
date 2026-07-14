@@ -35,6 +35,56 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     return record;
 }
 
+/** 在插入缓存页上找下个可用槽：bitmap 空闲且未落入 reserved_inserts_。 */
+int RmFileHandle::find_free_slot_on_cached_page() {
+    if (cached_insert_page_no_ < 0 || cached_insert_bitmap_ == nullptr) return -1;
+    int n = file_hdr_.num_records_per_page;
+    int slot_no = -1;
+    while (true) {
+        slot_no = Bitmap::next_bit(false, cached_insert_bitmap_, n, slot_no);
+        if (slot_no >= n) return -1;
+        Rid cand{cached_insert_page_no_, slot_no};
+        if (!reserved_inserts_.count(rid_key(cand))) return slot_no;
+    }
+}
+
+void RmFileHandle::ensure_insert_page_cached() {
+    if (find_free_slot_on_cached_page() >= 0) return;
+
+    if (cached_insert_page_) {
+        buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
+        cached_insert_page_ = nullptr;
+        cached_insert_page_no_ = -1;
+        cached_insert_hdr_ = nullptr;
+        cached_insert_bitmap_ = nullptr;
+        cached_insert_slots_ = nullptr;
+    }
+
+    // 先试 first_free；若该页剩余空位都被 reserve 占住，则开新页
+    if (file_hdr_.first_free_page_no != RM_NO_PAGE) {
+        RmPageHandle ph = fetch_page_handle(file_hdr_.first_free_page_no);
+        cached_insert_page_ = ph.page;
+        cached_insert_page_no_ = ph.page->get_page_id().page_no;
+        cached_insert_hdr_ = ph.page_hdr;
+        cached_insert_bitmap_ = ph.bitmap;
+        cached_insert_slots_ = ph.slots;
+        if (find_free_slot_on_cached_page() >= 0) return;
+        buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
+        cached_insert_page_ = nullptr;
+        cached_insert_page_no_ = -1;
+    }
+
+    RmPageHandle ph = create_new_page_handle();
+    cached_insert_page_ = ph.page;
+    cached_insert_page_no_ = ph.page->get_page_id().page_no;
+    cached_insert_hdr_ = ph.page_hdr;
+    cached_insert_bitmap_ = ph.bitmap;
+    cached_insert_slots_ = ph.slots;
+    // 新页挂到空闲链表头，供后续非 reserve 路径使用
+    ph.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+    file_hdr_.first_free_page_no = cached_insert_page_no_;
+}
+
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据
@@ -43,32 +93,12 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
  */
 Rid RmFileHandle::insert_record(char *buf, Context *context) {
     std::scoped_lock<std::mutex> op_lock(op_latch_);
-    // Step 1：决定写入页 —— 优先用缓存
-    bool use_cache = (cached_insert_page_no_ != -1 &&
-                      cached_insert_hdr_->num_records < file_hdr_.num_records_per_page);
-
-    if (!use_cache) {
-        // 释放过期缓存（page 已满或第一次插入）
-        if (cached_insert_page_) {
-            buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
-            cached_insert_page_ = nullptr;
-            cached_insert_page_no_ = -1;
-        }
-        // 找新的可写页
-        RmPageHandle ph = (file_hdr_.first_free_page_no == RM_NO_PAGE)
-                              ? create_new_page_handle()
-                              : fetch_page_handle(file_hdr_.first_free_page_no);
-        cached_insert_page_ = ph.page;
-        cached_insert_page_no_ = ph.page->get_page_id().page_no;
-        cached_insert_hdr_ = ph.page_hdr;
-        cached_insert_bitmap_ = ph.bitmap;
-        cached_insert_slots_ = ph.slots;
+    ensure_insert_page_cached();
+    int slot_no = find_free_slot_on_cached_page();
+    if (slot_no < 0) {
+        throw InternalError("RmFileHandle::insert_record: no free slot");
     }
 
-    // Step 2：bitmap 找空 slot
-    int slot_no = Bitmap::first_bit(false, cached_insert_bitmap_, file_hdr_.num_records_per_page);
-
-    // Step 3：写入
     char *slot = cached_insert_slots_ + slot_no * file_hdr_.record_size;
     memcpy(slot, buf, file_hdr_.record_size);
     Bitmap::set(cached_insert_bitmap_, slot_no);
@@ -76,15 +106,69 @@ Rid RmFileHandle::insert_record(char *buf, Context *context) {
 
     Rid rid{cached_insert_page_no_, slot_no};
 
-    // Step 4：页满，推进 first_free_page + 释放缓存（让下次 insert 重选页）
     if (cached_insert_hdr_->num_records == file_hdr_.num_records_per_page) {
         file_hdr_.first_free_page_no = cached_insert_hdr_->next_free_page_no;
         buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
         cached_insert_page_ = nullptr;
         cached_insert_page_no_ = -1;
+        cached_insert_hdr_ = nullptr;
+        cached_insert_bitmap_ = nullptr;
+        cached_insert_slots_ = nullptr;
     }
 
     return rid;
+}
+
+Rid RmFileHandle::reserve_insert_slot() {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
+    ensure_insert_page_cached();
+    int slot_no = find_free_slot_on_cached_page();
+    if (slot_no < 0) {
+        throw InternalError("RmFileHandle::reserve_insert_slot: no free slot");
+    }
+    Rid rid{cached_insert_page_no_, slot_no};
+    reserved_inserts_.insert(rid_key(rid));
+    return rid;
+}
+
+void RmFileHandle::publish_insert_slot(const Rid &rid, char *buf) {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
+    auto it = reserved_inserts_.find(rid_key(rid));
+    if (it == reserved_inserts_.end()) {
+        throw InternalError("RmFileHandle::publish_insert_slot: rid not reserved");
+    }
+    reserved_inserts_.erase(it);
+
+    if (cached_insert_page_no_ == rid.page_no && cached_insert_slots_ != nullptr) {
+        char *slot = cached_insert_slots_ + rid.slot_no * file_hdr_.record_size;
+        memcpy(slot, buf, file_hdr_.record_size);
+        Bitmap::set(cached_insert_bitmap_, rid.slot_no);
+        cached_insert_hdr_->num_records++;
+        if (cached_insert_hdr_->num_records == file_hdr_.num_records_per_page) {
+            file_hdr_.first_free_page_no = cached_insert_hdr_->next_free_page_no;
+            buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
+            cached_insert_page_ = nullptr;
+            cached_insert_page_no_ = -1;
+            cached_insert_hdr_ = nullptr;
+            cached_insert_bitmap_ = nullptr;
+            cached_insert_slots_ = nullptr;
+        }
+        return;
+    }
+
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    Bitmap::set(page_handle.bitmap, rid.slot_no);
+    page_handle.page_hdr->num_records++;
+    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page) {
+        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    }
+    buffer_pool_manager_->unpin_page({fd_, rid.page_no}, true);
+}
+
+void RmFileHandle::cancel_insert_slot(const Rid &rid) {
+    std::scoped_lock<std::mutex> op_lock(op_latch_);
+    reserved_inserts_.erase(rid_key(rid));
 }
 
 /**

@@ -219,6 +219,10 @@ class IndexScanExecutor : public AbstractExecutor {
 
     void position_to_match() {
         while (!range_exhausted_ && !scan_->is_end()) {
+            // 与 SeqScan 一致：扫描中途表变脏时打开 MVCC 读
+            if (!mvcc_on_ && context_ && context_->txn_mgr_ && context_->txn_) {
+                mvcc_on_ = context_->txn_mgr_->table_is_dirty(tab_name_);
+            }
             rid_ = scan_->rid();
             if (scan_->is_end() || rid_.page_no < 0 || rid_.slot_no < 0) {
                 break;

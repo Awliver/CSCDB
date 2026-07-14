@@ -343,7 +343,12 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             if (!ch.writer_del) v.data = ch.writer_data;
             ch.hist.push_back(std::move(v));
             // 先物化堆再 prune：否则摘链后读者会读到未刷新的堆页
-            if (!ch.writer_del && !ch.writer_data.empty()) {
+            if (ch.writer_del) {
+                // 墓碑须同步清堆，否则 prune 摘掉唯一 tombstone 后行会"复活"
+                if (sm_manager_->fhs_.at(tab)->is_record(wr->GetRid())) {
+                    sm_manager_->fhs_.at(tab)->delete_record(wr->GetRid(), nullptr);
+                }
+            } else if (!ch.writer_data.empty()) {
                 sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(),
                                                          (char *)ch.writer_data.data(), nullptr);
             }
