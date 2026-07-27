@@ -173,6 +173,22 @@ void SmManager::close_db() {
  * @param {Context*} context
  */
 void SmManager::show_tables(Context* context) {
+    // 决赛 Wire v3：show tables 是查询语义，必须 META → ROW* → RESULT_END（测活探针依赖此路径）
+    if (context && context->wire_sink_) {
+        context->wire_sink_->on_meta({{"Tables", TYPE_STRING}});
+        uint64_t n = 0;
+        for (auto &entry : db_.tabs_) {
+            WireCell cell;
+            cell.type = TYPE_STRING;
+            cell.str_val = entry.second.name;
+            context->wire_sink_->on_row({std::move(cell)});
+            n++;
+            if (context->wire_sink_->failed()) break;
+        }
+        context->wire_sink_->on_end(n);
+        return;
+    }
+
     std::fstream outfile;
     if (output_file_enabled()) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
@@ -224,6 +240,25 @@ void SmManager::show_indexes(const std::string& tab_name, Context* context) {
 
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
+
+    if (context && context->wire_sink_) {
+        context->wire_sink_->on_meta({
+            {"Field", TYPE_STRING},
+            {"Type", TYPE_STRING},
+            {"Index", TYPE_STRING},
+        });
+        uint64_t n = 0;
+        for (auto &col : tab.cols) {
+            WireCell c0{TYPE_STRING, 0, 0.0f, col.name};
+            WireCell c1{TYPE_STRING, 0, 0.0f, coltype2str(col.type)};
+            WireCell c2{TYPE_STRING, 0, 0.0f, col.index ? "YES" : "NO"};
+            context->wire_sink_->on_row({std::move(c0), std::move(c1), std::move(c2)});
+            n++;
+            if (context->wire_sink_->failed()) break;
+        }
+        context->wire_sink_->on_end(n);
+        return;
+    }
 
     std::vector<std::string> captions = {"Field", "Type", "Index"};
     RecordPrinter printer(captions.size());

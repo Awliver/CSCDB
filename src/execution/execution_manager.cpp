@@ -593,6 +593,46 @@ void QlManager::select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot,
         }
     }
 
+    // 决赛 Wire v3：聚合结果同样走 META → ROW → RESULT_END
+    if (context && context->wire_sink_) {
+        std::vector<std::pair<std::string, ColType>> meta;
+        meta.reserve(n);
+        for (size_t i = 0; i < n; i++) {
+            ColType t = TYPE_STRING;
+            int at = sel_cols[i].agg_type;
+            if (at == 1) {
+                t = TYPE_INT;  // COUNT
+            } else if (cnt[i] == 0) {
+                t = metas[i].type == TYPE_FLOAT ? TYPE_FLOAT : TYPE_INT;
+            } else if (metas[i].type == TYPE_INT) {
+                t = TYPE_INT;
+            } else if (metas[i].type == TYPE_FLOAT) {
+                t = TYPE_FLOAT;
+            } else {
+                t = TYPE_STRING;
+            }
+            meta.emplace_back(captions[i], t);
+        }
+        context->wire_sink_->on_meta(meta);
+        std::vector<WireCell> cells;
+        cells.reserve(n);
+        for (size_t i = 0; i < n; i++) {
+            WireCell cell;
+            cell.type = meta[i].second;
+            if (cell.type == TYPE_INT) {
+                cell.int_val = std::stoi(row[i]);
+            } else if (cell.type == TYPE_FLOAT) {
+                cell.float_val = std::stof(row[i]);
+            } else {
+                cell.str_val = row[i];
+            }
+            cells.push_back(std::move(cell));
+        }
+        context->wire_sink_->on_row(cells);
+        context->wire_sink_->on_end(1);
+        return;
+    }
+
     RecordPrinter rec_printer(n);
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);

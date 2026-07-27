@@ -931,8 +931,7 @@ static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id,
     }
     if (!sink.sent_result()) {
         // 非查询成功：DDL/DML/事务控制/LOAD 等——payload 为空的 COMMAND_OK
-        // （已知缺口：show tables/desc/help/explain 仍只写入历史文本旁路，wire 模式下
-        // 暂不回传该文本，只回 COMMAND_OK；不影响 TPC-C 排名与正确性门禁必需路径）
+        // show tables / desc 已走 META→ROW*→RESULT_END（sent_result=true）
         if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
     }
 }
