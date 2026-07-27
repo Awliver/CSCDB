@@ -253,7 +253,7 @@ public:
     bool mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
                               const char *visible_data, int len, int col_off, ColType col_type,
                               float delta_f, int delta_i, std::string *effective_new = nullptr);
-    /* 多列 UPDATE：基底版本上按 patches 改列；写写 rebase 同 rebase_write_delta */
+    /* 多列 UPDATE：基底版本上按 patches 改列；快照之后若已有新提交版本则 abort（SI 陈旧写规则） */
     bool mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
                               const char *visible_data, int len,
                               const std::vector<MvccColPatch> &patches,

@@ -64,36 +64,6 @@ void restore_index_if_missing(SmManager *sm, const std::string &tab_name, const 
     }
 }
 
-/* SI 写写冲突：将基于旧快照的增量写重定位到最新已提交版本（read-then-write 模式）。
- * 基底必须取 latest_rec：本事务未改动的列要保留最新已提交值，
- * 若以旧快照为基底会把并发已提交的增量覆盖回旧值。 */
-bool rebase_write_delta(SmManager *sm, const std::string &tab,
-                        const char *old_rec, const char *new_rec, const char *latest_rec,
-                        int len, std::string &out) {
-    out.assign(latest_rec, len);
-    if (memcmp(old_rec, new_rec, len) == 0) return false;
-    TabMeta &meta = sm->db_.get_table(tab);
-    bool any = false;
-    for (auto &col : meta.cols) {
-        if (col.offset + col.len > len) continue;
-        const char *o = old_rec + col.offset;
-        const char *n = new_rec + col.offset;
-        const char *l = latest_rec + col.offset;
-        if (memcmp(o, n, col.len) == 0) continue;
-        any = true;
-        if (col.type == TYPE_INT && col.len == (int)sizeof(int)) {
-            int delta = *(const int *)n - *(const int *)o;
-            *(int *)(out.data() + col.offset) = *(const int *)l + delta;
-        } else if (col.type == TYPE_FLOAT && col.len == (int)sizeof(float)) {
-            float delta = *(const float *)n - *(const float *)o;
-            *(float *)(out.data() + col.offset) = *(const float *)l + delta;
-        } else {
-            memcpy(out.data() + col.offset, n, col.len);
-        }
-    }
-    return any;
-}
-
 static const ColMeta *find_col_meta(const TabMeta &meta, const std::string &name) {
     for (const auto &c : meta.cols) {
         if (c.name == name) return &c;
@@ -133,47 +103,6 @@ static bool apply_col_patch_from_visible(const MvccColPatch &p, const char *visi
     return false;
 }
 
-static bool apply_col_patch_rebase(const MvccColPatch &p, const char *visible, const char *latest,
-                                   char *dest, int len, const TabMeta &meta) {
-    if (p.offset + p.len > len) return false;
-    if (!p.is_arith) {
-        if (p.type == TYPE_INT && p.len == (int)sizeof(int) &&
-            (int)p.abs_value.size() >= p.len) {
-            int o = *reinterpret_cast<const int *>(visible + p.offset);
-            int n = *reinterpret_cast<const int *>(p.abs_value.data());
-            int l = *reinterpret_cast<const int *>(latest + p.offset);
-            *reinterpret_cast<int *>(dest + p.offset) = l + (n - o);
-            return true;
-        }
-        if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float) &&
-            (int)p.abs_value.size() >= p.len) {
-            float o = *reinterpret_cast<const float *>(visible + p.offset);
-            float n = *reinterpret_cast<const float *>(p.abs_value.data());
-            float l = *reinterpret_cast<const float *>(latest + p.offset);
-            *reinterpret_cast<float *>(dest + p.offset) = l + (n - o);
-            return true;
-        }
-        apply_col_patch_abs(p, dest);
-        return true;
-    }
-    if (p.type == TYPE_INT && p.len == (int)sizeof(int)) {
-        int o = *reinterpret_cast<const int *>(visible + p.offset);
-        int delta = p.arith_neg ? -p.arith_rhs_i : p.arith_rhs_i;
-        int n = o + delta;
-        int l = *reinterpret_cast<const int *>(latest + p.offset);
-        *reinterpret_cast<int *>(dest + p.offset) = l + (n - o);
-        return true;
-    }
-    if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float)) {
-        float o = *reinterpret_cast<const float *>(visible + p.offset);
-        float delta = p.arith_neg ? -p.arith_rhs_f : p.arith_rhs_f;
-        float n = o + delta;
-        float l = *reinterpret_cast<const float *>(latest + p.offset);
-        *reinterpret_cast<float *>(dest + p.offset) = l + (n - o);
-        return true;
-    }
-    return false;
-}
 }  // namespace
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
@@ -698,17 +627,15 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     auto pit = pending[tab].find(rkey);
     if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
     if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
-    std::string rebased_new;
-    const char *write_ptr = new_data;
+    // 决赛 SI 铁律：快照之后若已有其它事务提交了新版本，本次写基于的是过期快照，
+    // 必须直接 abort，不允许把本次写变基（rebase）合并到最新已提交版本上——
+    // 否则会拼出一行任何单个事务都未真正提交过的"缝合"数据，且违反
+    // "SI 陈旧写必须 TRANSACTION_ABORT" 的赛题规范（决赛赛题整理 §5.3）。
     if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         ch.hist.back().commit_ts > txn->get_read_ts()) {
-        if (ch.hist.back().is_deleted || (int)ch.hist.back().data.size() != len ||
-            !rebase_write_delta(sm_manager_, tab, old_data, new_data,
-                                ch.hist.back().data.data(), len, rebased_new)) {
-            return false;
-        }
-        write_ptr = rebased_new.data();
+        return false;
     }
+    const char *write_ptr = new_data;
     bool first_touch = (ch.writer != txn->get_transaction_id()) &&
                        (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
     if (first_touch) {
@@ -800,11 +727,12 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
         base.is_deleted = false;
         ch.hist.push_back(std::move(base));
     }
-    const char *base_rec = visible_data;
-    if (ch.writer != txn->get_transaction_id() && !ch.hist.empty() &&
-        ch.hist.back().commit_ts > txn->get_read_ts()) {
-        base_rec = ch.hist.back().data.data();
+    // 决赛 SI 铁律：同 mvcc_write——快照之后已有新提交版本，本次(增量)写也必须 abort，
+    // 不得把 delta 变基叠加到最新版本上（哪怕是同列的交换律累加）。
+    if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
+        return false;
     }
+    const char *base_rec = visible_data;
     ch.writer = txn->get_transaction_id();
     ch.writer_del = false;
     ch.hold_writer_to_commit = true;
@@ -880,13 +808,13 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
         ch.hist.push_back(std::move(base));
     }
 
-    bool need_rebase = false;
-    const char *base_rec = visible_data;
+    // 决赛 SI 铁律：同 mvcc_write——快照之后已有新提交版本，本次写必须 abort，
+    // 不得把 patch 变基合并到最新版本上。
     if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
-        if (ch.hist.back().is_deleted || (int)ch.hist.back().data.size() != len) return false;
-        base_rec = ch.hist.back().data.data();
-        need_rebase = true;
-    } else if (reuse_writer && !ch.writer_data.empty()) {
+        return false;
+    }
+    const char *base_rec = visible_data;
+    if (reuse_writer && !ch.writer_data.empty()) {
         base_rec = ch.writer_data.data();
     }
 
@@ -897,10 +825,7 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
         ch.writer_data.assign(base_rec, len);
     }
     for (const auto &p : patches) {
-        bool ok = need_rebase
-                      ? apply_col_patch_rebase(p, visible_data, base_rec, ch.writer_data.data(), len, tmeta)
-                      : apply_col_patch_from_visible(p, visible_data, ch.writer_data.data(), len, tmeta);
-        if (!ok) return false;
+        if (!apply_col_patch_from_visible(p, visible_data, ch.writer_data.data(), len, tmeta)) return false;
     }
     if (first_touch) {
         RmRecord undo_old(len);

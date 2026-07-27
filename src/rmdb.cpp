@@ -29,6 +29,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/output_control.h"
 #include "common/wire_protocol.h"
 #include <cctype>
+#include <cmath>
 #include <cstring>
 
 #define SOCK_PORT 8765
@@ -715,13 +716,19 @@ static std::string wire_param_literal(uint8_t sql_type, wire::Reader &r) {
         uint32_t bits = r.u32();
         float f;
         memcpy(&f, &bits, sizeof(f));
+        // 决赛 FLOAT32 规则禁 NaN/Inf（决赛赛题整理 §5.3）：非 finite 值无法用 SQL 数字
+        // 字面量表示（%.9g 会产生 "inf"/"-inf"/"nan"，词法分析器无法识别这些字母 token，
+        // 会在拼接进 SQL 文本后触发不可控的 lexer/parser 错误）。这里主动、可控地拒绝，
+        // 而不是让畸形字面量流入 yacc 才崩溃。
+        if (!std::isfinite(f)) {
+            throw wire::WireProtocolError("FLOAT32 parameter is not finite (NaN/Inf not allowed)");
+        }
         char tmp[64];
-        // float32 十进制往返所需的有效位数上限为 9；配合词法 {sign}?digit+\.({digit}+)?
-        // 恒生成含小数点的形式，避免被误判成整数字面量。
+        // float32 十进制往返所需的有效位数上限为 9；配合词法 {sign}?digit+(\.{digit}*)?([eE]{sign}?{digit}+)?
+        // 恒生成含小数点或指数的形式，避免被误判成整数字面量。
         snprintf(tmp, sizeof(tmp), "%.9g", f);
         std::string s(tmp);
-        if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
-            s.find("inf") == std::string::npos && s.find("nan") == std::string::npos) {
+        if (s.find('.') == std::string::npos && s.find('e') == std::string::npos) {
             s += ".0";
         }
         return s;
