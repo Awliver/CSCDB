@@ -26,7 +26,9 @@ enum class IntFloatRewrite { CONVERTED, ALWAYS_TRUE, ALWAYS_FALSE };
  * float→double 提升精确，全部判定无舍入误差。 */
 IntFloatRewrite rewrite_int_col_float_val(Condition &cond) {
     const double d = static_cast<double>(cond.rhs_val.float_val);
-    if (std::isnan(d)) return IntFloatRewrite::ALWAYS_FALSE;
+    // IEEE：NaN 与任何值比较除 != 恒真外均恒假
+    if (std::isnan(d)) return cond.op == OP_NE ? IntFloatRewrite::ALWAYS_TRUE
+                                               : IntFloatRewrite::ALWAYS_FALSE;
     const double lo = static_cast<double>(INT32_MIN);
     const double hi = static_cast<double>(INT32_MAX);
     if (d > hi) {   // 所有 int32 都 < d（含 +inf）
@@ -554,6 +556,14 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
             // 类型提升
             if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
                 cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
+            } else if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_FLOAT &&
+                       std::isnan(cond.rhs_val.float_val)) {
+                // float 列 vs NaN 字面量（wire NaN 参数经 NAN 关键字进来）：执行器的
+                // 三值比较（<、> 皆假则判相等）不符合 IEEE NaN 语义，须在此改写——
+                // <> 恒真（删除条件），其余恒假（col < -inf 对任何 float 值恒假）。
+                if (cond.op == OP_NE) continue;
+                cond.op = OP_LT;
+                cond.rhs_val.set_float(-INFINITY);
             } else if (lhs_type == TYPE_INT && cond.rhs_val.type == TYPE_FLOAT) {
                 // int 列 vs float 字面量：按数值比较语义改写为纯 int 比较
                 // （直接截断字面量会改变 <、> 的语义，如 k > 0.5 ≠ k > 0）

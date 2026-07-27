@@ -85,6 +85,15 @@ class InsertExecutor : public AbstractExecutor {
                 bool conflict = true;
                 bool mvcc = context_ && context_->txn_mgr_ && context_->txn_ &&
                             context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
+                if (!mvcc) {
+                    // 非 MVCC 模式同样可能遇到陈旧索引项（checkpoint 强制清堆 + 崩溃
+                    // 恢复后，磁盘索引可能残留指向已释放槽位的项）：同键项全部指向
+                    // 死槽 → 不构成唯一冲突，下方清掉陈旧项后正常插入。
+                    conflict = false;
+                    for (auto &er : existing) {
+                        if (fh_->is_record(er)) { conflict = true; break; }
+                    }
+                }
                 if (mvcc) {
                     conflict = false;
                     bool other_writer = false;
@@ -114,8 +123,8 @@ class InsertExecutor : public AbstractExecutor {
                     append_output_file("failure\n");
                     return nullptr;
                 }
-                // 同键记录均已删(不可见)：清掉陈旧索引项，下方再插入新项
-                if (mvcc) ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
+                // 同键记录均已删(不可见)/项已陈旧：清掉旧索引项，下方再插入新项
+                ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
             }
         }
 

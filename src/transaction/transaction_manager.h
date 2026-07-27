@@ -276,6 +276,16 @@ public:
 
     void release_statement_writes(Transaction *txn);
 
+    /* 已提交删除的延迟物化：commit 时若有更旧活跃快照（prune_wm < cts），堆槽/索引项
+       须保留供 seq/index 快照读经版本链取旧版本，物理清理登记到 deferred_dels_；
+       本方法在事务结束（commit/abort）与静态 checkpoint 前调用，把水位已越过 cts 的
+       登记项物化（删索引项 + 删堆槽 + 摘除墓碑链）。列表为空时仅一次锁探测，近零开销。
+       force_heap_for_pending：checkpoint 专用——水位尚未越过的登记项也强制清理堆槽
+       （checkpoint 落盘堆页并截断重放起点，堆槽若带活位落盘，崩溃恢复后已提交删除会
+       复活）；链与索引项保留，pinned reader 的索引读仍经链取旧版本（heap_live 防护），
+       仅牺牲其 seq scan（与推迟机制引入前行为一致）。 */
+    void drain_deferred_deletes(bool force_heap_for_pending = false);
+
 private:
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
@@ -307,6 +317,15 @@ private:
     // 的 table_is_dirty 走共享锁并发判定，与 active_rts_ / ser_ 分锁。
     mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
+
+    /* 已提交删除的延迟物化登记（见 drain_deferred_deletes） */
+    struct DeferredDelete {
+        std::string tab;
+        Rid rid;
+        timestamp_t cts;
+    };
+    mutable std::mutex deferred_del_latch_;
+    std::vector<DeferredDelete> deferred_dels_;
 
     /* 被删键索引（del_keys_）：插入端删-插冲突 O(1) 点查，按记录首列登记。 */
     struct DelKeyState {

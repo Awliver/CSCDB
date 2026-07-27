@@ -283,8 +283,13 @@ class UpdateExecutor : public AbstractExecutor {
                     if (ih->get_value(new_key.data(), &found, context_ ? context_->txn_ : nullptr)) {
                         // 已存在——若不是自己，违反唯一性
                         if (found[0].page_no != rid.page_no || found[0].slot_no != rid.slot_no) {
-                            violated = true;
-                            break;
+                            if (fh_->is_record(found[0])) {
+                                violated = true;
+                                break;
+                            }
+                            // 陈旧索引项（指向已释放槽位，见 executor_insert 同注释）：
+                            // 清除后不构成冲突
+                            ih->delete_entry(new_key.data(), context_ ? context_->txn_ : nullptr);
                         }
                     }
                 }

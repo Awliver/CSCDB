@@ -14,6 +14,7 @@
 
 #include "ast.h"
 #include "yacc.tab.h"
+#include <cmath>
 #include <iostream>
 
 // automatically update location
@@ -113,6 +114,13 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "FALSE" {
     yylval->sv_bool = false;
     return VALUE_BOOL;
+}
+    /* 决赛 FLOAT32 位级传输：wire_param_literal 把 NaN 参数映射为 NAN 关键字（普通
+     * 数字字面量无法表示 NaN）。位置在 identifier 规则之前故优先命中；表/列名不叫
+     * nan，无冲突。比较语义由 analyze 层按 IEEE 改写。 */
+"NAN" {
+    yylval->sv_float = NAN;
+    return VALUE_FLOAT;
 }
     /* operators */
 ">=" { return GEQ; }

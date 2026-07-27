@@ -300,21 +300,27 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             ch.hist.push_back(std::move(v));
             // 先物化堆再 prune：否则摘链后读者会读到未刷新的堆页
             if (ch.writer_del) {
-                // 墓碑须同步清堆，否则 prune 摘掉唯一 tombstone 后行会"复活"
                 if (sm_manager_->fhs_.at(tab)->is_record(wr->GetRid())) {
-                    // 水位覆盖本次提交（无更旧活跃快照）时，下方 prune 会把整条链连同
-                    // 墓碑一起摘除，索引项成为指向已释放槽位的悬空引用——必须同步删除，
-                    // 否则索引扫描会读到残留字节，已提交删除的行"复活"（OJ Transaction
-                    // Commit Index 实测）。有更旧活跃快照时链上墓碑保留，索引项须保留
-                    // 供快照读经版本链取旧版本，此时不删。
                     if (prune_wm >= cts) {
+                        // 无更旧活跃快照：下方 prune 会把整条链连同墓碑一起摘除，索引项
+                        // 将成为指向已释放槽位的悬空引用——必须与堆同步清理，否则索引
+                        // 扫描会读到残留字节，已提交删除的行"复活"（OJ Transaction
+                        // Commit Index 实测）。
                         auto old_rec = sm_manager_->fhs_.at(tab)->get_record(wr->GetRid(), nullptr);
                         remove_index_entries_on_commit(
                             sm_manager_, tab, wr->GetRid(),
                             std::string(old_rec->data,
                                         (size_t)sm_manager_->fhs_.at(tab)->get_file_hdr().record_size));
+                        sm_manager_->fhs_.at(tab)->delete_record(wr->GetRid(), nullptr);
+                    } else {
+                        // 有更旧活跃快照：堆槽与索引项都必须保留——seq scan 靠 bitmap
+                        // 发现行、index scan 靠索引项定位 rid，快照可见性由链上墓碑之下
+                        // 的旧版本裁决（此前在此直接删堆导致 pinned reader 的 seq scan
+                        // 丢行）。物理清理登记延迟，待水位越过 cts 后由
+                        // drain_deferred_deletes 物化。
+                        std::scoped_lock<std::mutex> dl(deferred_del_latch_);
+                        deferred_dels_.push_back(DeferredDelete{tab, wr->GetRid(), cts});
                     }
-                    sm_manager_->fhs_.at(tab)->delete_record(wr->GetRid(), nullptr);
                 }
             } else if (!ch.writer_data.empty()) {
                 sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(),
@@ -407,6 +413,8 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     clear_pending_si_for_txn(txn);
     txn->si_overlays().clear();
     txn->set_state(TransactionState::COMMITTED);
+    // 本事务退出后水位可能前移：物化已无快照依赖的延迟删除（空列表时近零开销）
+    drain_deferred_deletes();
 }
 
 /**
@@ -580,6 +588,8 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (lock_manager_ != nullptr) lock_manager_->unlock_all(txn);
     txn->si_overlays().clear();
     txn->set_state(TransactionState::ABORTED);
+    // 与 commit 对称：abort 同样使水位前移
+    drain_deferred_deletes();
 }
 
 /* ------------------------ 题9：MVCC 读 / 插入 / 写 ------------------------ */
@@ -1289,6 +1299,80 @@ void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const R
             ch.hist.clear();
             ch.hist.push_back(std::move(sole));
         }
+    }
+}
+
+void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
+    std::vector<DeferredDelete> ready;
+    std::vector<DeferredDelete> still_pending;
+    {
+        std::scoped_lock<std::mutex> dl(deferred_del_latch_);
+        if (deferred_dels_.empty()) return;
+        timestamp_t wm;
+        {
+            std::scoped_lock<std::mutex> rl(rts_latch_);
+            wm = active_rts_.empty() ? last_commit_ts_.load() : *active_rts_.begin();
+        }
+        // cts <= wm 的登记项已无任何快照可见其旧版本，可物化；其余留在列表
+        auto keep_end = std::partition(deferred_dels_.begin(), deferred_dels_.end(),
+                                       [&](const DeferredDelete &d) { return d.cts > wm; });
+        ready.assign(std::make_move_iterator(keep_end), std::make_move_iterator(deferred_dels_.end()));
+        deferred_dels_.erase(keep_end, deferred_dels_.end());
+        if (force_heap_for_pending) {
+            still_pending.assign(deferred_dels_.begin(), deferred_dels_.end());
+        }
+    }
+    std::vector<DeferredDelete> redo;
+    for (auto &d : ready) {
+        auto fit = sm_manager_->fhs_.find(d.tab);
+        if (fit == sm_manager_->fhs_.end()) continue;      // 表已删，无需清理
+        RmFileHandle *fh = fit->second.get();
+        int64_t rkey = mvcc_key(d.rid);
+        size_t sh = mvcc_shard_idx(d.tab, rkey);
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
+        auto &sd = mvcc_shard_data_[sh];
+        auto tit = sd.store.find(d.tab);
+        if (tit == sd.store.end()) continue;               // 链已不在（如表重建），放弃
+        auto cit = tit->second.find(rkey);
+        if (cit == tit->second.end()) continue;
+        MvccChain &ch = cit->second;
+        // 校验链仍是本次登记的已提交墓碑（防表重建/rid 复用等错配）
+        if (ch.writer != INVALID_TXN_ID || ch.hist.empty() ||
+            !ch.hist.back().is_deleted || ch.hist.back().commit_ts != d.cts) {
+            continue;
+        }
+        auto pit = sd.pending.find(d.tab);
+        if (pit != sd.pending.end() && pit->second.count(rkey)) {
+            redo.push_back(d);                             // 他人 overlay 持有，保守重排队
+            continue;
+        }
+        // 索引 key 数据源：优先活堆槽；堆槽已被 checkpoint 强制清理时取链上墓碑之下的旧版本
+        std::string key_src;
+        if (fh->is_record(d.rid)) {
+            auto rec = fh->get_record(d.rid, nullptr);
+            key_src.assign(rec->data, (size_t)fh->get_file_hdr().record_size);
+        } else if (ch.hist.size() >= 2 && !ch.hist[ch.hist.size() - 2].is_deleted) {
+            key_src = ch.hist[ch.hist.size() - 2].data;
+        }
+        if (!key_src.empty()) {
+            remove_index_entries_on_commit(sm_manager_, d.tab, d.rid, key_src);
+        }
+        if (fh->is_record(d.rid)) fh->delete_record(d.rid, nullptr);
+        tit->second.erase(cit);                            // 整链摘除（等价 prune 的 wm>=cts 分支）
+        if (tit->second.empty()) sd.store.erase(tit);
+    }
+    // checkpoint 专用：水位未越过的登记项也把堆槽先行清理（登记保留，索引/链留待后续 drain）
+    for (auto &d : still_pending) {
+        auto fit = sm_manager_->fhs_.find(d.tab);
+        if (fit == sm_manager_->fhs_.end()) continue;
+        RmFileHandle *fh = fit->second.get();
+        size_t sh = mvcc_shard_idx(d.tab, mvcc_key(d.rid));
+        std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
+        if (fh->is_record(d.rid)) fh->delete_record(d.rid, nullptr);
+    }
+    if (!redo.empty()) {
+        std::scoped_lock<std::mutex> dl(deferred_del_latch_);
+        for (auto &d : redo) deferred_dels_.push_back(std::move(d));
     }
 }
 

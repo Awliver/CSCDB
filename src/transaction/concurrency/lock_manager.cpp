@@ -96,6 +96,18 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     RecordLockEntry &entry = get_record_lock(lock_id);
     std::unique_lock<std::mutex> lk(entry.mtx);
     txn_id_t me = txn->get_transaction_id();
+    // SI（非 SER）写写冲突 no-wait：同一记录存在其它活跃事务的未提交写时立即放弃
+    // （上层抛 TransactionAbortException → TRANSACTION_ABORT）。决赛 SI 模型要求
+    // "active write conflict" 在冲突语句处即刻 abort（OJ 驱动 ~5s 内未收到响应判负）；
+    // 且在严格 first-committer-wins 陈旧写规则下，等对方提交后本写必然 abort
+    // （对方 cts 必 > 本事务 read_ts），阻塞等待只是白等。SER 仍走等待 + 死锁检测，
+    // ser/select_dangerous_structure 类场景依赖该行为。
+    if (txn->get_isolation_level() != IsolationLevel::SERIALIZABLE &&
+        entry.owner != INVALID_TXN_ID && entry.owner != me) {
+        clear_wfg_state(me);
+        txn->clear_lock_abort();
+        return false;
+    }
     while (entry.owner != INVALID_TXN_ID && entry.owner != me) {
         if (txn->lock_abort_requested()) {
             clear_wfg_state(me);
