@@ -10,6 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <string>
+#include <vector>
+
+#include "defs.h"
 #include "transaction/transaction.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "recovery/log_manager.h"
@@ -18,6 +22,39 @@ class TransactionManager;
 
 // used for data_send
 static int const_offset = -1;
+
+// 决赛 Wire Protocol v3：查询结果的一个单元格（脱耦 ColMeta，避免 context.h 依赖 sm_meta.h）
+struct WireCell {
+    ColType type = TYPE_INT;
+    int int_val = 0;
+    float float_val = 0.0f;
+    std::string str_val;
+};
+
+// 决赛 Wire Protocol v3：执行侧只感知本抽象接口，不感知具体 socket/帧编码；
+// 模板方法：on_meta 记录“本次是查询结果”，供上层判断非查询语句是否已经产生过结构化结果。
+class WireResultSink {
+public:
+    virtual ~WireResultSink() = default;
+
+    void on_meta(const std::vector<std::pair<std::string, ColType>> &cols) {
+        sent_result_ = true;
+        emit_meta(cols);
+    }
+    void on_row(const std::vector<WireCell> &cells) { emit_row(cells); }
+    void on_end(uint64_t row_count) { emit_end(row_count); }
+    bool sent_result() const { return sent_result_; }
+    bool failed() const { return failed_; }
+
+protected:
+    virtual void emit_meta(const std::vector<std::pair<std::string, ColType>> &cols) = 0;
+    virtual void emit_row(const std::vector<WireCell> &cells) = 0;
+    virtual void emit_end(uint64_t row_count) = 0;
+    bool failed_ = false;   // 子类：socket 写失败时置位，供上层提前中断
+
+private:
+    bool sent_result_ = false;
+};
 
 class Context {
 public:
@@ -36,4 +73,5 @@ public:
     int *offset_;
     bool ellipsis_;
     bool ser_in_select_ = false;   // 题9 SER：当前扫描是否属于 SELECT（仅 SELECT 记录读集）
+    WireResultSink *wire_sink_ = nullptr;  // 决赛：非空时查询结果走 Wire v3 二进制帧，不走 RecordPrinter
 };

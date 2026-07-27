@@ -95,15 +95,16 @@ extern int yydebug;
     HAVING = 301,
     LIMIT = 302,
     UNION = 303,
-    LEQ = 304,
-    NEQ = 305,
-    GEQ = 306,
-    T_EOF = 307,
-    IDENTIFIER = 308,
-    VALUE_STRING = 309,
-    VALUE_INT = 310,
-    VALUE_FLOAT = 311,
-    VALUE_BOOL = 312
+    DISTINCT = 304,
+    LEQ = 305,
+    NEQ = 306,
+    GEQ = 307,
+    T_EOF = 308,
+    IDENTIFIER = 309,
+    VALUE_STRING = 310,
+    VALUE_INT = 311,
+    VALUE_FLOAT = 312,
+    VALUE_BOOL = 313
   };
 #endif
 

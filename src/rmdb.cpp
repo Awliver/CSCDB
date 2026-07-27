@@ -13,8 +13,10 @@ See the Mulan PSL v2 for more details. */
 #include <readline/readline.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
+#include <unordered_map>
 
 #include "errors.h"
 #include "optimizer/optimizer.h"
@@ -25,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 #include "parser/ast.h"
 #include "common/output_control.h"
+#include "common/wire_protocol.h"
 #include <cctype>
 #include <cstring>
 
@@ -431,9 +434,585 @@ static bool try_parse_load(const char *s, std::string &file_path, std::string &t
     return *p == '\0';
 }
 
+// ============================================================================
+// 决赛 Wire Protocol v3（附件 A）。历史 NUL 协议在 client_handler 中保持原样不变，
+// 见其开头的握手探测分支；本节新增代码不改动、不复用历史分支的任何变量或控制流，
+// 只共享无副作用的纯函数（try_fast_parse_sql / try_parse_load / parse_set_isolation /
+// SetTransaction）。
+// ============================================================================
+
+enum class ExecOutcome { OK, ABORT, ERROR };
+
+// 把 sink 的一个 cell 编码为 wire 字节，追加到 buf（present=1：引擎不产生 SQL NULL）
+static void wire_put_cell(std::string &buf, const WireCell &c) {
+    wire::put_u8(buf, 1);
+    if (c.type == TYPE_INT) {
+        wire::put_i32(buf, c.int_val);
+    } else if (c.type == TYPE_FLOAT) {
+        uint32_t bits;
+        float f = c.float_val;
+        memcpy(&bits, &f, sizeof(bits));
+        wire::put_u32(buf, bits);
+    } else {
+        wire::put_u32(buf, (uint32_t)c.str_val.size());
+        wire::put_bytes(buf, c.str_val.data(), c.str_val.size());
+    }
+}
+
+// EXEC_STREAM：结果直接流式写 socket（大结果不落地缓冲，呼应附件 A §4）
+class StreamSink : public WireResultSink {
+public:
+    explicit StreamSink(int fd) : fd_(fd) {}
+
+protected:
+    void emit_meta(const std::vector<std::pair<std::string, ColType>> &cols) override {
+        std::string payload;
+        wire::put_u16(payload, (uint16_t)cols.size());
+        for (auto &c : cols) wire::put_column_def(payload, c.first, c.second);
+        if (!wire::send_frame(fd_, wire::TAG_META, payload)) failed_ = true;
+    }
+    void emit_row(const std::vector<WireCell> &cells) override {
+        std::string payload;
+        for (auto &c : cells) wire_put_cell(payload, c);
+        if (!wire::send_frame(fd_, wire::TAG_ROW, payload)) failed_ = true;
+    }
+    void emit_end(uint64_t row_count) override {
+        std::string payload;
+        wire::put_u64(payload, row_count);
+        if (!wire::send_frame(fd_, wire::TAG_RESULT_END, payload)) failed_ = true;
+    }
+
+private:
+    int fd_;
+};
+
+// EXEC_BATCH 内单个 query operation：结果先缓冲进内存，随 BATCH_RESULT 一次性发出
+class BufferSink : public WireResultSink {
+public:
+    uint32_t row_count() const { return row_count_; }
+    const std::string &rows_payload() const { return payload_; }
+
+protected:
+    void emit_meta(const std::vector<std::pair<std::string, ColType>> &) override {}
+    void emit_row(const std::vector<WireCell> &cells) override {
+        for (auto &c : cells) wire_put_cell(payload_, c);
+        row_count_++;
+    }
+    void emit_end(uint64_t) override {}
+
+private:
+    std::string payload_;
+    uint32_t row_count_ = 0;
+};
+
+// 单条 SQL 语句的完整生命周期：parse -> analyze -> plan -> portal(start/run) ->
+// (autocommit 则 commit) -> reap。与历史 NUL 协议 client_handler 主循环体行为一致
+// （包括“RMDBError/std::exception 不主动 abort、仍落入尾部 autocommit”的历史语义），
+// 供 EXEC_STREAM 与 EXEC_BATCH 的每个 operation 共用。
+static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, IsolationLevel &sess_iso,
+                                      WireResultSink *sink, std::string &diag) {
+    std::vector<char> scratch(BUFFER_LENGTH);
+    int off = 0;
+    Context context_obj(lock_manager.get(), log_manager.get(), nullptr, scratch.data(), &off);
+    Context *context = &context_obj;
+    context->txn_mgr_ = txn_manager.get();
+    context->wire_sink_ = sink;
+    SetTransaction(txn_id, context, sess_iso);
+
+    ExecOutcome outcome = ExecOutcome::OK;
+    bool finish_analyze = false;
+    bool used_yacc = false;
+    YY_BUFFER_STATE buf = nullptr;
+    std::shared_ptr<ast::TreeNode> fast_tree = try_fast_parse_sql(sql.c_str());
+
+    auto yacc_cleanup_if_needed = [&]() {
+        if (used_yacc && !finish_analyze) {
+            yy_delete_buffer(buf);
+            finish_analyze = true;
+            pthread_mutex_unlock(buffer_mutex);
+        }
+    };
+
+    try {
+        if (fast_tree != nullptr) {
+            std::shared_ptr<Query> query = analyze->do_analyze(fast_tree);
+            finish_analyze = true;
+            std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+            std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
+            portal->run(portalStmt, ql_manager.get(), txn_id, context);
+            portal->drop();
+            if (context->txn_->get_txn_mode() &&
+                context->txn_->get_state() != TransactionState::COMMITTED &&
+                context->txn_->get_state() != TransactionState::ABORTED) {
+                txn_manager->release_statement_writes(context->txn_);
+            }
+        } else {
+            // 与历史 NUL 协议一致：buffer_mutex 全程覆盖到 do_analyze 成功返回为止，
+            // 期间抛出的异常靠 yacc_cleanup_if_needed() 兜底释放 buffer/mutex。
+            used_yacc = true;
+            pthread_mutex_lock(buffer_mutex);
+            buf = yy_scan_string(sql.c_str());
+            if (yyparse() == 0 && ast::parse_tree != nullptr) {
+                std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
+                yy_delete_buffer(buf);
+                finish_analyze = true;
+                pthread_mutex_unlock(buffer_mutex);
+                std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+                std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
+                portal->run(portalStmt, ql_manager.get(), txn_id, context);
+                portal->drop();
+                if (context->txn_->get_txn_mode() &&
+                    context->txn_->get_state() != TransactionState::COMMITTED &&
+                    context->txn_->get_state() != TransactionState::ABORTED) {
+                    txn_manager->release_statement_writes(context->txn_);
+                }
+            } else {
+                yy_delete_buffer(buf);
+                finish_analyze = true;
+                pthread_mutex_unlock(buffer_mutex);
+                diag = "parse error";
+                outcome = ExecOutcome::ERROR;
+            }
+        }
+    } catch (TransactionAbortException &e) {
+        yacc_cleanup_if_needed();
+        txn_manager->abort(context->txn_, log_manager.get());
+        diag = e.GetInfo();
+        outcome = ExecOutcome::ABORT;
+    } catch (RMDBError &e) {
+        yacc_cleanup_if_needed();
+        diag = e.what();
+        outcome = ExecOutcome::ERROR;
+    } catch (std::exception &e) {
+        yacc_cleanup_if_needed();
+        diag = e.what();
+        outcome = ExecOutcome::ERROR;
+    }
+
+    // 与历史 NUL 协议一致：非显式事务在此无条件提交/回收——回复即持久
+    if (context->txn_->get_txn_mode() == false) {
+        txn_manager->commit(context->txn_, context->log_mgr_);
+    }
+    txn_manager->reap(context->txn_);
+    return outcome;
+}
+
+// PREPARE_SET 用类型零值探测语句 schema：只 parse/analyze/plan/portal->start，
+// 不调用 portal->run()，因此对 INSERT/UPDATE/DELETE 绝不产生真实写入；探测事务
+// 全程只读（UPDATE/DELETE 的 rid 预扫描除外，属只读扫描）随后立即结束。
+static bool probe_prepare_schema(const std::string &sql, bool is_query,
+                                  std::vector<std::pair<std::string, ColType>> &out_cols, std::string &diag) {
+    txn_id_t probe_txn = INVALID_TXN_ID;
+    IsolationLevel probe_iso = IsolationLevel::SERIALIZABLE;
+    std::vector<char> scratch(BUFFER_LENGTH);
+    int off = 0;
+    Context context_obj(lock_manager.get(), log_manager.get(), nullptr, scratch.data(), &off);
+    Context *context = &context_obj;
+    context->txn_mgr_ = txn_manager.get();
+    SetTransaction(&probe_txn, context, probe_iso);
+
+    bool ok = true;
+    bool used_yacc = false;
+    YY_BUFFER_STATE buf = nullptr;
+    try {
+        std::shared_ptr<ast::TreeNode> tree = try_fast_parse_sql(sql.c_str());
+        if (tree == nullptr) {
+            used_yacc = true;
+            pthread_mutex_lock(buffer_mutex);
+            buf = yy_scan_string(sql.c_str());
+            if (yyparse() != 0 || ast::parse_tree == nullptr) {
+                yy_delete_buffer(buf);
+                pthread_mutex_unlock(buffer_mutex);
+                diag = "parse error";
+                ok = false;
+            } else {
+                tree = ast::parse_tree;
+            }
+        }
+        if (ok) {
+            std::shared_ptr<Query> query = analyze->do_analyze(tree);
+            if (used_yacc) {
+                yy_delete_buffer(buf);
+                pthread_mutex_unlock(buffer_mutex);
+                used_yacc = false;
+            }
+            std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+            std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
+            if (is_query) {
+                if (portalStmt->tag != PORTAL_ONE_SELECT || !portalStmt->root) {
+                    diag = "statement_id declared query but is not a SELECT";
+                    ok = false;
+                } else {
+                    for (auto &c : portalStmt->root->cols()) out_cols.emplace_back(c.name, c.type);
+                }
+            } else if (portalStmt->tag == PORTAL_ONE_SELECT) {
+                diag = "statement_id declared command but is a SELECT";
+                ok = false;
+            }
+        }
+    } catch (std::exception &e) {
+        if (used_yacc) { yy_delete_buffer(buf); pthread_mutex_unlock(buffer_mutex); }
+        diag = e.what();
+        ok = false;
+    }
+
+    Transaction *t = txn_manager->get_transaction(probe_txn);
+    if (t != nullptr) {
+        if (t->get_txn_mode() == false) txn_manager->abort(t, log_manager.get());
+        txn_manager->reap(t);
+    }
+    return ok;
+}
+
+// 用给定字面量文本替换 SQL 模板中的 $1..$n；跳过单引号字符串内部的 $n（那只是文本，
+// 不是 marker，见附件 A §5）。生成字面量本身经过转义/精度处理（见 wire_param_literal），
+// 因此这里的替换等价于 typed bind，不是未转义字符串拼接。
+static std::string wire_substitute_params(const std::string &tmpl, const std::vector<std::string> &literals) {
+    std::string out;
+    out.reserve(tmpl.size() + literals.size() * 4);
+    bool in_str = false;
+    for (size_t i = 0; i < tmpl.size();) {
+        char c = tmpl[i];
+        if (in_str) {
+            out.push_back(c);
+            if (c == '\'') in_str = false;
+            i++;
+            continue;
+        }
+        if (c == '\'') { in_str = true; out.push_back(c); i++; continue; }
+        if (c == '$' && i + 1 < tmpl.size() && isdigit((unsigned char)tmpl[i + 1])) {
+            size_t j = i + 1;
+            int num = 0;
+            while (j < tmpl.size() && isdigit((unsigned char)tmpl[j])) { num = num * 10 + (tmpl[j] - '0'); j++; }
+            if (num >= 1 && (size_t)num <= literals.size()) {
+                out += literals[num - 1];
+                i = j;
+                continue;
+            }
+        }
+        out.push_back(c);
+        i++;
+    }
+    return out;
+}
+
+// 从 EXEC_BATCH operation 的 wire 字节流中按声明类型解出一个参数，生成可安全内嵌进
+// SQL 文本的字面量。present=0（NULL）时按类型零值兜底：正式 TPC-C 负载不绑定 SQL
+// NULL（附件 A §3），此兜底只覆盖功能测试之外的边角。
+static std::string wire_param_literal(uint8_t sql_type, wire::Reader &r) {
+    uint8_t present = r.u8();
+    if (present > 1) throw wire::WireProtocolError("invalid present byte");
+    if (present == 0) {
+        if (sql_type == wire::SQLTYPE_INT32) return "0";
+        if (sql_type == wire::SQLTYPE_FLOAT32) return "0.0";
+        return "''";
+    }
+    if (sql_type == wire::SQLTYPE_INT32) {
+        return std::to_string(r.i32());
+    } else if (sql_type == wire::SQLTYPE_FLOAT32) {
+        uint32_t bits = r.u32();
+        float f;
+        memcpy(&f, &bits, sizeof(f));
+        char tmp[64];
+        // float32 十进制往返所需的有效位数上限为 9；配合词法 {sign}?digit+\.({digit}+)?
+        // 恒生成含小数点的形式，避免被误判成整数字面量。
+        snprintf(tmp, sizeof(tmp), "%.9g", f);
+        std::string s(tmp);
+        if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+            s.find("inf") == std::string::npos && s.find("nan") == std::string::npos) {
+            s += ".0";
+        }
+        return s;
+    } else {
+        uint32_t n = r.u32();
+        std::string s(r.bytes(n), n);
+        if (s.find('\'') != std::string::npos) {
+            // 决赛已知限制：当前词法 value_string 不支持转义单引号，无法安全内嵌该
+            // 字面量；TPC-C 正式负载（姓名音节表等）不产生此类值，此处主动报错而非
+            // 静默截断/注入。
+            throw wire::WireProtocolError("CHAR parameter contains ' which cannot be safely embedded");
+        }
+        return "'" + s + "'";
+    }
+}
+
+struct WirePreparedStmt {
+    std::string sql_template;
+    std::vector<uint8_t> param_types;
+    bool is_query = false;
+    std::vector<std::pair<std::string, ColType>> out_cols;
+};
+
+static void handle_prepare_set(int fd, const std::string &payload,
+                                std::unordered_map<uint16_t, WirePreparedStmt> &prepared) {
+    wire::Reader r(payload.data(), payload.size());
+    uint16_t stmt_count = r.u16();
+    if (stmt_count < 1 || stmt_count > 256) throw wire::WireProtocolError("statement_count out of range");
+
+    std::vector<uint16_t> ids;
+    std::unordered_map<uint16_t, WirePreparedStmt> fresh;
+    for (uint16_t i = 0; i < stmt_count; i++) {
+        uint16_t id = r.u16();
+        if (id == 0) throw wire::WireProtocolError("statement id must be nonzero");
+        if (fresh.count(id)) throw wire::WireProtocolError("duplicate statement id in request");
+        uint8_t result_kind = r.u8();
+        uint16_t param_count = r.u16();
+        WirePreparedStmt st;
+        st.is_query = (result_kind == 1);
+        st.param_types.reserve(param_count);
+        for (uint16_t k = 0; k < param_count; k++) st.param_types.push_back(r.u8());
+        uint32_t sql_bytes = r.u32();
+        st.sql_template = std::string(r.bytes(sql_bytes), sql_bytes);
+        fresh[id] = std::move(st);
+        ids.push_back(id);
+    }
+    if (!r.at_end()) throw wire::WireProtocolError("trailing bytes in PREPARE_SET payload");
+
+    std::string resp;
+    wire::put_u16(resp, stmt_count);
+    for (uint16_t id : ids) {
+        WirePreparedStmt &st = fresh[id];
+        std::vector<std::string> dummy(st.param_types.size());
+        for (size_t k = 0; k < dummy.size(); k++) {
+            dummy[k] = (st.param_types[k] == wire::SQLTYPE_INT32) ? "0"
+                       : (st.param_types[k] == wire::SQLTYPE_FLOAT32) ? "0.0" : "''";
+        }
+        std::string probe_sql = wire_substitute_params(st.sql_template, dummy);
+        std::vector<std::pair<std::string, ColType>> cols;
+        std::string diag;
+        if (!probe_prepare_schema(probe_sql, st.is_query, cols, diag)) {
+            wire::send_frame(fd, wire::TAG_ERROR,
+                             wire::truncate_diag("PREPARE_SET failed for statement " + std::to_string(id) +
+                                                  ": " + diag));
+            return;  // 旧字典保持不变（未替换 prepared）
+        }
+        st.out_cols = cols;
+        wire::put_u16(resp, id);
+        wire::put_u16(resp, st.is_query ? (uint16_t)cols.size() : 0);
+        if (st.is_query) {
+            for (auto &c : cols) wire::put_column_def(resp, c.first, c.second);
+        }
+    }
+    if (!wire::send_frame(fd, wire::TAG_PREPARE_OK, resp)) throw wire::WireProtocolError("write failed");
+    prepared = std::move(fresh);  // 整字典原子替换：全部探测成功后才落地
+}
+
+static void handle_exec_batch(int fd, const std::string &payload,
+                               std::unordered_map<uint16_t, WirePreparedStmt> &prepared, txn_id_t *txn_id,
+                               IsolationLevel &sess_iso) {
+    wire::Reader r(payload.data(), payload.size());
+    uint16_t op_count = r.u16();
+    if (op_count < 1 || op_count > 256) throw wire::WireProtocolError("operation_count out of range");
+
+    struct OpResult { uint16_t op_index; uint32_t row_count; std::string rows_payload; };
+    std::vector<OpResult> results;
+    uint16_t executed = 0;
+    uint8_t status = wire::BATCH_STATUS_OK;
+    uint16_t failed_op = 0xffff;
+    std::string diag;
+
+    for (uint16_t op = 0; op < op_count; op++) {
+        uint16_t stmt_id;
+        std::vector<std::string> literals;
+        bool decode_ok = true;
+        try {
+            stmt_id = r.u16();
+            auto it = prepared.find(stmt_id);
+            if (it == prepared.end()) throw wire::WireProtocolError("unknown statement id " + std::to_string(stmt_id));
+            WirePreparedStmt &st = it->second;
+            literals.resize(st.param_types.size());
+            for (size_t k = 0; k < st.param_types.size(); k++) literals[k] = wire_param_literal(st.param_types[k], r);
+        } catch (std::exception &e) {
+            decode_ok = false;
+            diag = e.what();
+        }
+        if (!decode_ok) { status = wire::BATCH_STATUS_ERROR; failed_op = op; break; }
+
+        WirePreparedStmt &st = prepared.at(stmt_id);
+        std::string sql = wire_substitute_params(st.sql_template, literals);
+
+        if (st.is_query) {
+            BufferSink sink;
+            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag);
+            if (outc != ExecOutcome::OK) {
+                status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
+                failed_op = op;
+                break;
+            }
+            results.push_back(OpResult{op, sink.row_count(), sink.rows_payload()});
+        } else {
+            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag);
+            if (outc != ExecOutcome::OK) {
+                status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
+                failed_op = op;
+                break;
+            }
+        }
+        executed++;
+    }
+
+    // AUTO_ABORT：失败且连接存在活动（显式）事务时，必须先完成回滚再回失败响应
+    if (status != wire::BATCH_STATUS_OK) {
+        Transaction *t = txn_manager->get_transaction(*txn_id);
+        if (t != nullptr && t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
+            t->get_state() != TransactionState::ABORTED) {
+            txn_manager->abort(t, log_manager.get());
+        }
+    }
+
+    std::string resp;
+    wire::put_u16(resp, executed);
+    wire::put_u8(resp, status);
+    wire::put_u16(resp, (status == wire::BATCH_STATUS_OK) ? 0xffff : failed_op);
+    std::string diag_trunc = wire::truncate_diag(diag);
+    wire::put_u32(resp, (uint32_t)diag_trunc.size());
+    wire::put_bytes(resp, diag_trunc.data(), diag_trunc.size());
+    if (status == wire::BATCH_STATUS_OK) {
+        wire::put_u16(resp, (uint16_t)results.size());
+        for (auto &rr : results) {
+            wire::put_u16(resp, rr.op_index);
+            wire::put_u32(resp, rr.row_count);
+            wire::put_bytes(resp, rr.rows_payload.data(), rr.rows_payload.size());
+        }
+    } else {
+        wire::put_u16(resp, 0);
+    }
+    if (resp.size() > wire::MAX_PAYLOAD_BYTES) throw wire::WireProtocolError("BATCH_RESULT exceeds 1 MiB");
+    if (!wire::send_frame(fd, wire::TAG_BATCH_RESULT, resp)) throw wire::WireProtocolError("write failed");
+}
+
+static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id, IsolationLevel &sess_iso) {
+    IsolationLevel new_iso;
+    if (parse_set_isolation(sql.c_str(), &new_iso)) {
+        sess_iso = new_iso;
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+        return;
+    }
+    if (strncasecmp(sql.c_str(), "create static_checkpoint", 24) == 0) {
+        sm_manager->do_checkpoint(log_manager.get());
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+        return;
+    }
+    {
+        std::string load_file, load_tab;
+        if (try_parse_load(sql.c_str(), load_file, load_tab)) {
+            std::vector<char> scratch(BUFFER_LENGTH);
+            int off = 0;
+            Context context_obj(lock_manager.get(), log_manager.get(), nullptr, scratch.data(), &off);
+            Context *context = &context_obj;
+            context->txn_mgr_ = txn_manager.get();
+            SetTransaction(txn_id, context, sess_iso);
+            try {
+                ql_manager->run_load(load_file, load_tab, context);
+            } catch (std::exception &e) {
+                txn_manager->abort(context->txn_, log_manager.get());
+                wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));
+                return;
+            }
+            if (context->txn_->get_txn_mode() == false) txn_manager->commit(context->txn_, context->log_mgr_);
+            txn_manager->reap(context->txn_);
+            if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+            return;
+        }
+    }
+
+    StreamSink sink(fd);
+    std::string diag;
+    ExecOutcome outcome = run_sql_statement(sql, txn_id, sess_iso, &sink, diag);
+    if (sink.failed()) throw wire::WireProtocolError("client write failed mid-result");
+
+    if (outcome == ExecOutcome::ABORT) {
+        wire::send_frame(fd, wire::TAG_TRANSACTION_ABORT, wire::truncate_diag(diag));
+        return;
+    }
+    if (outcome == ExecOutcome::ERROR) {
+        wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(diag));
+        return;
+    }
+    if (!sink.sent_result()) {
+        // 非查询成功：DDL/DML/事务控制/LOAD 等——payload 为空的 COMMAND_OK
+        // （已知缺口：show tables/desc/help/explain 仍只写入历史文本旁路，wire 模式下
+        // 暂不回传该文本，只回 COMMAND_OK；不影响 TPC-C 排名与正确性门禁必需路径）
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+    }
+}
+
+static void handle_wire_connection(int fd) {
+    char hs[8];
+    if (!wire::read_exact(fd, hs, 8)) return;       // 握手阶段断开
+    if (!wire::write_all_bytes(fd, hs, 8)) return;  // 原样回送 8 字节，不做版本校验
+
+    txn_id_t txn_id = INVALID_TXN_ID;
+    IsolationLevel sess_iso = IsolationLevel::SERIALIZABLE;
+    std::unordered_map<uint16_t, WirePreparedStmt> prepared;
+
+    while (true) {
+        wire::FrameHeader fh;
+        bool have;
+        try {
+            have = wire::read_frame_header(fd, fh);
+        } catch (wire::WireProtocolError &) {
+            break;
+        }
+        if (!have) break;
+
+        try {
+            std::string payload;
+            if (!wire::read_payload(fd, fh.payload_bytes, payload)) break;
+            switch (fh.tag) {
+                case wire::TAG_EXEC_STREAM:
+                    if (fh.flags != 0) throw wire::WireProtocolError("EXEC_STREAM flags must be 0");
+                    handle_exec_stream(fd, payload, &txn_id, sess_iso);
+                    break;
+                case wire::TAG_PREPARE_SET:
+                    if (fh.flags != 0) throw wire::WireProtocolError("PREPARE_SET flags must be 0");
+                    handle_prepare_set(fd, payload, prepared);
+                    break;
+                case wire::TAG_EXEC_BATCH:
+                    if (fh.flags != wire::EXEC_BATCH_FLAG_AUTO_ABORT)
+                        throw wire::WireProtocolError("EXEC_BATCH flags must be AUTO_ABORT");
+                    handle_exec_batch(fd, payload, prepared, &txn_id, sess_iso);
+                    break;
+                default:
+                    throw wire::WireProtocolError("unknown request tag " + std::to_string((int)fh.tag));
+            }
+        } catch (wire::WireProtocolError &e) {
+            std::cerr << "[wire] protocol error, closing connection: " << e.what() << std::endl;
+            wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));
+            break;
+        }
+    }
+
+    if (txn_id != INVALID_TXN_ID) {
+        Transaction *t = txn_manager->get_transaction(txn_id);
+        if (t != nullptr) {
+            if (t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
+                t->get_state() != TransactionState::ABORTED) {
+                txn_manager->abort(t, log_manager.get());
+            } else {
+                txn_manager->reap(t);
+            }
+        }
+    }
+}
+
 void *client_handler(void *sock_fd) {
     int fd = (int)(intptr_t)sock_fd;
     pthread_mutex_unlock(sockfd_mutex);
+
+    // 决赛 Wire Protocol v3：peek 前 4 字节判断是否为新协议握手，不消费字节——
+    // 不匹配（历史 NUL 客户端）时下面的历史协议分支会原样重新读到这些字节。
+    {
+        unsigned char peek4[4];
+        ssize_t pn = recv(fd, peek4, 4, MSG_PEEK);
+        if (pn == 4 && peek4[0] == 'R' && peek4[1] == 'M' && peek4[2] == 'D' && peek4[3] == 'B') {
+            std::cout << "Wire Protocol v3 connection, sockfd: " << fd << std::endl;
+            handle_wire_connection(fd);
+            std::cout << "Terminating current wire client_connection..." << std::endl;
+            close(fd);
+            pthread_exit(NULL);
+        }
+    }
 
     int i_recvBytes;
     // 接收客户端发送的请求（按 '\0' 分帧：容忍 TCP 半包/粘包；缓冲随语句长度增长）

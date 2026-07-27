@@ -80,6 +80,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "MIN" { return MIN; }
 "SUM" { return SUM; }
 "AVG" { return AVG; }
+"DISTINCT" { return DISTINCT; }
 "AS" { return AS; }
 "GROUP" { return GROUP; }
 "HAVING" { return HAVING; }

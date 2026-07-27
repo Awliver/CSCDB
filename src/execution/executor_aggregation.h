@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "execution_defs.h"
@@ -38,7 +39,7 @@ private:
     struct AggState {
         int64_t count = 0;
         int64_t int_sum = 0;
-        float float_sum = 0.0f;
+        double float_sum = 0.0;  // 决赛 FLOAT32 规则：binary64 累加，输出前一次舍回 binary32
         int int_max = INT_MIN;
         float float_max = -FLT_MAX;
         int int_min = INT_MAX;
@@ -47,6 +48,7 @@ private:
         std::string str_min;
         int64_t sum_cnt = 0;
         bool has_value = false;
+        std::unordered_set<std::string> distinct_seen;  // 决赛：COUNT(DISTINCT col) 去重集合
     };
 
     std::unordered_map<std::string, std::vector<AggState>> groups_;
@@ -217,7 +219,7 @@ Value AggExecutor::get_agg_value(const AggregateInfo &agg, const AggState &st) {
         case ast::AGG_COUNT: return agg_make_int(static_cast<int>(st.count));
         case ast::AGG_SUM:
             if (agg.arg_type == TYPE_INT) return agg_make_int(static_cast<int>(st.int_sum));
-            else return agg_make_float(st.float_sum);
+            else return agg_make_float(static_cast<float>(st.float_sum));
         case ast::AGG_MAX:
             if (!st.has_value) return agg_make_empty();
             if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_max);
@@ -230,9 +232,9 @@ Value AggExecutor::get_agg_value(const AggregateInfo &agg, const AggState &st) {
             return agg_make_str(st.str_min);
         case ast::AGG_AVG:
             return (st.sum_cnt > 0)
-                       ? agg_make_float((agg.arg_type == TYPE_INT)
-                                   ? (static_cast<float>(st.int_sum) / st.sum_cnt)
-                                   : (st.float_sum / st.sum_cnt))
+                       ? agg_make_float(static_cast<float>((agg.arg_type == TYPE_INT)
+                                   ? (static_cast<double>(st.int_sum) / st.sum_cnt)
+                                   : (st.float_sum / st.sum_cnt)))
                        : agg_make_float(0.0f);
     }
     return agg_make_empty();
@@ -355,7 +357,15 @@ void AggExecutor::beginTuple() {
                                        (agg.col.tab_name.empty() || c.tab_name == agg.col.tab_name);
                             });
                         if (col_it != prev_->cols().end() && !is_null(rec->data, *col_it)) {
-                            st.count++;
+                            if (agg.distinct) {
+                                // 决赛：COUNT(DISTINCT col) —— 按列原始字节去重后计数
+                                std::string dkey(rec->data + col_it->offset, col_it->len);
+                                if (st.distinct_seen.insert(std::move(dkey)).second) {
+                                    st.count++;
+                                }
+                            } else {
+                                st.count++;
+                            }
                         }
                     }
                     break;
@@ -477,9 +487,10 @@ void AggExecutor::build_cur() {
                 if (out_type == TYPE_INT) {
                     *(int *)slot = static_cast<int>(st.int_sum);
                 } else {
+                    // 决赛 FLOAT32：SUM 全程 binary64 累加，此处一次性舍回 binary32
                     *(float *)slot = (agg.arg_type == TYPE_INT)
                                          ? static_cast<float>(st.int_sum)
-                                         : st.float_sum;
+                                         : static_cast<float>(st.float_sum);
                 }
                 break;
 
@@ -513,8 +524,8 @@ void AggExecutor::build_cur() {
 
             case ast::AGG_AVG:
                 *(float *)slot = (st.sum_cnt > 0)
-                                     ? ((agg.arg_type == TYPE_INT)
-                                            ? (static_cast<float>(st.int_sum) / st.sum_cnt)
+                                     ? static_cast<float>((agg.arg_type == TYPE_INT)
+                                            ? (static_cast<double>(st.int_sum) / st.sum_cnt)
                                             : (st.float_sum / st.sum_cnt))
                                      : 0.0f;
                 break;

@@ -435,6 +435,44 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     }
 
+    // 决赛 Wire Protocol v3：结果走二进制 META/ROW*/RESULT_END，不进文本 RecordPrinter/output.txt
+    if (context && context->wire_sink_) {
+        auto &wcols = executorTreeRoot->cols();
+        std::vector<std::pair<std::string, ColType>> meta;
+        meta.reserve(wcols.size());
+        for (size_t i = 0; i < wcols.size() && i < captions.size(); i++) {
+            meta.emplace_back(captions[i], wcols[i].type);
+        }
+        context->wire_sink_->on_meta(meta);
+        uint64_t num_rec = 0;
+        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+            if (limit >= 0 && num_rec >= (uint64_t)limit) break;
+            auto Tuple = executorTreeRoot->Next();
+            std::vector<WireCell> cells;
+            cells.reserve(wcols.size());
+            for (auto &col : wcols) {
+                WireCell cell;
+                cell.type = col.type;
+                char *p = Tuple->data + col.offset;
+                if (col.type == TYPE_INT) {
+                    cell.int_val = *(int *)p;
+                } else if (col.type == TYPE_FLOAT) {
+                    cell.float_val = *(float *)p;
+                } else {
+                    std::string s((char *)p, col.len);
+                    s.resize(strlen(s.c_str()));
+                    cell.str_val = std::move(s);
+                }
+                cells.push_back(std::move(cell));
+            }
+            context->wire_sink_->on_row(cells);
+            num_rec++;
+            if (context->wire_sink_->failed()) break;
+        }
+        context->wire_sink_->on_end(num_rec);
+        return;
+    }
+
     // Print header into buffer
     RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(context);

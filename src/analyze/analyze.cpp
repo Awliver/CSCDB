@@ -120,6 +120,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             agg.type = sv_agg->agg_type;
             agg.is_star = sv_agg->is_star;
             agg.alias = sv_agg->alias;
+            agg.distinct = sv_agg->distinct;
             if (sv_agg->col) {
                 agg.col = {.tab_name = sv_agg->col->tab_name, .col_name = sv_agg->col->col_name};
                 if (!agg.col.tab_name.empty() && query->alias2real.count(agg.col.tab_name))

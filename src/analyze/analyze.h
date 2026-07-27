@@ -28,6 +28,7 @@ struct AggregateInfo {
     bool is_star;
     ColType arg_type;
     bool in_output = true;
+    bool distinct = false;   // 决赛：原生 COUNT(DISTINCT col)
 
     std::string to_string() const {
         std::string name;

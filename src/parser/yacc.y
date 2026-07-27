@@ -23,7 +23,7 @@ using namespace ast;
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
-%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION
+%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION DISTINCT
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -484,6 +484,16 @@ agg_func:
     |   COUNT '(' col ')' opt_alias
     {
         $$ = std::make_shared<AggExpr>(AGG_COUNT, $3, $5, false);
+    }
+    |   COUNT '(' DISTINCT col ')' opt_alias
+    {
+        /* 决赛：原生 COUNT(DISTINCT col) */
+        $$ = std::make_shared<AggExpr>(AGG_COUNT, $4, $6, false, true);
+    }
+    |   COUNT '(' DISTINCT '(' col ')' ')' opt_alias
+    {
+        /* 决赛：COUNT(DISTINCT (col)) 括号变体 */
+        $$ = std::make_shared<AggExpr>(AGG_COUNT, $5, $8, false, true);
     }
     |   MAX '(' col ')' opt_alias
     {

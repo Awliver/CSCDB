@@ -167,8 +167,9 @@ struct AggExpr : public Expr {
     std::shared_ptr<Col> col;
     std::string alias;
     bool is_star;
-    AggExpr(AggType t, std::shared_ptr<Col> c, std::string a, bool star = false)
-        : agg_type(t), col(std::move(c)), alias(std::move(a)), is_star(star) {}
+    bool distinct;    // 决赛：原生 COUNT(DISTINCT col) / COUNT(DISTINCT (col))
+    AggExpr(AggType t, std::shared_ptr<Col> c, std::string a, bool star = false, bool dist = false)
+        : agg_type(t), col(std::move(c)), alias(std::move(a)), is_star(star), distinct(dist) {}
 
     std::string to_string() const {
         std::string name;
