@@ -240,8 +240,11 @@ public:
        新键插入(无可见旧版本)、自删重插(writer==me)、早已提交的重复键 均不冲突。 */
     bool mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
                                   const char *rec_data, int key_off, int key_len);
+    /* heap_live=false 表示调用方已确认该 rid 的堆槽位不存活（bitmap 未置位，典型来源是
+       陈旧索引项指向已物理删除的记录）：此时"无版本链 → 回退堆数据"的路径必须判为不可见，
+       且不得解引用 heap_data（允许传 nullptr）。 */
     bool mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
-                   const char *heap_data, int len, std::string &out);
+                   const char *heap_data, int len, std::string &out, bool heap_live = true);
     /* 插入：登记一条未提交插入版本（rid 为堆插入返回的位置） */
     void mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
                      const char *data, int len);

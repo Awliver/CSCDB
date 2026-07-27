@@ -114,6 +114,19 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
 
     // 题9 MVCC：内表记录按本事务快照重建可见版本；不可见返回 false（与 SeqScan/IndexScan 一致）
     bool read_right_visible(const Rid &rid, RmRecord &out) {
+        // 陈旧索引项防护：槽位已释放（已提交删除）时 get_record 会抛 RecordNotFoundError；
+        // 无版本链兜底则该 rid 不可见，有链则按快照经版本链重建（不触碰堆字节）。
+        if (!right_fh_->is_record(rid)) {
+            if (!mvcc_on_ || context_ == nullptr || context_->txn_mgr_ == nullptr) return false;
+            std::string buf;
+            if (!context_->txn_mgr_->mvcc_read(context_->txn_, right_table_, rid,
+                                               nullptr, right_record_size_, buf, false)) {
+                return false;
+            }
+            if ((int)buf.size() < right_record_size_) return false;
+            memcpy(out.data, buf.data(), right_record_size_);
+            return true;
+        }
         auto right_rec = right_fh_->get_record(rid, context_);
         if (!mvcc_on_) {
             memcpy(out.data, right_rec->data, right_record_size_);

@@ -11,6 +11,67 @@ See the Mulan PSL v2 for more details. */
 #include "analyze.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace {
+
+/* int 列 vs float 字面量比较的语义保持改写结果 */
+enum class IntFloatRewrite { CONVERTED, ALWAYS_TRUE, ALWAYS_FALSE };
+
+/* 把 "int_col <op> float_lit" 改写为纯 int 比较，保持数值比较语义：
+ * - 字面量为整数值且在 int32 范围内：直接转 int，op 不变；
+ * - 非整数值：EQ 恒假、NE 恒真；LT/LE → <= floor，GT/GE → >= floor+1；
+ * - 超出 int32 范围（含 ±inf）：按方向折叠为恒真/恒假；NaN 一律恒假。
+ * float→double 提升精确，全部判定无舍入误差。 */
+IntFloatRewrite rewrite_int_col_float_val(Condition &cond) {
+    const double d = static_cast<double>(cond.rhs_val.float_val);
+    if (std::isnan(d)) return IntFloatRewrite::ALWAYS_FALSE;
+    const double lo = static_cast<double>(INT32_MIN);
+    const double hi = static_cast<double>(INT32_MAX);
+    if (d > hi) {   // 所有 int32 都 < d（含 +inf）
+        if (cond.op == OP_LT || cond.op == OP_LE || cond.op == OP_NE) return IntFloatRewrite::ALWAYS_TRUE;
+        return IntFloatRewrite::ALWAYS_FALSE;   // EQ/GT/GE
+    }
+    if (d < lo) {   // 所有 int32 都 > d（含 -inf）
+        if (cond.op == OP_GT || cond.op == OP_GE || cond.op == OP_NE) return IntFloatRewrite::ALWAYS_TRUE;
+        return IntFloatRewrite::ALWAYS_FALSE;   // EQ/LT/LE
+    }
+    if (d == std::floor(d)) {
+        cond.rhs_val.set_int(static_cast<int>(d));
+        return IntFloatRewrite::CONVERTED;
+    }
+    // 非整数值：介于 floor(d) 与 floor(d)+1 之间，且两端都在 int32 范围内
+    const int fl = static_cast<int>(std::floor(d));
+    switch (cond.op) {
+        case OP_EQ: return IntFloatRewrite::ALWAYS_FALSE;
+        case OP_NE: return IntFloatRewrite::ALWAYS_TRUE;
+        case OP_LT:
+        case OP_LE:
+            cond.op = OP_LE;
+            cond.rhs_val.set_int(fl);
+            return IntFloatRewrite::CONVERTED;
+        case OP_GT:
+        case OP_GE:
+            cond.op = OP_GE;
+            cond.rhs_val.set_int(fl + 1);
+            return IntFloatRewrite::CONVERTED;
+    }
+    return IntFloatRewrite::ALWAYS_FALSE;
+}
+
+/* float 字面量赋给 int 列（INSERT 值 / UPDATE SET）：整数值精确转换，非整数值
+ * 四舍五入（远离零，与主流实现一致）；NaN/超出 int32 范围仍走类型错误。 */
+bool coerce_float_val_to_int(Value &v) {
+    const double d = static_cast<double>(v.float_val);
+    if (std::isnan(d)) return false;
+    const double r = std::round(d);
+    if (r < static_cast<double>(INT32_MIN) || r > static_cast<double>(INT32_MAX)) return false;
+    v.set_int(static_cast<int>(r));
+    return true;
+}
+
+}  // namespace
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
@@ -267,6 +328,12 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 类型提升
         if (col_it->type == TYPE_FLOAT && set.rhs.type == TYPE_INT) {
             set.rhs.set_float(static_cast<float>(set.rhs.int_val));
+        } else if (col_it->type == TYPE_INT && set.rhs.type == TYPE_FLOAT) {
+            // int 列赋 float 值（含 col=col±float 的增量）：数值可表示时四舍五入转 int；
+            // 整数 k 有 round(k+d)=k+round(d)，增量取整与结果取整等价
+            if (!coerce_float_val_to_int(set.rhs)) {
+                throw IncompatibleTypeError(coltype2str(col_it->type), coltype2str(set.rhs.type));
+            }
         }
         if (col_it->type != set.rhs.type) {
             throw IncompatibleTypeError(coltype2str(col_it->type),
@@ -313,6 +380,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             auto &col = tab.cols[i];
             if (col.type == TYPE_FLOAT && v.type == TYPE_INT) {
                 v.set_float(static_cast<float>(v.int_val));
+            } else if (col.type == TYPE_INT && v.type == TYPE_FLOAT) {
+                // int 列插入 float 字面量：数值可表示时四舍五入转 int，否则仍报类型错误
+                if (!coerce_float_val_to_int(v)) {
+                    throw IncompatibleTypeError(coltype2str(col.type), coltype2str(v.type));
+                }
             }
             if (col.type != v.type) {
                 throw IncompatibleTypeError(coltype2str(col.type), coltype2str(v.type));
@@ -466,6 +538,8 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
     std::vector<ColMeta> all_cols;
     get_all_cols(tab_names, all_cols);
     // Get raw values in where clause
+    std::vector<Condition> kept;
+    kept.reserve(conds.size());
     for (auto &cond : conds) {
         // Infer table name from column name
         cond.lhs_col = check_column(all_cols, cond.lhs_col);
@@ -480,6 +554,15 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
             // 类型提升
             if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
                 cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
+            } else if (lhs_type == TYPE_INT && cond.rhs_val.type == TYPE_FLOAT) {
+                // int 列 vs float 字面量：按数值比较语义改写为纯 int 比较
+                // （直接截断字面量会改变 <、> 的语义，如 k > 0.5 ≠ k > 0）
+                IntFloatRewrite rw = rewrite_int_col_float_val(cond);
+                if (rw == IntFloatRewrite::ALWAYS_TRUE) continue;   // 恒真条件直接删除
+                if (rw == IntFloatRewrite::ALWAYS_FALSE) {
+                    cond.op = OP_LT;                                 // k < INT32_MIN 恒假
+                    cond.rhs_val.set_int(INT32_MIN);
+                }
             }
             cond.rhs_val.init_raw(lhs_col->len);
             rhs_type = cond.rhs_val.type;
@@ -491,7 +574,9 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
         if (lhs_type != rhs_type) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
+        kept.push_back(std::move(cond));
     }
+    conds.swap(kept);
 }
 
 

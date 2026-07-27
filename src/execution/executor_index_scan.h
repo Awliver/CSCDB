@@ -46,6 +46,7 @@ class IndexScanExecutor : public AbstractExecutor {
     int cached_table_page_no_ = -1;
     Page *cached_table_page_ = nullptr;
     char *cached_table_slots_ = nullptr;
+    char *cached_table_bitmap_ = nullptr;   // 槽位存活性校验（陈旧索引项防护）
     int table_record_size_ = 0;
 
     // 题3 批 11：预编译条件 + 跳过冗余检查
@@ -110,6 +111,7 @@ class IndexScanExecutor : public AbstractExecutor {
             cached_table_page_ = nullptr;
             cached_table_page_no_ = -1;
             cached_table_slots_ = nullptr;
+            cached_table_bitmap_ = nullptr;
         }
     }
 
@@ -120,8 +122,14 @@ class IndexScanExecutor : public AbstractExecutor {
             cached_table_page_ = handle.page;
             cached_table_page_no_ = rid.page_no;
             cached_table_slots_ = handle.slots;
+            cached_table_bitmap_ = handle.bitmap;
         }
         return cached_table_slots_ + rid.slot_no * table_record_size_;
+    }
+
+    /* 当前缓存页上该槽位是否存活（bitmap 置位）。须在 get_table_slot(rid) 之后调用 */
+    bool table_slot_live(const Rid &rid) const {
+        return cached_table_bitmap_ != nullptr && Bitmap::is_set(cached_table_bitmap_, rid.slot_no);
     }
 
     /**
@@ -235,15 +243,21 @@ class IndexScanExecutor : public AbstractExecutor {
 
             const char *slot = get_table_slot(rid_);  // 0-alloc 直接读 slot
             const char *rec_data = slot;
+            // 陈旧索引项防护：已提交删除会释放堆槽，而快照读期间索引项可能尚在。
+            // 槽位不存活时，无版本链兜底的记录必须判为不可见，绝不能返回残留字节。
+            const bool slot_live = table_slot_live(rid_);
 
             if (mvcc_on_) {
                 // 题9：按本事务快照重建可见版本；不可见/已删则跳过（与 SeqScan 一致）
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_,
-                                                   slot, table_record_size_, mvcc_buf_)) {
+                                                   slot, table_record_size_, mvcc_buf_, slot_live)) {
                     scan_->next();
                     continue;
                 }
                 rec_data = mvcc_buf_.data();
+            } else if (!slot_live) {
+                scan_->next();
+                continue;
             }
 
             if (need_prefix_check_) {

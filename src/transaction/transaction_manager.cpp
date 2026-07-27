@@ -45,6 +45,33 @@ void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const R
     }
 }
 
+/* 已提交删除的索引收尾：按记录字节构造各索引 key 并删除对应索引项。
+ * 仅在墓碑链将被整链剪除（无更旧活跃快照）时调用——此后版本链不复存在，
+ * 索引项若残留，索引扫描会经它读到已释放槽位的残留字节，令已删行"复活"。
+ * 仅当索引项仍指向本 rid 才删：同事务删后重插同 key 时，重插已把索引项
+ * 重定向到新 rid（executor_insert 的陈旧项替换），此时绝不能误删新行的项。 */
+void remove_index_entries_on_commit(SmManager *sm, const std::string &tab_name, const Rid &rid,
+                                    const std::string &data) {
+    if (sm == nullptr || data.empty()) return;
+    TabMeta &tab = sm->db_.get_table(tab_name);
+    for (auto &index : tab.indexes) {
+        auto ih = sm->ihs_.at(sm->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        std::vector<char> key(index.col_tot_len);
+        int off = 0;
+        for (auto &idx_col : index.cols) {
+            memcpy(key.data() + off, data.data() + idx_col.offset, idx_col.len);
+            off += idx_col.len;
+        }
+        std::vector<Rid> found;
+        if (!ih->get_value(key.data(), &found, nullptr)) continue;
+        bool points_here = false;
+        for (auto &fr : found) {
+            if (fr == rid) { points_here = true; break; }
+        }
+        if (points_here) ih->delete_entry(key.data(), nullptr);
+    }
+}
+
 void restore_index_if_missing(SmManager *sm, const std::string &tab_name, const Rid &rid,
                               const std::string &data) {
     if (sm == nullptr || data.empty()) return;
@@ -275,6 +302,18 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             if (ch.writer_del) {
                 // 墓碑须同步清堆，否则 prune 摘掉唯一 tombstone 后行会"复活"
                 if (sm_manager_->fhs_.at(tab)->is_record(wr->GetRid())) {
+                    // 水位覆盖本次提交（无更旧活跃快照）时，下方 prune 会把整条链连同
+                    // 墓碑一起摘除，索引项成为指向已释放槽位的悬空引用——必须同步删除，
+                    // 否则索引扫描会读到残留字节，已提交删除的行"复活"（OJ Transaction
+                    // Commit Index 实测）。有更旧活跃快照时链上墓碑保留，索引项须保留
+                    // 供快照读经版本链取旧版本，此时不删。
+                    if (prune_wm >= cts) {
+                        auto old_rec = sm_manager_->fhs_.at(tab)->get_record(wr->GetRid(), nullptr);
+                        remove_index_entries_on_commit(
+                            sm_manager_, tab, wr->GetRid(),
+                            std::string(old_rec->data,
+                                        (size_t)sm_manager_->fhs_.at(tab)->get_file_hdr().record_size));
+                    }
                     sm_manager_->fhs_.at(tab)->delete_record(wr->GetRid(), nullptr);
                 }
             } else if (!ch.writer_data.empty()) {
@@ -546,8 +585,9 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 /* ------------------------ 题9：MVCC 读 / 插入 / 写 ------------------------ */
 
 bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
-                                   const char *heap_data, int len, std::string &out) {
+                                   const char *heap_data, int len, std::string &out, bool heap_live) {
     if (!any_mvcc_dirty_.load(std::memory_order_acquire)) {
+        if (!heap_live) return false;
         out.assign(heap_data, len);
         return true;
     }
@@ -561,9 +601,17 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
     std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
     auto &store = mvcc_shard_data_[sh].store;
     auto tit = store.find(tab);
-    if (tit == store.end()) { out.assign(heap_data, len); return true; }
+    if (tit == store.end()) {
+        if (!heap_live) return false;
+        out.assign(heap_data, len);
+        return true;
+    }
     auto cit = tit->second.find(mvcc_key(rid));
-    if (cit == tit->second.end()) { out.assign(heap_data, len); return true; }  // 未跟踪 = 基础数据，对所有事务可见
+    if (cit == tit->second.end()) {                       // 未跟踪 = 基础数据，对所有事务可见
+        if (!heap_live) return false;                     // 但槽位已死（陈旧索引项）则不可见
+        out.assign(heap_data, len);
+        return true;
+    }
     MvccChain &ch = cit->second;
     if (ch.writer == txn->get_transaction_id()) {        // 自身未提交写：总能读到
         if (ch.writer_del) return false;
