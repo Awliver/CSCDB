@@ -38,7 +38,11 @@ new_line "\r"|"\n"|"\r\n"
 sign "+"|"-"
 identifier {alpha}(_|{alpha}|{digit})*
 value_int {sign}?{digit}+
-value_float {sign}?{digit}+\.({digit}+)?
+    /* 决赛 FLOAT32 位级传输：wire_param_literal 用 %.9g 回拼字面量，超出/低于常规范围时会
+     * 生成科学计数法（如 1e-07、3.26937805e+09）。指数后缀设为可选，故纯整数串与
+     * value_int 等长时按规则表靠前者(value_int)优先，不影响原有整数解析行为；一旦出现
+     * 小数点或指数后缀才会比 value_int 更长，从而正确识别为浮点。 */
+value_float {sign}?{digit}+(\.{digit}*)?([eE]{sign}?{digit}+)?
 value_string '[^']*'
 single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 

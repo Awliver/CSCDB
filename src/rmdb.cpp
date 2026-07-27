@@ -345,8 +345,10 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_sql(const char *s) {
 
 // 简单单元组 INSERT 的手写快路径解析:仅识别 `insert into <表> values (字面量,...)`，
 // 构建与 yacc 完全相同的 AST 交给后续 analyze/optimize/execute；任何偏离都返回 nullptr
-// 回退到 flex/bison。词法严格对齐 lex.l：整数 {sign}?digit+ 用 atoi，浮点 {sign}?digit+.digit*
-// 用 atof，字符串 '[^']*' 去引号。绕过 yyparse 削减巨量单行装载的每语句解析开销。
+// 回退到 flex/bison。词法对齐 lex.l 的基本形式：整数 {sign}?digit+ 用 atoi，浮点
+// {sign}?digit+.digit* 用 atof，字符串 '[^']*' 去引号；但不识别 lex.l 额外支持的科学计数法
+// 指数后缀——遇到指数会在数字后留下未消费的 'e...'，使尾部校验失败而安全回退到 yacc，不会
+// 误解析。绕过 yyparse 削减巨量单行装载的每语句解析开销。
 static std::shared_ptr<ast::TreeNode> try_fast_parse_insert(const char *s) {
     const char *p = s;
     auto skipws = [&]() { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p; };

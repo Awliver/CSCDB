@@ -474,13 +474,21 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                 if (ch.writer == txn->get_transaction_id()) {
                     undone = true;
                     WType wtype = wr->GetWriteType();
+                    RmRecord &wr_rec = wr->GetRecord();
                     std::string old_data, new_data;
                     bool insert_then_deleted = (wtype == WType::INSERT_TUPLE && ch.writer_del);
                     if (wtype == WType::INSERT_TUPLE) {
                         new_data = ch.writer_data;
-                    } else if (wtype == WType::UPDATE_TUPLE && !ch.hist.empty() && !ch.writer_del) {
-                        old_data = ch.hist.back().data;
+                    } else if (wtype == WType::UPDATE_TUPLE && !ch.writer_del) {
+                        // 复合写（本事务先走快路径直写堆、未建 MVCC 链；后续语句才转入 MVCC
+                        // 建链）下 hist 可能始终为空。此时唯一可信的"事务前原值"是 wr 自身
+                        // 在本事务首次触碰该行时捕获的数据——本事务独占写期间 hist 不会再
+                        // 增长，二者在非复合写场景下取值完全一致，回退到 wr_rec 不改变原语义。
+                        if (!ch.hist.empty()) old_data = ch.hist.back().data;
+                        else if (wr_rec.size > 0) old_data.assign(wr_rec.data, wr_rec.size);
                         new_data = ch.writer_data;
+                    } else if (wtype == WType::DELETE_TUPLE && ch.hist.empty() && wr_rec.size > 0) {
+                        old_data.assign(wr_rec.data, wr_rec.size);
                     }
                     ch.writer = INVALID_TXN_ID;
                     ch.writer_data.clear();
@@ -492,9 +500,50 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                             auto rec = fh->get_record(wr->GetRid(), nullptr);
                             new_data.assign(rec->data, (size_t)fh->get_file_hdr().record_size);
                         }
-                        if (!new_data.empty()) {
-                            rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
-                                                    WType::INSERT_TUPLE, old_data, new_data);
+                        if (wtype == WType::INSERT_TUPLE) {
+                            if (!new_data.empty()) {
+                                rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
+                                                        WType::INSERT_TUPLE, old_data, new_data);
+                            }
+                        } else if (wtype == WType::UPDATE_TUPLE && !old_data.empty()) {
+                            // 堆在 MVCC 阶段从未物化过（仅早先快路径写落过一次堆)：
+                            // 显式恢复堆到事务前原值，否则会停留在快路径写之后的中间态。
+                            if (fh->is_record(wr->GetRid())) {
+                                fh->update_record(wr->GetRid(), (char *)old_data.data(), nullptr);
+                            }
+                            if (!new_data.empty()) {
+                                rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
+                                                        WType::UPDATE_TUPLE, old_data, new_data);
+                            }
+                            // 这行在本事务之前就已是真实已提交数据（并非本事务凭空插入），
+                            // 必须补一条 commit_ts=0 基版本，否则空 hist 会被 mvcc_read
+                            // 判定为"无任何可见版本"，导致行对所有事务错误地变为不可见。
+                            MvccVer base;
+                            base.data = old_data;
+                            base.commit_ts = 0;
+                            base.is_deleted = false;
+                            ch.hist.push_back(std::move(base));
+                        } else if (wtype == WType::DELETE_TUPLE && !old_data.empty()) {
+                            // 早先快路径删除已清 bitmap；MVCC 阶段未再复原过堆槽，须显式补回，
+                            // 否则该行会在快路径删除后永久消失，无法回滚。
+                            restore_index_if_missing(sm_manager_, tab, wr->GetRid(), old_data);
+                            if (!fh->is_record(wr->GetRid())) {
+                                RmPageHandle ph = fh->fetch_page_handle(wr->GetRid().page_no);
+                                Bitmap::set(ph.bitmap, wr->GetRid().slot_no);
+                                ph.page_hdr->num_records++;
+                                memcpy(ph.get_slot(wr->GetRid().slot_no), old_data.data(),
+                                      (int)old_data.size());
+                                sm_manager_->get_bpm()->unpin_page(ph.page->get_page_id(), true);
+                            } else {
+                                fh->update_record(wr->GetRid(), (char *)old_data.data(), nullptr);
+                            }
+                            // 同上：撤销的是"删除"，该行本就是事务前已提交数据，补 commit_ts=0
+                            // 基版本以恢复可见性。
+                            MvccVer base;
+                            base.data = old_data;
+                            base.commit_ts = 0;
+                            base.is_deleted = false;
+                            ch.hist.push_back(std::move(base));
                         }
                     } else {
                         const MvccVer &last = ch.hist.back();
@@ -673,8 +722,13 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     // 首次触及预先存在(未跟踪)的记录：以堆当前值作为基础已提交版本(commit_ts=0)。
     // 注意：若该 rid 只是本事务上一条语句释放到 overlay 的未提交写（典型 insert 后再 delete/update），
     // 不能伪造基础已提交版本，否则 abort 时会把该行当成已提交数据保留下来。
+    // 同理：若 write_set 里已有本事务对同一 (tab,rid) 的早先写入（典型：单连接 SI 快路径
+    // 直接落堆的 INSERT/UPDATE，未建 MVCC 链），此处的 old_data 其实是本事务自己尚未提交
+    // 的堆内容，绝非外部已提交版本——first_touch 已在上面通过扫描 write_set 排除了这种
+    // 情况，必须同时作为伪造基版本的前提条件，否则 abort 会把这份自写数据当成"已提交历史"
+    // 永久保留/复原，造成回滚后行仍可见（compound rollback 场景）。
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
-    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay) {
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay && first_touch) {
         MvccVer base;
         base.data.assign(old_data, len);
         base.commit_ts = 0;
@@ -724,8 +778,22 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
     auto pit = pending[tab].find(rkey);
     if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
     if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+    const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
-    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay) {
+    // first_touch 须先于伪造基版本判定算出：write_set 内若已有本事务对同一 (tab,rid) 的
+    // 早先写入（典型：单连接 SI 快路径直写堆的 INSERT/UPDATE，未建 MVCC 链），visible_data
+    // 其实是本事务自己尚未提交的堆内容，绝不能当作外部已提交版本伪造 commit_ts=0 基版本，
+    // 否则 abort 时会把这份自写数据当成"已提交历史"保留，造成回滚后行仍可见。
+    bool first_touch = !reuse_writer && !had_overlay;
+    if (first_touch) {
+        for (auto *wr : *txn->get_write_set()) {
+            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
+                first_touch = false;
+                break;
+            }
+        }
+    }
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay && first_touch) {
         MvccVer base;
         base.data.assign(visible_data, len);
         base.commit_ts = 0;
@@ -736,16 +804,6 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
     if (ch.writer != txn->get_transaction_id() && !ch.hist.empty() &&
         ch.hist.back().commit_ts > txn->get_read_ts()) {
         base_rec = ch.hist.back().data.data();
-    }
-    const bool reuse_writer = (ch.writer == txn->get_transaction_id());
-    bool first_touch = !reuse_writer && (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
-    if (first_touch) {
-        for (auto *wr : *txn->get_write_set()) {
-            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
-                first_touch = false;
-                break;
-            }
-        }
     }
     ch.writer = txn->get_transaction_id();
     ch.writer_del = false;
@@ -801,8 +859,20 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
     if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
     if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
 
+    const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
-    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay) {
+    // 同 mvcc_write / mvcc_write_col_delta：first_touch 须先于伪造基版本判定算出，避免把
+    // 本事务早先快路径直写堆、尚未提交的内容误当外部已提交版本伪造 commit_ts=0 基版本。
+    bool first_touch = !reuse_writer && !had_overlay;
+    if (first_touch) {
+        for (auto *wr : *txn->get_write_set()) {
+            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
+                first_touch = false;
+                break;
+            }
+        }
+    }
+    if (ch.hist.empty() && ch.writer == INVALID_TXN_ID && !had_overlay && first_touch) {
         MvccVer base;
         base.data.assign(visible_data, len);
         base.commit_ts = 0;
@@ -810,7 +880,6 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
         ch.hist.push_back(std::move(base));
     }
 
-    const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     bool need_rebase = false;
     const char *base_rec = visible_data;
     if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
@@ -819,16 +888,6 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
         need_rebase = true;
     } else if (reuse_writer && !ch.writer_data.empty()) {
         base_rec = ch.writer_data.data();
-    }
-
-    bool first_touch = !reuse_writer && (txn->get_si_overlay(si_overlay_key(tab, rkey)) == nullptr);
-    if (first_touch) {
-        for (auto *wr : *txn->get_write_set()) {
-            if (wr->GetTableName() == tab && wr->GetRid() == rid) {
-                first_touch = false;
-                break;
-            }
-        }
     }
 
     TabMeta &tmeta = sm_manager_->db_.get_table(tab);
