@@ -91,4 +91,6 @@ struct SetClause {
     bool is_arith = false;   // 题9：lhs = rhs_col ± rhs 的算术增量形式（如 v=v+1）
     std::string rhs_col;     // 算术时右侧引用的列名
     bool arith_neg = false;  // 带空格减号(v = v - 1)：rhs 为正、需取负
+    bool self_noop = false;  // 决赛：SET col = col 自赋值——字节恒等，rhs 不参与；
+                             // 写路径（锁/冲突检测/WAL/回滚）仍完整执行
 };

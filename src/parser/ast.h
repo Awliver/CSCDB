@@ -191,6 +191,7 @@ struct SetClause : public TreeNode {
     bool is_arith = false;     // 题9：v = v ± 字面量 的算术增量
     std::string rhs_col;       // 算术时右侧列名
     bool arith_neg = false;    // 带空格的减号(v = v - 1)：字面量为正、需取负
+    bool self_copy = false;    // 决赛：SET col = col 自赋值（恒等写，须保留冲突/回滚语义）
 
     SetClause(std::string col_name_, std::shared_ptr<Value> val_) :
             col_name(std::move(col_name_)), val(std::move(val_)), is_arith(false) {}

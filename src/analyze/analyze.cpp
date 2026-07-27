@@ -165,6 +165,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             std::string tn = sv_sel_col->tab_name;
             if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
             TabCol sel_col = {.tab_name = tn, .col_name = sv_sel_col->col_name};
+            sel_col.alias = sv_sel_col->alias;        // 决赛：col AS alias（输出列名用别名）
             query->cols.push_back(sel_col);
         }
         if (query->cols.empty() && x->aggs.empty()) {
@@ -264,7 +265,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             check_having_clause(x->having_conds, query->group_by_cols, query->aggs, all_cols);
         }
         for (auto &sel_col : query->cols) {
-            query->sel_captions.push_back(sel_col.col_name);
+            query->sel_captions.push_back(sel_col.alias.empty() ? sel_col.col_name : sel_col.alias);
         }
 
         get_clause(x->conds, query->conds);
@@ -323,9 +324,25 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         set.is_arith = sv_set->is_arith;
         set.rhs_col = sv_set->rhs_col;
         set.arith_neg = sv_set->arith_neg;
+        set.self_noop = sv_set->self_copy;
 
         // 查找该列元数据，若不存在抛 ColumnNotFoundError
         auto col_it = tab_meta.get_col(sv_set->col_name);
+
+        if (set.self_noop) {
+            // SET col = col 自赋值：字节恒等。数值列保留 delta-0 算术表示，复用现有
+            // 冲突检测/回滚机制；char 列 rhs（IntLit 0）不参与执行也过不了类型检查，
+            // 跳过检查与 init_raw（init_raw 按列宽写 int 会越界），执行器按原值拷贝。
+            if (col_it->type == TYPE_FLOAT) {
+                set.rhs.set_float(0.0f);
+                set.rhs.init_raw(col_it->len);
+            } else if (col_it->type == TYPE_INT) {
+                set.rhs.set_int(0);
+                set.rhs.init_raw(col_it->len);
+            }
+            query->set_clauses.push_back(set);
+            continue;
+        }
 
         // 类型提升
         if (col_it->type == TYPE_FLOAT && set.rhs.type == TYPE_INT) {
@@ -438,6 +455,7 @@ std::vector<ColMeta> Analyze::infer_select_output_cols(const std::shared_ptr<Que
         auto tab = sm_manager_->db_.get_table(tc.tab_name);
         auto col_it = tab.get_col(tc.col_name);
         ColMeta col = *col_it;
+        if (!tc.alias.empty()) col.name = tc.alias;   // 决赛：col AS alias
         col.offset = offset;
         offset += col.len;
         result.push_back(col);
@@ -503,6 +521,10 @@ TabCol Analyze::resolve_order_column(TabCol order_col,
     for (auto &sc : sel_cols) {
         if (order_col.col_name == sc.col_name &&
             (order_col.tab_name.empty() || order_col.tab_name == sc.tab_name)) {
+            return sc;
+        }
+        // 决赛：ORDER BY 引用 SELECT 列别名 → 解析回底层列
+        if (!sc.alias.empty() && order_col.tab_name.empty() && order_col.col_name == sc.alias) {
             return sc;
         }
     }

@@ -426,7 +426,8 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     std::vector<std::string> captions;
     captions.reserve(sel_cols.size());
     for (auto &sel_col : sel_cols) {
-        captions.push_back(sel_col.col_name);
+        // 决赛：col AS alias——输出列名（wire META / 文本表头）用别名
+        captions.push_back(sel_col.alias.empty() ? sel_col.col_name : sel_col.alias);
     }
     // Union / 部分聚合路径无 ProjectionPlan，从执行器输出列推断表头
     if (captions.empty()) {

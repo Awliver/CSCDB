@@ -390,6 +390,17 @@ colList:
     {
         $$.push_back($3);
     }
+    |   col AS IDENTIFIER
+    {
+        /* 决赛：SELECT 列别名 col AS alias（输出列名须改为别名） */
+        $1->alias = $3;
+        $$ = std::vector<std::shared_ptr<Col>>{$1};
+    }
+    |   colList ',' col AS IDENTIFIER
+    {
+        $3->alias = $5;
+        $$.push_back($3);
+    }
     ;
 
 op:
@@ -445,6 +456,14 @@ setClause:
         colName '=' value
     {
         $$ = std::make_shared<SetClause>($1, $3);
+    }
+    |   colName '=' colName
+    {
+        /* 决赛：SET col = col（自赋值，须保留写冲突/回滚语义）与 col = 其他列。
+         * 复用算术增量表示（delta 0）；同名列打 self_copy 标记，char 列由
+         * analyze/executor 按恒等拷贝处理（不走数值 delta 路径）。 */
+        $$ = std::make_shared<SetClause>($1, $3, std::make_shared<IntLit>(0), false);
+        $$->self_copy = ($1 == $3);
     }
     |   colName '=' colName value
     {

@@ -43,6 +43,7 @@ class ProjectionExecutor : public AbstractExecutor {
             auto pos = get_col(prev_cols, sel_col);
             sel_idxs_.push_back(pos - prev_cols.begin());
             auto col = *pos;
+            if (!sel_col.alias.empty()) col.name = sel_col.alias;   // 决赛：col AS alias
             col.offset = curr_offset;
             curr_offset += col.len;
             cols_.push_back(col);

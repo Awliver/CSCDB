@@ -69,6 +69,11 @@ class UpdateExecutor : public AbstractExecutor {
 
     // 题9：把一条 SET 子句应写入的值放到 dest_field。算术增量 v=v+字面量 从 base_rec 读取右侧列基值。
     void apply_set_value(const char *base_rec, char *dest_field, const SetClause &set, const ColMeta &col) {
+        if (set.self_noop) {
+            // 决赛：SET col = col 自赋值——按原值恒等拷贝（任意类型），rhs 不参与
+            memcpy(dest_field, base_rec + col.offset, col.len);
+            return;
+        }
         if (!set.is_arith) {
             memcpy(dest_field, set.rhs.raw->data, col.len);
             return;
@@ -122,6 +127,10 @@ class UpdateExecutor : public AbstractExecutor {
         std::vector<MvccColPatch> patches;
         patches.reserve(set_clauses_.size());
         for (const auto &set : set_clauses_) {
+            // 自赋值恒等写不产生字节变化，无需 patch（char 列的 arith patch 也无法表达）；
+            // 全部子句均为自赋值时 patches 为空，上层回退 mvcc_write 全记录路径，
+            // 写冲突/回滚语义保持完整
+            if (set.self_noop) continue;
             auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                        [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
             if (col_it == tab_.cols.end()) continue;
