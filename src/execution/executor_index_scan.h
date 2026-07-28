@@ -268,10 +268,9 @@ class IndexScanExecutor : public AbstractExecutor {
         memcpy(end_key.data(), eq_prefix_data_.data(), eq_prefix_data_.size());
         fill_extreme_from(start_key.data(), eq_match_count_, false);
         fill_extreme_from(end_key.data(), eq_match_count_, true);
-        Iid lo = ih_->lower_bound(start_key.data());
-        Iid hi = ih_->upper_bound(end_key.data());
         range_exhausted_ = false;
-        scan_ = std::make_unique<IxScan>(ih_, lo, hi, sm_manager_->get_bpm());
+        scan_ = std::make_unique<IxScan>(ih_, start_key.data(), end_key.data(), true,
+                                         sm_manager_->get_bpm());
     }
 
     /* skip scan：跳到比 cur_first 更大的下一个首列值；无则 skip_done_ */
@@ -352,8 +351,19 @@ class IndexScanExecutor : public AbstractExecutor {
 
             if (mvcc_on_) {
                 // 题9：按本事务快照重建可见版本；不可见/已删则跳过（与 SeqScan 一致）
+                bool from_heap = false;
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_,
-                                                   slot, table_record_size_, mvcc_buf_, slot_live)) {
+                                                   slot, table_record_size_, mvcc_buf_, slot_live,
+                                                   &from_heap)) {
+                    scan_->next();
+                    continue;
+                }
+                // 关闭 drain 竞态窗口：slot_live 采样早于 mvcc_read，若期间
+                // drain_deferred_deletes 完成"摘链+清堆"，链缺失的堆回退会拿陈旧采样
+                // 误判可见（已删行瞬态复活，Delivery MIN canary 实测）。mvcc_read 与
+                // drain 都持分片锁互斥，读后复查 bitmap 必然看到 drain 的结果。
+                // 仅堆回退需要复查——链数据的可见性与堆槽无关（checkpoint 清堆场景合法）。
+                if (from_heap && !table_slot_live(rid_)) {
                     scan_->next();
                     continue;
                 }
@@ -596,74 +606,38 @@ class IndexScanExecutor : public AbstractExecutor {
             }
         }
 
-        // 计算 lo —— 多列索引前缀范围：range 列之后的 suffix 列需填类型极值
-        //   >=val(含)：suffix 填 min + lower_bound（含 val 的所有后缀）
-        //   >val (排)：suffix 填 max + upper_bound（跳过 val 的所有后缀）
-        Iid lo;
+        // 计算 start_key（key 锚定模式：定位式 lo/hi 在并发 delete_entry 下会失效——
+        // 条目左移/搬走后跳行、空扫，Delivery MIN canary 实测；改为把上下界都表达成
+        // 完整 key 字节，IxScan 每次访问在锁内实时重定位）
+        //   >=val(含)：suffix 填 min（含 val 的所有后缀）
+        //   >val (排)：suffix 填 max（真实 key 不会等于极值填充，lower_bound 即跳过 val）
         if (has_lower) {
-            if (lower_inclusive) {
-                fill_extreme_from(start_key.data(), eq_match_count_ + 1, false);
-                lo = ih->lower_bound(start_key.data());
-            } else {
-                fill_extreme_from(start_key.data(), eq_match_count_ + 1, true);
-                lo = ih->upper_bound(start_key.data());
-            }
-        } else if (eq_len > 0) {
-            // 纯 EQ 前缀（无范围）：range 列及之后填 min，取首个匹配前缀的 key
+            fill_extreme_from(start_key.data(), eq_match_count_ + 1, !lower_inclusive);
+        } else {
+            // 纯 EQ 前缀或无条件：range 列及之后填 min
             fill_extreme_from(start_key.data(), eq_match_count_, false);
-            lo = ih->lower_bound(start_key.data());
-        } else {
-            lo = ih->leaf_begin();
         }
 
-        // 计算 hi
-        //   <val (排)：suffix 填 min + lower_bound（停在 val 之前）
-        //   <=val(含)：suffix 填 max + upper_bound（停在 val 的所有后缀之后）
-        Iid hi;
+        // 计算 end_key + 含端标志
         bool full_eq = (eq_match_count_ == (int)index_meta_.cols.size());
+        bool end_incl = true;
         if (has_upper) {
-            if (upper_inclusive) {
-                fill_extreme_from(end_key.data(), eq_match_count_ + 1, true);
-                hi = ih->upper_bound(end_key.data());
-            } else {
-                fill_extreme_from(end_key.data(), eq_match_count_ + 1, false);
-                hi = ih->lower_bound(end_key.data());
-            }
+            // <=val(含)：suffix 填 max、含端；<val(排)：suffix 填 min、排端
+            fill_extreme_from(end_key.data(), eq_match_count_ + 1, upper_inclusive);
+            end_incl = upper_inclusive;
         } else if (full_eq) {
-            // 全 EQ：精确末尾 = upper_bound(prefix)（唯一索引下仅 1 条）
-            hi = ih->upper_bound(start_key.data());
+            end_incl = true;   // end_key == 全 EQ 前缀本身
         } else {
-            // 部分 EQ 或纯前缀：靠 eq_prefix_matches 早期终止或扫到 leaf_end
-            hi = ih->leaf_end();
+            // 部分 EQ 或纯前缀：上界为前缀的最大后缀（prefix check 亦兜底早停）
+            fill_extreme_from(end_key.data(), eq_match_count_, true);
         }
 
-        // 并发修正：IxScan 的 end_ 是定位式 (page,slot)，并发分裂会使其失效（条目搬走后
-        // iid_==end_ 永不成立），扫描可能越过逻辑上界继续走。因此不能信任"范围已被
-        // lo/hi 完全吸收"而跳过逐行检查：
-        //   - 所有值条件始终逐行 eval（吸收的 range 条件也在 compiled_ 里，代价极小）；
-        //   - EQ 前缀检查始终开启，作为越界后的早期硬停（range_exhausted_）。
+        // 逐行防线不变：所有值条件始终 eval；EQ 前缀检查始终开启（早期硬停）。
         need_eval_ = !fed_conds_.empty();
         need_prefix_check_ = (eq_match_count_ > 0);
 
-        // 矛盾/空范围保护：显式上下界交叉时（如 w_id > 500 and w_id < 400），
-        // lo 会落在 hi 之后，IxScan 顺序前进永远到不了 end_，会越过树尾导致
-        // 越界读 / ix_scan.cpp 的 assert 崩溃。这里在 key 层面判定空结果，
-        // 直接返回一个空扫描（lo==lo 使 is_end 立即为真）。
-        if (has_lower && has_upper) {
-            int off = 0, kc = 0;
-            for (const auto &col : index_meta_.cols) {
-                kc = ix_compare(start_key.data() + off, end_key.data() + off, col.type, col.len);
-                if (kc != 0) break;
-                off += col.len;
-            }
-            if (kc > 0 || (kc == 0 && !(lower_inclusive && upper_inclusive))) {
-                range_exhausted_ = true;
-                scan_ = std::make_unique<IxScan>(ih, lo, lo, sm_manager_->get_bpm());
-                return;
-            }
-        }
-
-        scan_ = std::make_unique<IxScan>(ih, lo, hi, sm_manager_->get_bpm());
+        scan_ = std::make_unique<IxScan>(ih, start_key.data(), end_key.data(), end_incl,
+                                         sm_manager_->get_bpm());
         position_to_match();
     }
 

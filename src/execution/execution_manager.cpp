@@ -449,11 +449,15 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
             if (limit >= 0 && num_rec >= (uint64_t)limit) break;
             auto Tuple = executorTreeRoot->Next();
+            const std::vector<bool> *nulls = executorTreeRoot->null_mask();
             std::vector<WireCell> cells;
             cells.reserve(wcols.size());
+            size_t ci = 0;
             for (auto &col : wcols) {
                 WireCell cell;
                 cell.type = col.type;
+                if (nulls != nullptr && ci < nulls->size() && (*nulls)[ci]) cell.is_null = true;
+                ci++;
                 char *p = Tuple->data + col.offset;
                 if (col.type == TYPE_INT) {
                     cell.int_val = *(int *)p;

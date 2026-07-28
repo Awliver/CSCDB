@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <limits>
 #include <unordered_set>
+#include <thread>
 
 namespace {
 
@@ -291,11 +292,36 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     const bool had_writes = !write_set->empty();
     std::unordered_set<std::string> touched_tabs;
     restore_writers_from_overlays(txn);
-    // commit_ts 原子递增；SI 只动 rts_latch_，SER 才碰 ser_latch_
+    // commit_ts【分配】：只从分配器取号并登记未发布集合，发布水位 last_commit_ts_
+    // 在版本物化完成后才推进（见 publish_cts）——否则新快照会在"取号后、物化前"
+    // 的窗口读到提交前旧状态（已删行瞬态复活，OJ Delivery MIN canary 实测）
     if (!write_set->empty() || txn->get_txn_mode()) {
-        cts = last_commit_ts_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        cts = next_cts_.fetch_add(1, std::memory_order_acq_rel) + 1;
         txn->set_commit_ts(cts);
+        std::scoped_lock<std::mutex> pl(cts_publish_mtx_);
+        unpublished_cts_.insert(cts);
     }
+    // 发布：从未发布集合摘除本 cts 并把水位推进到"最小未发布 cts - 1"（前缀完成）。
+    // RAII 兜底保证异常路径也发布，否则水位永久卡死（所有新快照停在旧时间戳）。
+    struct CtsPublishGuard {
+        TransactionManager *tm;
+        timestamp_t cts;
+        bool done = false;
+        void publish() {
+            if (done || cts == 0) return;
+            done = true;
+            std::scoped_lock<std::mutex> pl(tm->cts_publish_mtx_);
+            tm->unpublished_cts_.erase(cts);
+            timestamp_t frontier = tm->unpublished_cts_.empty()
+                                       ? tm->next_cts_.load(std::memory_order_acquire)
+                                       : (*tm->unpublished_cts_.begin() - 1);
+            timestamp_t cur = tm->last_commit_ts_.load(std::memory_order_relaxed);
+            while (frontier > cur &&
+                   !tm->last_commit_ts_.compare_exchange_weak(cur, frontier)) {
+            }
+        }
+        ~CtsPublishGuard() { publish(); }
+    } cts_guard{this, cts};
     {
         std::scoped_lock<std::mutex> lck(rts_latch_);
         auto wit = active_rts_.find(txn->get_read_ts());
@@ -460,6 +486,14 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     clear_pending_si_for_txn(txn);
     txn->si_overlays().clear();
     txn->set_state(TransactionState::COMMITTED);
+    // 发布本 cts，并等待发布水位覆盖它（外部一致性：响应发出后开始的任何新快照
+    // 必须看到本事务效果；前缀 committer 的物化都是内存操作，等待常为零）
+    cts_guard.publish();
+    if (cts != 0) {
+        while (last_commit_ts_.load(std::memory_order_acquire) < cts) {
+            std::this_thread::yield();
+        }
+    }
     // 本事务退出后水位可能前移：物化已无快照依赖的延迟删除（空列表时近零开销）
     drain_deferred_deletes();
 }
@@ -642,10 +676,13 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 /* ------------------------ 题9：MVCC 读 / 插入 / 写 ------------------------ */
 
 bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
-                                   const char *heap_data, int len, std::string &out, bool heap_live) {
+                                   const char *heap_data, int len, std::string &out, bool heap_live,
+                                   bool *from_heap) {
+    if (from_heap != nullptr) *from_heap = false;
     if (!any_mvcc_dirty_.load(std::memory_order_acquire)) {
         if (!heap_live) return false;
         out.assign(heap_data, len);
+        if (from_heap != nullptr) *from_heap = true;
         return true;
     }
     int64_t rkey = mvcc_key(rid);
@@ -661,12 +698,14 @@ bool TransactionManager::mvcc_read(Transaction *txn, const std::string &tab, con
     if (tit == store.end()) {
         if (!heap_live) return false;
         out.assign(heap_data, len);
+        if (from_heap != nullptr) *from_heap = true;
         return true;
     }
     auto cit = tit->second.find(mvcc_key(rid));
     if (cit == tit->second.end()) {                       // 未跟踪 = 基础数据，对所有事务可见
         if (!heap_live) return false;                     // 但槽位已死（陈旧索引项）则不可见
         out.assign(heap_data, len);
+        if (from_heap != nullptr) *from_heap = true;
         return true;
     }
     MvccChain &ch = cit->second;

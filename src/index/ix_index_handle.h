@@ -217,6 +217,10 @@ class IxIndexHandle {
 
     /* 索引 key 总字节数（IxScan::rid_and_key 拷贝 key 用） */
     int get_fhdr_col_tot_len() const { return file_hdr_->col_tot_len_; }
+    /* nolock 变体：调用方须已持 root_latch_（IxScan key 锚定模式的锁内重定位） */
+    Iid lower_bound_nolock(const char *key) const;
+    Iid upper_bound_nolock(const char *key) const;
+    const IxFileHdr *get_fhdr() const { return file_hdr_; }
 
    private:
     // 辅助函数

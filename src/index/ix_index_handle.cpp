@@ -695,7 +695,13 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  */
 Iid IxIndexHandle::lower_bound(const char *key) {
     std::shared_lock<std::shared_mutex> lock(root_latch_);
-    auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
+    return lower_bound_nolock(key);
+}
+
+/* 调用方须已持 root_latch_（shared 或 unique）——IxScan key 锚定模式在自己的
+ * shared 锁内重定位用（std::shared_mutex 同线程重复加锁是 UB，不能复用公开版本） */
+Iid IxIndexHandle::lower_bound_nolock(const char *key) const {
+    auto [leaf, _] = const_cast<IxIndexHandle *>(this)->find_leaf_page(key, Operation::FIND, nullptr);
     int slot = leaf->lower_bound(key);
     Iid iid;
     if (slot < leaf->get_size()) {
@@ -720,7 +726,12 @@ Iid IxIndexHandle::lower_bound(const char *key) {
  */
 Iid IxIndexHandle::upper_bound(const char *key) {
     std::shared_lock<std::shared_mutex> lock(root_latch_);
-    auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
+    return upper_bound_nolock(key);
+}
+
+/* 调用方须已持 root_latch_（同 lower_bound_nolock） */
+Iid IxIndexHandle::upper_bound_nolock(const char *key) const {
+    auto [leaf, _] = const_cast<IxIndexHandle *>(this)->find_leaf_page(key, Operation::FIND, nullptr);
     int slot = leaf->lower_bound(key);
     // 注意：IxNodeHandle::upper_bound 是为内部节点设计的（从 1 开始）
     // 这里要在叶子上找"严格 > target 的第一个"，所以用 lower_bound 后等值则跳一格

@@ -35,9 +35,26 @@ class IxScan : public RecScan {
     void advance_to_next_leaf() const;
     bool page_no_valid(int page_no) const;
 
+    // key 锚定模式：定位式 (page,slot) 迭代在并发 delete_entry/分裂下会失效（条目
+    // 左移/搬走 → 跳行、空扫，OJ Delivery MIN canary 实测 min 间歇返回空/错值）。
+    // key 模式每次访问在锁内按 key 实时重定位：首行 lower_bound(start_key)，推进
+    // upper_bound(anchor=上一行 key)，终止按 end_key 比较——天然抗并发结构变更。
+    bool key_mode_ = false;
+    std::vector<char> start_key_;
+    std::vector<char> end_key_;
+    bool end_inclusive_ = true;
+    mutable std::vector<char> anchor_key_;
+    mutable bool has_anchor_ = false;
+    /* 锁内定位当前行；true=iid_/cached_node_ 有效且未越过 end_key */
+    bool locate_key_mode() const;
+
    public:
     IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
         : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {}
+
+    /* key 锚定模式构造：start/end 为 col_tot_len 完整 key 字节 */
+    IxScan(const IxIndexHandle *ih, const char *start_key, const char *end_key,
+           bool end_inclusive, BufferPoolManager *bpm);
 
     ~IxScan() override { release_cached(); }
 
@@ -45,6 +62,7 @@ class IxScan : public RecScan {
 
     bool is_end() const override {
         std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+        if (key_mode_) return !locate_key_mode();
         normalize_position();
         return iid_ == end_;
     }

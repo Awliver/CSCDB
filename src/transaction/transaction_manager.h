@@ -245,8 +245,12 @@ public:
     /* heap_live=false 表示调用方已确认该 rid 的堆槽位不存活（bitmap 未置位，典型来源是
        陈旧索引项指向已物理删除的记录）：此时"无版本链 → 回退堆数据"的路径必须判为不可见，
        且不得解引用 heap_data（允许传 nullptr）。 */
+    /* from_heap 非空时输出"可见结果是否来自堆回退（无版本链兜底）"——堆回退的
+       可见性依赖调用方的槽位存活采样，采样早于本调用时存在 drain 竞态窗口，调用方
+       须复查 bitmap；链数据的可见性与堆无关（checkpoint 清堆+链保留场景合法）。 */
     bool mvcc_read(Transaction *txn, const std::string &tab, const Rid &rid,
-                   const char *heap_data, int len, std::string &out, bool heap_live = true);
+                   const char *heap_data, int len, std::string &out, bool heap_live = true,
+                   bool *from_heap = nullptr);
     /* 插入：登记一条未提交插入版本（rid 为堆插入返回的位置） */
     void mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
                      const char *data, int len);
@@ -296,7 +300,14 @@ private:
     SmManager *sm_manager_;
     LockManager *lock_manager_;
 
-    std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
+    /* cts 分配与发布分离：last_commit_ts_ 是【发布水位】——所有 ≤ 它的提交均已完成
+     * 版本物化，新快照 read_ts 采样它；next_cts_ 是分配器。若直接 fetch_add 分配，
+     * 新快照会在"cts 已分配、墓碑/版本未上链"的窗口读到提交前旧状态（OJ Delivery
+     * MIN canary 实测：已删行对新快照瞬态可见）。 */
+    std::atomic<timestamp_t> last_commit_ts_{0};    // 发布水位（前缀完成）
+    std::atomic<timestamp_t> next_cts_{0};          // cts 分配器
+    mutable std::mutex cts_publish_mtx_;
+    std::set<timestamp_t> unpublished_cts_;         // 已分配未完成物化的 cts 集合
     std::multiset<timestamp_t> active_rts_;         // 题10:活跃事务 read_ts 水位(SER 状态 GC 用)
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
 

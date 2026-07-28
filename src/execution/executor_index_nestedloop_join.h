@@ -133,10 +133,14 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             return true;
         }
         std::string buf;
+        bool from_heap = false;
         if (!context_->txn_mgr_->mvcc_read(context_->txn_, right_table_, rid,
-                                           right_rec->data, right_record_size_, buf)) {
+                                           right_rec->data, right_record_size_, buf, true,
+                                           &from_heap)) {
             return false;
         }
+        // drain 竞态窗口复查（同 IndexScan：堆回退的可见性依赖读前的槽位采样）
+        if (from_heap && !right_fh_->is_record(rid)) return false;
         memcpy(out.data, buf.data(), right_record_size_);
         return true;
     }

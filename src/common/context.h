@@ -29,6 +29,7 @@ struct WireCell {
     int int_val = 0;
     float float_val = 0.0f;
     std::string str_val;
+    bool is_null = false;    // 空集聚合等：wire 发 present=0
 };
 
 // 决赛 Wire Protocol v3：执行侧只感知本抽象接口，不感知具体 socket/帧编码；

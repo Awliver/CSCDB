@@ -74,7 +74,25 @@ class ProjectionExecutor : public AbstractExecutor {
         for (const auto &s : steps_) {
             memcpy(cur_rec_->data + s.dst_offset, src_rec->data + s.src_offset, s.len);
         }
+        // 转发 NULL 掩码（按投影列重排）
+        cur_nulls_.clear();
+        if (const auto *nm = prev_->null_mask()) {
+            if (!nm->empty()) {
+                cur_nulls_.resize(sel_idxs_.size(), false);
+                for (size_t i = 0; i < sel_idxs_.size(); i++) {
+                    if (sel_idxs_[i] < nm->size()) cur_nulls_[i] = (*nm)[sel_idxs_[i]];
+                }
+            }
+        }
     }
+
+   public:
+    const std::vector<bool> *null_mask() const override {
+        return cur_nulls_.empty() ? nullptr : &cur_nulls_;
+    }
+
+   private:
+    std::vector<bool> cur_nulls_;
 
     void beginTuple() override { prev_->beginTuple(); build_cur(); }
 

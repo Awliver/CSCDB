@@ -71,8 +71,43 @@ void IxScan::normalize_position() const {
     }
 }
 
+IxScan::IxScan(const IxIndexHandle *ih, const char *start_key, const char *end_key,
+               bool end_inclusive, BufferPoolManager *bpm)
+    : ih_(ih), iid_({-1, -1}), end_({-1, -1}), bpm_(bpm) {
+    key_mode_ = true;
+    const int klen = ih->get_fhdr_col_tot_len();
+    start_key_.assign(start_key, start_key + klen);
+    end_key_.assign(end_key, end_key + klen);
+    end_inclusive_ = end_inclusive;
+    anchor_key_.resize(klen);
+}
+
+bool IxScan::locate_key_mode() const {
+    auto *self = const_cast<IxScan *>(this);
+    Iid pos = has_anchor_ ? ih_->upper_bound_nolock(anchor_key_.data())
+                          : ih_->lower_bound_nolock(start_key_.data());
+    self->iid_ = pos;
+    if (!page_no_valid(pos.page_no)) return false;
+    ensure_cached(pos.page_no);
+    if (cached_node_ == nullptr || pos.slot_no < 0 || pos.slot_no >= cached_size_) return false;  // 树尾
+    const IxFileHdr *fh = ih_->get_fhdr();
+    int c = ix_compare(cached_node_->get_key(pos.slot_no), end_key_.data(),
+                       fh->col_types_, fh->col_lens_);
+    if (c > 0 || (c == 0 && !end_inclusive_)) return false;
+    return true;
+}
+
 void IxScan::next() {
     std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    if (key_mode_) {
+        // 消费当前行：把它的 key 设为 anchor，下次 locate 用 upper_bound(anchor) 取下一行
+        if (locate_key_mode()) {
+            memcpy(anchor_key_.data(), cached_node_->get_key(iid_.slot_no),
+                   ih_->get_fhdr_col_tot_len());
+            has_anchor_ = true;
+        }
+        return;
+    }
     normalize_position();
     if (iid_ == end_) return;
     iid_.slot_no++;
@@ -85,6 +120,10 @@ void IxScan::next() {
 
 Rid IxScan::rid() const {
     std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    if (key_mode_) {
+        if (!locate_key_mode()) return Rid{-1, -1};
+        return *cached_node_->get_rid(iid_.slot_no);
+    }
     normalize_position();
     if (iid_ == end_) {
         return Rid{-1, -1};
@@ -98,6 +137,11 @@ Rid IxScan::rid() const {
 
 Rid IxScan::rid_and_key(char *key_out) const {
     std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    if (key_mode_) {
+        if (!locate_key_mode()) return Rid{-1, -1};
+        memcpy(key_out, cached_node_->get_key(iid_.slot_no), ih_->get_fhdr_col_tot_len());
+        return *cached_node_->get_rid(iid_.slot_no);
+    }
     normalize_position();
     if (iid_ == end_) {
         return Rid{-1, -1};

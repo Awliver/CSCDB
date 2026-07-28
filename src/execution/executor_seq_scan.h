@@ -53,6 +53,7 @@ class SeqScanExecutor : public AbstractExecutor {
     int cached_page_no_ = -1;
     Page *cached_page_ = nullptr;
     char *cached_slots_ = nullptr;
+    char *cached_bitmap_ = nullptr;   // drain 竞态复查用
 
     SmManager *sm_manager_;
 
@@ -124,8 +125,16 @@ class SeqScanExecutor : public AbstractExecutor {
             char *slot = get_slot_ptr(rid_);
             const char *eval_data = slot;
             if (mvcc_on_) {
-                // 题9：按本事务快照重建可见版本；不可见/已删则跳过
-                if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_, slot, (int)len_, mvcc_buf_)) {
+                // 题9：按本事务快照重建可见版本；不可见/已删则跳过。
+                // drain 竞态窗口复查（同 IndexScan）：RmScan 的 bitmap 采样早于本次
+                // mvcc_read，堆回退可见时须复查槽位仍存活。
+                bool from_heap = false;
+                if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_, slot, (int)len_,
+                                                   mvcc_buf_, true, &from_heap)) {
+                    scan_->next();
+                    continue;
+                }
+                if (from_heap && !slot_live(rid_)) {
                     scan_->next();
                     continue;
                 }
@@ -188,6 +197,7 @@ class SeqScanExecutor : public AbstractExecutor {
             cached_page_ = nullptr;
             cached_page_no_ = -1;
             cached_slots_ = nullptr;
+            cached_bitmap_ = nullptr;
         }
     }
 
@@ -198,8 +208,13 @@ class SeqScanExecutor : public AbstractExecutor {
             cached_page_ = handle.page;
             cached_page_no_ = rid.page_no;
             cached_slots_ = handle.slots;
+            cached_bitmap_ = handle.bitmap;
         }
         return cached_slots_ + rid.slot_no * (int)len_;
+    }
+
+    bool slot_live(const Rid &rid) const {
+        return cached_bitmap_ != nullptr && Bitmap::is_set(cached_bitmap_, rid.slot_no);
     }
 
 
