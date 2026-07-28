@@ -17,7 +17,18 @@ void BufferPoolManager::start_cleaner() {
     if (cleaner_started_) return;
     cleaner_stop_ = false;
     cleaner_started_ = true;
-    cleaner_thread_ = std::thread([this] { cleaner_loop(); });
+    // 线程函数必须兜底 catch：write_page/flush_log 的异常（磁盘满等）若逃出线程
+    // 函数会 std::terminate 杀死整个服务器（SIGABRT）；cleaner 是尽力而为的后台
+    // 预刷，失败退化为无 cleaner（淘汰路径同步刷盘兜底），不能连累进程
+    cleaner_thread_ = std::thread([this] {
+        try {
+            cleaner_loop();
+        } catch (std::exception &e) {
+            fprintf(stderr, "[bpm-cleaner] fatal: %s (cleaner disabled)\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[bpm-cleaner] fatal: unknown exception (cleaner disabled)\n");
+        }
+    });
 }
 
 void BufferPoolManager::stop_cleaner() {

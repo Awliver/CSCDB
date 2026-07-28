@@ -146,72 +146,16 @@ void RecoveryManager::analyze() {
     std::vector<char> rec;
     long pos = start_offset_;
 
+    // 第一遍只收集事务终态（committed 集合），绝不缓存 op 数据——
+    // load 单表是单事务（W=50 的 order_line 有 1500 万条 insert 日志，commit 在末尾），
+    // 原实现"见 commit 前全量缓存 PendingOp"会吃掉数 GB 内存，重启恢复直接
+    // bad_alloc/OOM → SIGABRT（OJ Phase3 实测）。未完成事务的 undo 镜像改由
+    // collect_uncommitted() 第二遍按 committed_ 过滤收集（量级=崩溃时活跃事务数）。
     auto handle_rec = [&](const char* data) {
         LogType type = *reinterpret_cast<const LogType*>(data);
         txn_id_t tid = *reinterpret_cast<const txn_id_t*>(data + OFFSET_LOG_TID);
-        switch (type) {
-            case LogType::commit:
-                committed_.insert(tid);
-                uncommitted_.erase(tid);
-                break;
-            case LogType::ABORT:
-                break;
-            case LogType::INSERT: {
-                InsertLogRecord lr;
-                lr.deserialize(data);
-                PendingOp op;
-                op.type = LogType::INSERT;
-                op.table.assign(lr.table_name_, lr.table_name_size_);
-                op.rid = lr.rid_;
-                op.new_data.assign(lr.insert_value_.data, lr.insert_value_.size);
-                uncommitted_[tid].push_back(std::move(op));
-                delete[] lr.table_name_;
-                break;
-            }
-            case LogType::DELETE: {
-                DeleteLogRecord lr;
-                lr.deserialize(data);
-                PendingOp op;
-                op.type = LogType::DELETE;
-                op.table.assign(lr.table_name_, lr.table_name_size_);
-                op.rid = lr.rid_;
-                op.old_data.assign(lr.delete_value_.data, lr.delete_value_.size);
-                uncommitted_[tid].push_back(std::move(op));
-                delete[] lr.table_name_;
-                break;
-            }
-            case LogType::UPDATE: {
-                UpdateLogRecord lr;
-                lr.deserialize(data);
-                PendingOp op;
-                op.type = LogType::UPDATE;
-                op.table.assign(lr.table_name_, lr.table_name_size_);
-                op.rid = lr.rid_;
-                op.old_data.assign(lr.old_value_.data, lr.old_value_.size);
-                op.new_data.assign(lr.new_value_.data, lr.new_value_.size);
-                uncommitted_[tid].push_back(std::move(op));
-                delete[] lr.table_name_;
-                break;
-            }
-            case LogType::UPDATE_DELTA: {
-                UpdateDeltaLogRecord lr;
-                lr.deserialize(data);
-                PendingOp op;
-                op.type = LogType::UPDATE_DELTA;
-                op.table.assign(lr.table_name_, lr.table_name_size_);
-                op.rid = lr.rid_;
-                for (int i = 0; i < lr.n_ranges_; i++) {
-                    op.delta_ranges.push_back(lr.ranges_[i]);
-                    op.delta_old.emplace_back(lr.old_ptrs_[i], lr.ranges_[i].len);
-                    op.delta_new.emplace_back(lr.new_ptrs_[i], lr.ranges_[i].len);
-                }
-                uncommitted_[tid].push_back(std::move(op));
-                break;
-            }
-            case LogType::begin:
-            case LogType::CKPT:
-            default:
-                break;
+        if (type == LogType::commit) {
+            committed_.insert(tid);
         }
     };
 
@@ -243,6 +187,103 @@ void RecoveryManager::analyze() {
 }
 
 /**
+ * @description: 第二遍扫描——只为【非已提交】事务缓存 undo 所需的 op 镜像。
+ * 已提交事务（含 load 的千万行级大事务）零缓存，由第三遍流式 redo；
+ * 未完成/中止事务的量级 = 崩溃时活跃连接数 × 每事务语句数，内存可忽略。
+ * INSERT 的 undo 只需 rid（apply_delete），不缓存行数据。
+ */
+void RecoveryManager::collect_uncommitted() {
+    if (!disk_manager_->is_file(LOG_FILE_NAME) || log_end_ <= start_offset_) return;
+    std::vector<char> rec;
+    long pos = start_offset_;
+
+    auto handle_rec = [&](const char* data) {
+        LogType type = *reinterpret_cast<const LogType*>(data);
+        txn_id_t tid = *reinterpret_cast<const txn_id_t*>(data + OFFSET_LOG_TID);
+        if (committed_.count(tid)) return;
+        switch (type) {
+            case LogType::INSERT: {
+                InsertLogRecord lr;
+                lr.deserialize(data);
+                PendingOp op;
+                op.type = LogType::INSERT;
+                op.table.assign(lr.table_name_, lr.table_name_size_);
+                op.rid = lr.rid_;
+                uncommitted_[tid].push_back(std::move(op));
+                delete[] lr.table_name_;
+                break;
+            }
+            case LogType::DELETE: {
+                DeleteLogRecord lr;
+                lr.deserialize(data);
+                PendingOp op;
+                op.type = LogType::DELETE;
+                op.table.assign(lr.table_name_, lr.table_name_size_);
+                op.rid = lr.rid_;
+                op.old_data.assign(lr.delete_value_.data, lr.delete_value_.size);
+                uncommitted_[tid].push_back(std::move(op));
+                delete[] lr.table_name_;
+                break;
+            }
+            case LogType::UPDATE: {
+                UpdateLogRecord lr;
+                lr.deserialize(data);
+                PendingOp op;
+                op.type = LogType::UPDATE;
+                op.table.assign(lr.table_name_, lr.table_name_size_);
+                op.rid = lr.rid_;
+                op.old_data.assign(lr.old_value_.data, lr.old_value_.size);
+                uncommitted_[tid].push_back(std::move(op));
+                delete[] lr.table_name_;
+                break;
+            }
+            case LogType::UPDATE_DELTA: {
+                UpdateDeltaLogRecord lr;
+                lr.deserialize(data);
+                PendingOp op;
+                op.type = LogType::UPDATE_DELTA;
+                op.table.assign(lr.table_name_, lr.table_name_size_);
+                op.rid = lr.rid_;
+                for (int i = 0; i < lr.n_ranges_; i++) {
+                    op.delta_ranges.push_back(lr.ranges_[i]);
+                    op.delta_old.emplace_back(lr.old_ptrs_[i], lr.ranges_[i].len);
+                    op.delta_new.emplace_back(lr.new_ptrs_[i], lr.ranges_[i].len);
+                }
+                uncommitted_[tid].push_back(std::move(op));
+                break;
+            }
+            default:
+                break;
+        }
+    };
+
+    if (use_batch_) {
+        long file_end = log_end_;
+        long body_off = 0;
+        uint32_t body_len = 0;
+        int span;
+        while (pos < file_end && (span = read_batch(pos, body_off, body_len)) > 0) {
+            long saved = log_end_;
+            log_end_ = body_off + body_len;
+            long bpos = body_off;
+            int len;
+            while ((len = read_one(bpos, rec)) > 0) {
+                handle_rec(rec.data());
+                bpos += len;
+            }
+            log_end_ = saved;
+            pos += span;
+        }
+    } else {
+        int len;
+        while (pos < log_end_ && (len = read_one(pos, rec)) > 0) {
+            handle_rec(rec.data());
+            pos += len;
+        }
+    }
+}
+
+/**
  * @description: 重做所有未落盘的操作
  */
 void RecoveryManager::redo() {
@@ -250,6 +291,7 @@ void RecoveryManager::redo() {
     // 占有止于其 abort;此后已提交事务可改写同一记录。若先 redo 后 undo,undo 会用
     // 旧镜像回卷已提交效果。先把全部未完成事务回退到其改前值,再按日志序重放已提交
     // 事务,终态正确。
+    collect_uncommitted();
     undo_pass();
     if (committed_.empty()) return;
     std::vector<char> rec;

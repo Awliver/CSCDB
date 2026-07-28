@@ -63,7 +63,24 @@ LogManager::LogManager(DiskManager* disk_manager) {
         long v = std::strtol(env, &end, 10);
         if (end != env && v >= 0) gc_deadline_us_ = v;
     }
-    flush_thread_ = std::thread(&LogManager::flush_worker, this);
+    // 兜底 catch：flush 线程的异常（磁盘满等）逃出线程函数会 std::terminate 杀死
+    // 整个服务器。失败时置 stop_ 并唤醒全部等待者（wait 谓词含 stop_，不会永久挂起），
+    // 服务降级但进程存活。
+    flush_thread_ = std::thread([this] {
+        try {
+            flush_worker();
+        } catch (std::exception &e) {
+            fprintf(stderr, "[wal-flush] fatal: %s (flush worker stopped)\n", e.what());
+            stop_.store(true);
+            cv_.notify_all();
+            persist_cv_.notify_all();
+        } catch (...) {
+            fprintf(stderr, "[wal-flush] fatal: unknown exception (flush worker stopped)\n");
+            stop_.store(true);
+            cv_.notify_all();
+            persist_cv_.notify_all();
+        }
+    });
 }
 
 void LogManager::dump_wal_stats(const char* tag) {

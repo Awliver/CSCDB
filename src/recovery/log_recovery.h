@@ -51,6 +51,8 @@ public:
     void redo();
     void undo();
     void undo_pass();
+    /* 第二遍扫描：仅为非已提交事务缓存 undo 镜像（见 log_recovery.cpp 注释） */
+    void collect_uncommitted();
 
 private:
     // 从 offset 读出一条完整日志到 scratch；返回总长，0 表示到尾/截断
