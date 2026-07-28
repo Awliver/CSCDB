@@ -42,6 +42,16 @@ class IndexScanExecutor : public AbstractExecutor {
     std::vector<char> eq_prefix_data_;  // EQ 前缀的拼接字节（按索引列顺序）
     bool range_exhausted_ = false;      // 标记"EQ 前缀已被超出"
 
+    // 决赛 index skip scan：索引首列无条件、第 2 列起有连续 EQ（Delivery 的
+    // sum(ol_amount) where ol_o_id=? and ol_d_id=? 形态）——枚举首列 distinct 值，
+    // 对每个值以 [v|EQ链] 为前缀做子范围扫描，避免全表扫（OJ 1500 万行必超时）
+    bool skip_mode_ = false;
+    int skip_eq_count_ = 0;             // 第 2 列起连续 EQ 数
+    std::vector<char> skip_eq_data_;    // 上述 EQ 值拼接（不含首列）
+    std::vector<char> skip_cur_first_;  // 当前枚举中的首列值
+    bool skip_done_ = false;
+    IxIndexHandle *ih_ = nullptr;
+
     // 题3 批 9：表数据页缓存（仿 SeqScan 批 2），避免每条记录都 BPM 往返 + alloc
     int cached_table_page_no_ = -1;
     Page *cached_table_page_ = nullptr;
@@ -207,6 +217,89 @@ class IndexScanExecutor : public AbstractExecutor {
             if (found_eq) eq_match_count_++;
             else break;
         }
+        // skip scan 形态检测：首列无 EQ、第 2 列起有连续 EQ 且首列无任何条件
+        skip_mode_ = false;
+        skip_eq_count_ = 0;
+        skip_eq_data_.clear();
+        if (eq_match_count_ == 0 && index_meta_.cols.size() >= 2) {
+            bool first_has_cond = false;
+            for (const auto &cond : fed_conds_) {
+                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name_ &&
+                    cond.lhs_col.col_name == index_meta_.cols[0].name) {
+                    first_has_cond = true;
+                    break;
+                }
+            }
+            if (!first_has_cond) {
+                for (size_t ci = 1; ci < index_meta_.cols.size(); ci++) {
+                    const auto &col = index_meta_.cols[ci];
+                    bool found_eq = false;
+                    for (const auto &cond : fed_conds_) {
+                        if (cond.is_rhs_val && cond.op == OP_EQ &&
+                            cond.lhs_col.tab_name == tab_name_ &&
+                            cond.lhs_col.col_name == col.name) {
+                            skip_eq_data_.insert(skip_eq_data_.end(),
+                                                 cond.rhs_val.raw->data,
+                                                 cond.rhs_val.raw->data + col.len);
+                            found_eq = true;
+                            break;
+                        }
+                    }
+                    if (!found_eq) break;
+                    skip_eq_count_++;
+                }
+                skip_mode_ = (skip_eq_count_ >= 1);
+            }
+        }
+    }
+
+    /* skip scan：为首列值 v 打开子范围 [v|EQ链|min, v|EQ链|max]，并把
+     * eq 前缀切换为 v|EQ链（prefix 早停与 key 一致性过滤随之生效） */
+    void skip_open_for_value(const char *v) {
+        const auto &fcol = index_meta_.cols[0];
+        skip_cur_first_.assign(v, v + fcol.len);
+        eq_match_count_ = 1 + skip_eq_count_;
+        eq_prefix_data_.assign(v, v + fcol.len);
+        eq_prefix_data_.insert(eq_prefix_data_.end(), skip_eq_data_.begin(), skip_eq_data_.end());
+
+        std::vector<char> start_key(index_meta_.col_tot_len, 0);
+        std::vector<char> end_key(index_meta_.col_tot_len, 0);
+        memcpy(start_key.data(), eq_prefix_data_.data(), eq_prefix_data_.size());
+        memcpy(end_key.data(), eq_prefix_data_.data(), eq_prefix_data_.size());
+        fill_extreme_from(start_key.data(), eq_match_count_, false);
+        fill_extreme_from(end_key.data(), eq_match_count_, true);
+        Iid lo = ih_->lower_bound(start_key.data());
+        Iid hi = ih_->upper_bound(end_key.data());
+        range_exhausted_ = false;
+        scan_ = std::make_unique<IxScan>(ih_, lo, hi, sm_manager_->get_bpm());
+    }
+
+    /* skip scan：跳到比 cur_first 更大的下一个首列值；无则 skip_done_ */
+    bool skip_advance_first_col() {
+        std::vector<char> probe(index_meta_.col_tot_len, 0);
+        memcpy(probe.data(), skip_cur_first_.data(), skip_cur_first_.size());
+        fill_extreme_from(probe.data(), 1, true);         // [cur|max...] 之后即下一首列值
+        Iid nxt = ih_->upper_bound(probe.data());
+        IxScan peek(ih_, nxt, ih_->leaf_end(), sm_manager_->get_bpm());
+        if ((int)cur_key_buf_.size() < index_meta_.col_tot_len) {
+            cur_key_buf_.resize(index_meta_.col_tot_len);
+        }
+        Rid r = peek.rid_and_key(cur_key_buf_.data());
+        if (r.page_no < 0) {
+            skip_done_ = true;
+            return false;
+        }
+        skip_open_for_value(cur_key_buf_.data());
+        return true;
+    }
+
+    /* skip scan：当前子范围耗尽时推进到下一首列值，直到定位有效行或全部枚举完 */
+    void skip_fill_valid() {
+        while (skip_mode_ && !skip_done_ &&
+               (range_exhausted_ || scan_ == nullptr || scan_->is_end())) {
+            if (!skip_advance_first_col()) return;
+            position_to_match();
+        }
     }
 
     /**
@@ -289,24 +382,26 @@ class IndexScanExecutor : public AbstractExecutor {
             }
 
             if (need_prefix_check_) {
+                // 范围边界判定必须用【索引项 key】：项 key 一旦越出 eq 前缀即真越界，
+                // 立刻终止（保持点/前缀扫描早停——此前误用可见版本 key 判定并改为
+                // skip，导致未提交新 key 项触发后线性扫完整个索引，单条 UPDATE 高达
+                // 数十秒，OJ warmup 响应超时实测）。项 key 在前缀内但可见版本 key
+                // 不一致（未提交 UPDATE 新项）的情况由下方 key 一致性过滤跳过。
+                const char *bound_key = mvcc_on_ ? cur_key_buf_.data() : rec_data;
                 int offset = 0;
+                int koff_in_key = 0;
                 bool match = true;
                 for (int i = 0; i < eq_match_count_; i++) {
                     const auto &col = index_meta_.cols[i];
-                    if (memcmp(rec_data + col.offset, eq_prefix_data_.data() + offset, col.len) != 0) {
+                    const char *lhs = mvcc_on_ ? bound_key + koff_in_key : rec_data + col.offset;
+                    if (memcmp(lhs, eq_prefix_data_.data() + offset, col.len) != 0) {
                         match = false;
                         break;
                     }
                     offset += col.len;
+                    koff_in_key += col.len;
                 }
                 if (!match) {
-                    if (mvcc_on_) {
-                        // MVCC 下索引可含"未提交 UPDATE 插入的新 key 项"：其可见版本
-                        // 的列值仍是旧值，与扫描前缀不匹配属正常，跳过继续——据此
-                        // 终止整个扫描会漏掉后续真正匹配的行
-                        scan_->next();
-                        continue;
-                    }
                     range_exhausted_ = true;
                     return;
                 }
@@ -438,6 +533,30 @@ class IndexScanExecutor : public AbstractExecutor {
         analyze_conditions();
         compile_conds();
         range_exhausted_ = false;
+        ih_ = ih;
+
+        if (skip_mode_) {
+            // index skip scan：从索引最小首列值起逐值枚举
+            skip_done_ = false;
+            need_eval_ = !fed_conds_.empty();
+            need_prefix_check_ = true;
+            if ((int)cur_key_buf_.size() < index_meta_.col_tot_len) {
+                cur_key_buf_.resize(index_meta_.col_tot_len);
+            }
+            Iid first = ih->leaf_begin();
+            IxScan peek(ih, first, ih->leaf_end(), sm_manager_->get_bpm());
+            Rid r = peek.rid_and_key(cur_key_buf_.data());
+            if (r.page_no < 0) {
+                skip_done_ = true;
+                range_exhausted_ = true;
+                scan_ = std::make_unique<IxScan>(ih, first, first, sm_manager_->get_bpm());
+                return;
+            }
+            skip_open_for_value(cur_key_buf_.data());
+            position_to_match();
+            skip_fill_valid();
+            return;
+        }
 
         // 构造 start_key / end_key：默认 EQ 前缀 + 零填充
         int eq_len = (int)eq_prefix_data_.size();
@@ -549,9 +668,13 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void nextTuple() override {
-        if (range_exhausted_ || scan_->is_end()) return;
+        if (range_exhausted_ || scan_->is_end()) {
+            if (skip_mode_) skip_fill_valid();
+            return;
+        }
         scan_->next();
         position_to_match();
+        if (skip_mode_) skip_fill_valid();
     }
 
     bool is_end() const override { return range_exhausted_ || scan_->is_end(); }

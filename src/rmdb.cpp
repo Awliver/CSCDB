@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <chrono>
 #include <readline/history.h>
 #include <readline/readline.h>
 #include <setjmp.h>
@@ -515,6 +517,7 @@ private:
 // 供 EXEC_STREAM 与 EXEC_BATCH 的每个 operation 共用。
 static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, IsolationLevel &sess_iso,
                                       WireResultSink *sink, std::string &diag) {
+    const auto stmt_start = std::chrono::steady_clock::now();
     std::vector<char> scratch(BUFFER_LENGTH);
     int off = 0;
     Context context_obj(lock_manager.get(), log_manager.get(), nullptr, scratch.data(), &off);
@@ -597,6 +600,14 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
         // "ERROR terminal" 不透出 diag，没有这行日志线上故障无法归因（历史上为此
         // 盲调多轮）。截断避免刷屏。
         fprintf(stderr, "[sql-error] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
+    }
+    {
+        // 慢语句痕迹（>2s）：评测"响应超时"判负时唯一的服务器端归因线索；低频不刷屏
+        auto slow_dt = std::chrono::steady_clock::now() - stmt_start;
+        long slow_ms = std::chrono::duration_cast<std::chrono::milliseconds>(slow_dt).count();
+        if (slow_ms > 2000) {
+            fprintf(stderr, "[sql-slow] %ldms outcome=%d | sql: %.160s\n", slow_ms, (int)outcome, sql.c_str());
+        }
     }
 
     // 与历史 NUL 协议一致：非显式事务在此无条件提交/回收——回复即持久。
@@ -1381,6 +1392,11 @@ void start_server() {
         {
             int sndbuf = 16 << 20;
             setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+            // TCP_NODELAY：wire 响应帧是"8 字节头 + payload"两次小包写，Nagle 会把
+            // 第二段扣到对端 delayed-ACK（~40ms）——逐语句往返恒定 +40ms（实测），
+            // 关闭 Nagle 后由 send 侧立即发出
+            int nodelay = 1;
+            setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         }
         
         // 和客户端建立连接，并开启一个线程负责处理客户端请求

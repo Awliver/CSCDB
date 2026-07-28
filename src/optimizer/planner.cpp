@@ -62,6 +62,44 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
         }
     }
 
+    // 决赛 Delivery 模板 `sum(ol_amount) where ol_o_id=? and ol_d_id=?` 缺索引首列：
+    // 常规最左匹配失败会退化全表扫（OJ 1500 万行必超时）。若某索引"首列无条件、
+    // 第 2 列起有连续 EQ"，选它做 index skip scan（executor 枚举首列 distinct 值 ×
+    // 后续 EQ 子范围）。仅在无常规前缀匹配时启用。
+    if (best_match_len == 0) {
+        for (auto& index : tab.indexes) {
+            if (index.cols.size() < 2) continue;
+            int skip_eq = 0;
+            for (size_t ci = 1; ci < index.cols.size(); ci++) {
+                bool found_eq = false;
+                for (auto& cond : curr_conds) {
+                    if (cond.is_rhs_val && cond.op == OP_EQ &&
+                        cond.lhs_col.tab_name == tab_name &&
+                        cond.lhs_col.col_name == index.cols[ci].name) {
+                        found_eq = true;
+                        break;
+                    }
+                }
+                if (!found_eq) break;
+                skip_eq++;
+            }
+            // 首列自身不得有条件（有条件则常规匹配早已命中）
+            bool first_has_cond = false;
+            for (auto& cond : curr_conds) {
+                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name &&
+                    cond.lhs_col.col_name == index.cols[0].name) {
+                    first_has_cond = true;
+                    break;
+                }
+            }
+            if (skip_eq >= 1 && !first_has_cond) {
+                best_index = &index;
+                best_match_len = skip_eq;   // 标记选中；executor 侧自行识别 skip 形态
+                break;
+            }
+        }
+    }
+
     if (best_match_len == 0) return false;
     // 输出整条索引的全部 col_names（让 get_index_meta 能完整命中）
     // IndexScanExecutor 自己再分析 fed_conds_ 决定能用几列做 key
