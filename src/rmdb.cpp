@@ -592,6 +592,12 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
         diag = e.what();
         outcome = ExecOutcome::ERROR;
     }
+    if (outcome == ExecOutcome::ERROR) {
+        // ERROR 是稀有事件（正常负载不产生），必须留下服务器端痕迹：评测端只回报
+        // "ERROR terminal" 不透出 diag，没有这行日志线上故障无法归因（历史上为此
+        // 盲调多轮）。截断避免刷屏。
+        fprintf(stderr, "[sql-error] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
+    }
 
     // 与历史 NUL 协议一致：非显式事务在此无条件提交/回收——回复即持久。
     // commit/reap 也可能抛异常（缓冲池压力下的页 IO 等），必须捕获转 ERROR，
