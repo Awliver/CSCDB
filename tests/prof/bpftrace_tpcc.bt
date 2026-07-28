@@ -1,0 +1,46 @@
+#!/usr/bin/env bpftrace
+/*
+ * TPC-C RMDB syscall / block I/O sampler (run alongside bench_tpcc.py).
+ *
+ * Usage (root):
+ *   sudo bpftrace tests/prof/bpftrace_tpcc.bt -c "python3 tests/local/bench_tpcc.py --quick"
+ *
+ * Or attach to running rmdb:
+ *   sudo bpftrace tests/prof/bpftrace_tpcc.bt -p $(pgrep -f bin/rmdb)
+ */
+
+BEGIN {
+    printf("Tracing RMDB TPC-C I/O patterns... Hit Ctrl-C to end.\n");
+    @start = nsecs;
+}
+
+tracepoint:syscalls:sys_enter_write,
+tracepoint:syscalls:sys_enter_pwrite64,
+tracepoint:syscalls:sys_enter_fdatasync,
+tracepoint:syscalls:sys_enter_fsync
+/pid == $1 || $1 == 0/
+{
+    @syscalls[probe] = count();
+    @bytes[probe] = sum(args->count);
+}
+
+tracepoint:syscalls:sys_enter_read,
+tracepoint:syscalls:sys_enter_pread64
+/pid == $1 || $1 == 0/
+{
+    @syscalls[probe] = count();
+}
+
+interval:s:10
+{
+    printf("\n--- %d s ---\n", (nsecs - @start) / 1000000000);
+    print(@syscalls);
+}
+
+END {
+    printf("\n=== Summary ===\n");
+    print(@syscalls);
+    clear(@syscalls);
+    clear(@bytes);
+    clear(@start);
+}

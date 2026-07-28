@@ -1,0 +1,337 @@
+"""OJ fidelity helpers: build check, result summary, JSON baseline."""
+
+import json
+import os
+import subprocess
+import time
+
+from tpcc_common import BUILD, RMDB
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+
+# Self-generated full CSV (OJ does not ship official data).
+DATA_SOURCE = "self-generated (build/tpcc_data/full via generate_tpcc_data.py)"
+
+
+def detect_build_info():
+    """Best-effort build type from rmdb binary strings."""
+    info = {
+        "path": RMDB,
+        "exists": os.path.isfile(RMDB),
+        "build_type": "unknown",
+        "optimize": "unknown",
+        "release_like": False,
+        "warning": "",
+    }
+    if not info["exists"]:
+        info["warning"] = "rmdb binary missing"
+        return info
+
+    try:
+        out = subprocess.run(
+            ["strings", RMDB],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        info["warning"] = "could not inspect rmdb binary"
+        return info
+
+    for line in out.splitlines():
+        if "CMAKE_BUILD_TYPE=" in line:
+            info["build_type"] = line.split("=", 1)[-1].strip()
+        if line.startswith("GCC:") or line.startswith("clang version"):
+            if "-O0" in line:
+                info["optimize"] = "-O0"
+            elif "-O3" in line:
+                info["optimize"] = "-O3"
+            elif "-O2" in line:
+                info["optimize"] = "-O2"
+
+    if info["build_type"] == "unknown" or info["optimize"] == "unknown":
+        cache = os.path.join(BUILD, "CMakeCache.txt")
+        if os.path.isfile(cache):
+            try:
+                with open(cache) as f:
+                    for line in f:
+                        if info["build_type"] == "unknown" and line.startswith("CMAKE_BUILD_TYPE:"):
+                            info["build_type"] = line.split("=", 1)[-1].strip()
+                        if info["optimize"] == "unknown" and line.startswith("CMAKE_CXX_FLAGS_RELEASE:"):
+                            flags = line.split("=", 1)[-1].strip()
+                            if "-O0" in flags:
+                                info["optimize"] = "-O0"
+                            elif "-O3" in flags:
+                                info["optimize"] = "-O3"
+                            elif "-O2" in flags:
+                                info["optimize"] = "-O2"
+            except OSError:
+                pass
+
+    bt = info["build_type"].lower()
+    opt = info["optimize"]
+    info["release_like"] = bt == "release" or opt == "-O3"
+    if bt in ("debug",) or opt == "-O0":
+        info["warning"] = (
+            "build looks like Debug/-O0; OJ uses Release/-O3 — tpmC numbers are NOT comparable"
+        )
+    return info
+
+
+def require_release_build(strict=False):
+    """Print build info; return False if strict and not release-like."""
+    info = detect_build_info()
+    print("  build:", info["build_type"], "opt:", info["optimize"], "path:", info["path"])
+    if info["warning"]:
+        print("  WARNING:", info["warning"])
+    if strict and not info["release_like"]:
+        print("  FAIL: --strict requires Release build (cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make rmdb)")
+        return False
+    return True
+
+
+def tier_label(quick=False, mid=False, finals=False, strict=False):
+    if finals:
+        return "finals"
+    if strict and not quick and not mid:
+        return "oj"
+    if mid:
+        return "mid"
+    if quick:
+        return "quick"
+    return "custom"
+
+
+def print_oj_summary(
+    *,
+    tier,
+    scale,
+    threads,
+    seed,
+    warmup,
+    measure,
+    rounds,
+    tpms,
+    median_tpm,
+    round_results,
+    consistency_ok=None,
+    crash_ok=None,
+    overall_pass,
+    data_source=DATA_SOURCE,
+    mix_desc=None,
+    protocol=None,
+):
+    """OJ-aligned one-screen summary for comparing with online results."""
+    total_no_ok = sum(r.get("new_order_ok", 0) for r in round_results)
+    total_no_fail = sum(r.get("new_order_fail", 0) for r in round_results)
+    total_other_fail = sum(r.get("other_fail", 0) for r in round_results)
+
+    print("\n=== OJ FIT SUMMARY ===")
+    print("  tier:          %s" % tier)
+    print("  data:          %s (%s)" % (scale, data_source))
+    print("  threads:       %d" % threads)
+    print("  seed:          %d" % seed)
+    print("  window:        warmup=%ss measure=%ss rounds=%d" % (warmup, measure, rounds))
+    print("  protocol:      %s" % (protocol or "PREPARE_SET+EXEC_BATCH"))
+    print("  mix:           %s" % (mix_desc or "finals 45/43/4/4/4"))
+    print("  isolation:     snapshot isolation")
+    print("  rounds tpmC:   %s" % ["%.2f" % x for x in tpms])
+    print("  median tpmC:   %.2f  (OJ metric)" % median_tpm)
+    print("  new_order:     ok=%d fail=%d" % (total_no_ok, total_no_fail))
+    print("  other_fail:    %d" % total_other_fail)
+    for i, r in enumerate(round_results, 1):
+        elapsed = r.get("elapsed", 0)
+        expected = measure
+        flag = ""
+        if elapsed < expected * 0.85:
+            flag = "  *** elapsed %.1fs << measure %.0fs (workers exited early?) ***" % (
+                elapsed, expected
+            )
+        print("  round %d wall:   %.1fs%s" % (i, elapsed, flag))
+    if consistency_ok is not None:
+        print("  consistency:   %s" % ("PASS" if consistency_ok else "FAIL"))
+    if crash_ok is not None:
+        print("  crash_recv:    %s" % ("PASS" if crash_ok else "FAIL"))
+    build = detect_build_info()
+    print("  build:         %s (%s)" % (build["build_type"], build["optimize"]))
+    print("  OVERALL:       %s" % ("PASS" if overall_pass else "FAIL"))
+    if tier in ("quick", "mid"):
+        print("  NOTE: tier=%s is NOT the OJ 150s×3 submission window; use --finals/--strict." % tier)
+    elif tier == "finals":
+        print("  NOTE: local generated CSV follows W=50 cardinalities; hardware and hidden identifiers")
+        print("        still make absolute tpmC non-comparable with the OJ.")
+
+
+HISTORY_DIR = os.path.join(BUILD, "bench_history")
+HISTORY_INDEX = os.path.join(HISTORY_DIR, "index.jsonl")
+HISTORY_LATEST = os.path.join(HISTORY_DIR, "LATEST.json")
+
+
+def write_json_result(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    payload = dict(payload)
+    if "written_at" not in payload:
+        payload["written_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print("  json:          %s" % path)
+
+
+def _git_cmd(*args):
+    try:
+        return subprocess.check_output(
+            ["git"] + list(args),
+            cwd=ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return ""
+
+
+def git_revision():
+    return _git_cmd("rev-parse", "--short", "HEAD") or "unknown"
+
+
+def git_info():
+    """Code version snapshot for bench history records."""
+    short = git_revision()
+    full = _git_cmd("rev-parse", "HEAD") or short
+    branch = _git_cmd("rev-parse", "--abbrev-ref", "HEAD") or "unknown"
+    dirty = bool(_git_cmd("status", "--porcelain"))
+    subject = _git_cmd("log", "-1", "--pretty=%s")
+    commit_time = _git_cmd("log", "-1", "--pretty=%ci")
+    return {
+        "git_rev": short,
+        "git_rev_full": full,
+        "git_branch": branch,
+        "git_dirty": dirty,
+        "git_subject": subject,
+        "git_commit_time": commit_time,
+    }
+
+
+def build_result_payload(
+    *,
+    tier,
+    scale,
+    warehouses,
+    threads,
+    seed,
+    warmup,
+    measure,
+    rounds,
+    tpms,
+    median_tpm,
+    round_results,
+    overall,
+    fail_stage=None,
+    consistency_ok=None,
+    crash_ok=None,
+    data_source=DATA_SOURCE,
+    extra=None,
+):
+    """Assemble one bench record (PASS or FAIL)."""
+    build = detect_build_info()
+    g = git_info()
+    payload = {
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "tier": tier,
+        "scale": scale,
+        "warehouses": warehouses,
+        "data_source": data_source,
+        "threads": threads,
+        "seed": seed,
+        "warmup_sec": warmup,
+        "measure_sec": measure,
+        "rounds": rounds,
+        "tpms": list(tpms) if tpms is not None else [],
+        "median_tpmc": median_tpm,
+        "new_order_ok": sum(r.get("new_order_ok", 0) for r in (round_results or [])),
+        "new_order_fail": sum(r.get("new_order_fail", 0) for r in (round_results or [])),
+        "other_fail": sum(r.get("other_fail", 0) for r in (round_results or [])),
+        "round_elapsed_sec": [r.get("elapsed", 0) for r in (round_results or [])],
+        "consistency": (
+            None if consistency_ok is None else ("PASS" if consistency_ok else "FAIL")
+        ),
+        "crash_recovery": (
+            None if crash_ok is None else ("PASS" if crash_ok else "FAIL")
+        ),
+        "build_type": build["build_type"],
+        "optimize": build["optimize"],
+        "overall": overall,
+        "fail_stage": fail_stage,
+        **g,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _history_filename(payload):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    tier = payload.get("tier") or "custom"
+    w = payload.get("warehouses")
+    t = payload.get("threads")
+    med = payload.get("median_tpmc")
+    overall = payload.get("overall") or "UNKNOWN"
+    parts = [ts, tier]
+    if w is not None:
+        parts.append("w%d" % w)
+    if t is not None:
+        parts.append("t%d" % t)
+    if med is not None and overall == "PASS":
+        parts.append("%.0f" % med)
+    else:
+        parts.append(str(overall).lower())
+    return "_".join(parts) + ".json"
+
+
+def save_bench_history(payload, history_dir=None, also_path=None):
+    """
+    Persist bench result + code version under build/bench_history/.
+
+    Writes:
+      - timestamped JSON
+      - LATEST.json (overwrite)
+      - index.jsonl (append one line)
+      - optional also_path (--json)
+    """
+    history_dir = history_dir or HISTORY_DIR
+    os.makedirs(history_dir, exist_ok=True)
+    payload = dict(payload)
+    if "written_at" not in payload:
+        payload["written_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    path = os.path.join(history_dir, _history_filename(payload))
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    with open(HISTORY_LATEST if history_dir == HISTORY_DIR else os.path.join(history_dir, "LATEST.json"), "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    index_path = HISTORY_INDEX if history_dir == HISTORY_DIR else os.path.join(history_dir, "index.jsonl")
+    index_row = {
+        "written_at": payload.get("written_at"),
+        "file": os.path.basename(path),
+        "tier": payload.get("tier"),
+        "warehouses": payload.get("warehouses"),
+        "threads": payload.get("threads"),
+        "median_tpmc": payload.get("median_tpmc"),
+        "overall": payload.get("overall"),
+        "fail_stage": payload.get("fail_stage"),
+        "git_rev": payload.get("git_rev"),
+        "git_branch": payload.get("git_branch"),
+        "git_dirty": payload.get("git_dirty"),
+        "build_type": payload.get("build_type"),
+    }
+    with open(index_path, "a") as f:
+        f.write(json.dumps(index_row, ensure_ascii=False) + "\n")
+
+    print("  history:       %s" % path)
+    print("  history index: %s" % index_path)
+
+    if also_path:
+        write_json_result(also_path, payload)
+    return path

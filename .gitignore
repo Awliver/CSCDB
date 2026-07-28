@@ -75,7 +75,6 @@ $RECYCLE.BIN/
 *.bak
 *.orig
 *.rej
-test.local.bak/
 
 # ============================================
 # Local config / secrets
@@ -86,7 +85,6 @@ test.local.bak/
 local_config/
 secrets/
 *.token
-tests/prof/config.env
 
 # ============================================
 # Profiling / coverage
@@ -115,7 +113,6 @@ __pycache__/
 # ============================================
 Docs/
 docs/
-tests/
 题目一/
 scratch/
 notes/personal/
