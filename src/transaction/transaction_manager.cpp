@@ -1457,5 +1457,22 @@ void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecor
         } else {
             fh->update_record(rid, (char *)old_bytes.data(), nullptr);
         }
+        // 快路径"删后重插同 key"会复用刚释放的同一槽位：逆序撤销时，先行的 INSERT 撤销
+        // 已在本 rid 留下"空链墓碑"（aborted-insert 不可见标记）。本分支刚把堆恢复为
+        // 事务前已提交数据，空链会让该行对所有事务永久不可见（OJ SI compound rollback
+        // 实测丢行）——摘除空链，恢复"未跟踪 = 堆基础数据可见"的语义。
+        {
+            int64_t rk2 = mvcc_key(rid);
+            auto &store2 = mvcc_shard_data_[mvcc_shard_idx(tab_name, rk2)].store;
+            auto tit2 = store2.find(tab_name);
+            if (tit2 != store2.end()) {
+                auto cit2 = tit2->second.find(rk2);
+                if (cit2 != tit2->second.end() && cit2->second.writer == INVALID_TXN_ID &&
+                    cit2->second.hist.empty()) {
+                    tit2->second.erase(cit2);
+                    if (tit2->second.empty()) store2.erase(tit2);
+                }
+            }
+        }
     }
 }

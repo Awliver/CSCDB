@@ -329,6 +329,43 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 查找该列元数据，若不存在抛 ColumnNotFoundError
         auto col_it = tab_meta.get_col(sv_set->col_name);
 
+        if (!sv_set->chain.empty()) {
+            // 决赛链式算术 col = col ± v1 ± v2 ...（项已带符号）：
+            // int 列——整数加法结合律成立，精确折叠为单增量，沿用 delta 热路径；
+            // float 列——IEEE 非结合，保留逐项链（chain_f），执行器按 f32 左结合累加。
+            if (col_it->type == TYPE_INT) {
+                long long acc = 0;
+                bool all_int = true;
+                for (auto &term : sv_set->chain) {
+                    Value tv = convert_sv_value(term);
+                    if (tv.type == TYPE_INT) acc += tv.int_val;
+                    else { all_int = false; break; }
+                }
+                if (!all_int || acc < INT32_MIN || acc > INT32_MAX) {
+                    throw IncompatibleTypeError(coltype2str(col_it->type), coltype2str(TYPE_FLOAT));
+                }
+                set.rhs.set_int(static_cast<int>(acc));
+                set.arith_neg = false;
+                set.rhs.init_raw(col_it->len);
+                query->set_clauses.push_back(set);
+                continue;
+            }
+            if (col_it->type == TYPE_FLOAT) {
+                for (auto &term : sv_set->chain) {
+                    Value tv = convert_sv_value(term);
+                    if (tv.type == TYPE_INT) set.chain_f.push_back(static_cast<float>(tv.int_val));
+                    else if (tv.type == TYPE_FLOAT) set.chain_f.push_back(tv.float_val);
+                    else throw IncompatibleTypeError(coltype2str(col_it->type), coltype2str(tv.type));
+                }
+                set.arith_neg = false;
+                set.rhs.set_float(0.0f);          // rhs 不参与，占位保证类型一致
+                set.rhs.init_raw(col_it->len);
+                query->set_clauses.push_back(set);
+                continue;
+            }
+            throw IncompatibleTypeError(coltype2str(col_it->type), coltype2str(set.rhs.type));
+        }
+
         if (set.self_noop) {
             // SET col = col 自赋值：字节恒等。数值列保留 delta-0 算术表示，复用现有
             // 冲突检测/回滚机制；char 列 rhs（IntLit 0）不参与执行也过不了类型检查，

@@ -93,4 +93,7 @@ struct SetClause {
     bool arith_neg = false;  // 带空格减号(v = v - 1)：rhs 为正、需取负
     bool self_noop = false;  // 决赛：SET col = col 自赋值——字节恒等，rhs 不参与；
                              // 写路径（锁/冲突检测/WAL/回滚）仍完整执行
+    std::vector<float> chain_f;  // 决赛：float 列链式算术 v = v ± v1 ± v2 ...（项带符号）。
+                                 // IEEE 加法非结合，须按 f32 逐步左结合累加，不能折叠；
+                                 // int 列的链在 analyze 已精确折叠进 rhs，不用此字段
 };

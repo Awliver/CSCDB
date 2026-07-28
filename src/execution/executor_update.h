@@ -83,6 +83,12 @@ class UpdateExecutor : public AbstractExecutor {
         if (rcol == tab_.cols.end()) return;
         if (rcol->type == TYPE_FLOAT) {
             float base = *(const float *)(base_rec + rcol->offset);
+            if (!set.chain_f.empty()) {
+                // 决赛链式算术：f32 逐步左结合累加（((base±v1)±v2)...，不能折叠）
+                for (float t : set.chain_f) base += t;
+                *(float *)dest_field = base;
+                return;
+            }
             float delta = set.arith_neg ? -set.rhs.float_val : set.rhs.float_val;
             *(float *)dest_field = base + delta;
         } else {
@@ -105,7 +111,8 @@ class UpdateExecutor : public AbstractExecutor {
         ColArithDelta r;
         if (set_clauses_.size() != 1) return r;
         const auto &set = set_clauses_[0];
-        if (!set.is_arith || set.lhs.col_name != set.rhs_col) return r;
+        // float 链式算术无法表示为单增量（左结合逐步 f32），走全记录回退路径
+        if (!set.is_arith || set.lhs.col_name != set.rhs_col || !set.chain_f.empty()) return r;
         auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                    [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
         if (col_it == tab_.cols.end()) return r;
@@ -131,6 +138,9 @@ class UpdateExecutor : public AbstractExecutor {
             // 全部子句均为自赋值时 patches 为空，上层回退 mvcc_write 全记录路径，
             // 写冲突/回滚语义保持完整
             if (set.self_noop) continue;
+            // float 链式算术 patch 无法表达（MvccColPatch 只有单增量）；一旦出现，整条
+            // 语句放弃 patch 路径（返回空），统一回退 mvcc_write 全记录——否则该子句会丢失
+            if (!set.chain_f.empty()) return {};
             auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
                                        [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
             if (col_it == tab_.cols.end()) continue;

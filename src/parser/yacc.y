@@ -11,6 +11,14 @@ void yyerror(YYLTYPE *locp, const char* s) {
 }
 
 using namespace ast;
+
+/* 决赛链式算术 SET col = col ± v ± v ...：'-' 项在此取负成带符号项（IEEE x-y == x+(-y) 精确），
+ * 非数值字面量返回 nullptr（动作里转 YYERROR） */
+static std::shared_ptr<ast::Value> negate_value(const std::shared_ptr<ast::Value> &v) {
+    if (auto i = std::dynamic_pointer_cast<ast::IntLit>(v)) return std::make_shared<ast::IntLit>(-i->val);
+    if (auto f = std::dynamic_pointer_cast<ast::FloatLit>(v)) return std::make_shared<ast::FloatLit>(-f->val);
+    return nullptr;
+}
 %}
 
 // request a pure (reentrant) parser
@@ -42,8 +50,8 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_type_len> type
 %type <sv_comp_op> op
 %type <sv_expr> expr
-%type <sv_val> value
-%type <sv_vals> valueList valueRows
+%type <sv_val> value arith_term
+%type <sv_vals> valueList valueRows arith_chain
 %type <sv_str> tbName colName
 %type <sv_strs> colNameList
 %type <sv_table_list> tableList
@@ -465,20 +473,41 @@ setClause:
         $$ = std::make_shared<SetClause>($1, $3, std::make_shared<IntLit>(0), false);
         $$->self_copy = ($1 == $3);
     }
-    |   colName '=' colName value
+    |   colName '=' colName arith_chain
     {
-        /* 题9：算术增量 v=v+1（词法把 +1/-1 归并为带符号 VALUE_INT，无空格情形） */
-        $$ = std::make_shared<SetClause>($1, $3, $4, false);
+        /* 题9 单项算术 v = v ± 1 与 决赛链式算术 v = v ± v1 ± v2 ...（左结合）。
+         * 项均已带符号；单项与原三条产生式行为等价，多项存 chain 由 analyze/执行器
+         * 逐步左结合求值（float 非结合，不能折叠常量）。 */
+        $$ = std::make_shared<SetClause>($1, $3, $4[0], false);
+        if ($4.size() > 1) $$->chain = $4;
     }
-    |   colName '=' colName '+' value
+    ;
+
+arith_chain:
+        arith_term
     {
-        /* 带空格加号 v = v + 1 */
-        $$ = std::make_shared<SetClause>($1, $3, $5, false);
+        $$ = std::vector<std::shared_ptr<Value>>{$1};
     }
-    |   colName '=' colName '-' value
+    |   arith_chain arith_term
     {
-        /* 带空格减号 v = v - 1：字面量为正、置 neg 取负 */
-        $$ = std::make_shared<SetClause>($1, $3, $5, true);
+        $$.push_back($2);
+    }
+    ;
+
+arith_term:
+        value
+    {
+        /* 词法已把无空格 +1/-1 归并为带符号字面量 */
+        $$ = $1;
+    }
+    |   '+' value
+    {
+        $$ = $2;
+    }
+    |   '-' value
+    {
+        $$ = negate_value($2);
+        if ($$ == nullptr) YYERROR;
     }
     ;
 

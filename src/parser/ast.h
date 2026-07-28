@@ -192,6 +192,7 @@ struct SetClause : public TreeNode {
     std::string rhs_col;       // 算术时右侧列名
     bool arith_neg = false;    // 带空格的减号(v = v - 1)：字面量为正、需取负
     bool self_copy = false;    // 决赛：SET col = col 自赋值（恒等写，须保留冲突/回滚语义）
+    std::vector<std::shared_ptr<Value>> chain;  // 决赛：链式算术 v = v ± v1 ± v2 ...（项已带符号，含首项）
 
     SetClause(std::string col_name_, std::shared_ptr<Value> val_) :
             col_name(std::move(col_name_)), val(std::move(val_)), is_arith(false) {}
