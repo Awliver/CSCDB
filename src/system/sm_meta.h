@@ -73,10 +73,11 @@ struct TabMeta {
 
     TabMeta(){}
 
-    TabMeta(const TabMeta &other) {
-        name = other.name;
-        for(auto col : other.cols) cols.push_back(col);
-    }
+    /* 勿再自定义拷贝构造：框架原版手写的拷贝构造漏拷 indexes（只拷 name/cols），
+     * 导致 `TabMeta tab = get_table(...)`（拷贝初始化）拿到的索引元数据恒为空——
+     * run_load 因此从不维护先建好的索引（OJ Phase2 先建主键索引再 LOAD，索引全空，
+     * 抽样点查/连接返回 0，实测）。各 executor 用 `tab_ = get_table(...)`（隐式生成的
+     * 赋值运算符，完整拷贝）故未受影响。交由编译器生成完整的拷贝/移动语义。 */
 
     /* 判断当前表中是否存在名为col_name的字段 */
     bool is_col(const std::string &col_name) const {
