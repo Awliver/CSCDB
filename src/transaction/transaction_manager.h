@@ -196,13 +196,15 @@ public:
     void inc_explicit() { active_explicit_count_++; }
     /* 该表是否被 MVCC 写过（读时才需查版本链，未脏表直接读堆，保持非事务负载性能） */
     bool table_is_dirty(const std::string &tab);
-    /* 单连接 SI 快路径：无并发且库未脏时可跳过版本维护；一旦 any_mvcc_dirty_ 置位必须走 MVCC，
-     * 否则堆与版本链长期分叉。 */
+    /* 单连接 SI 快路径【已禁用】：判定条件（"当前无并发"）在另一连接 begin 的瞬间失效，
+     * 但本事务已物理落堆/落索引的写没有版本链保护，后来的事务会直接看到未提交状态
+     * （OJ 'dirty read and abort restoration' 场景实测：s2 在 s1 首写之后 begin，
+     * s1 未提交的物理删除/更新对 s2 可见）。该路径仅服务单连接显式事务（功能测试
+     * 场景），决赛 benchmark 全程多连接本就不会命中，禁用零性能损失；批量 LOAD 走
+     * autocommit（txn_mode=false）从不经此路径，同样不受影响。 */
     bool uses_si_fast_path(Transaction *txn) const {
-        return txn && txn->get_txn_mode() &&
-               active_explicit_count_.load(std::memory_order_acquire) <= 1 &&
-               !any_mvcc_dirty_.load(std::memory_order_acquire) &&
-               txn->get_isolation_level() != IsolationLevel::SERIALIZABLE;
+        (void)txn;
+        return false;
     }
     /* 写是否需维护版本：并发显式事务 / SER / 脏表隐式写 才走 MVCC；单连接 SI 显式事务走快路径。
      * 有活跃显式事务时，隐式（autocommit）写也必须走版本——否则会原地改堆，破坏并行 SI 快照。 */
@@ -318,11 +320,14 @@ private:
     mutable std::shared_mutex mvcc_dirty_mutex_;
     std::unordered_set<std::string> mvcc_dirty_;
 
-    /* 已提交删除的延迟物化登记（见 drain_deferred_deletes） */
+    /* 已提交删除/更新旧索引项的延迟物化登记（见 drain_deferred_deletes）。
+       unindex_data 非空 = "UPDATE 旧 key 项清理"模式：只删除仍指向该 rid 的旧 key
+       索引项（按 unindex_data 建 key），不动堆与版本链；为空 = 删除物化三合一。 */
     struct DeferredDelete {
         std::string tab;
         Rid rid;
         timestamp_t cts;
+        std::string unindex_data;
     };
     mutable std::mutex deferred_del_latch_;
     std::vector<DeferredDelete> deferred_dels_;

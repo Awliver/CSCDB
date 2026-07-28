@@ -318,7 +318,12 @@ class UpdateExecutor : public AbstractExecutor {
                 }
             }
 
-            // 第一遍：在改 slot 之前，把所有"受影响索引"的旧 key 删掉
+            // 第一遍：在改 slot 之前，把所有"受影响索引"的旧 key 删掉。
+            // 仅限非 MVCC（物理）路径——MVCC 路径的旧项必须保留到 commit：其他会话
+            // 的快照读要经旧 key 索引项找到 rid、再经版本链取旧版本（语句期就删会让
+            // 未提交的 UPDATE 影响他人索引扫描，OJ dirty-read 场景实测丢行）。
+            // MVCC 路径的旧项由 commit 物化时删除（有更旧活跃快照则延迟）、abort 时天然保留。
+            if (!mvcc_path)
             for (auto &index : tab_.indexes) {
                 bool touches = false;
                 for (auto &idx_col : index.cols) {

@@ -95,3 +95,17 @@ Rid IxScan::rid() const {
     }
     return *cached_node_->get_rid(iid_.slot_no);
 }
+
+Rid IxScan::rid_and_key(char *key_out) const {
+    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    normalize_position();
+    if (iid_ == end_) {
+        return Rid{-1, -1};
+    }
+    ensure_cached(iid_.page_no);
+    if (iid_ == end_ || iid_.slot_no < 0 || iid_.slot_no >= cached_size_) {
+        return Rid{-1, -1};
+    }
+    memcpy(key_out, cached_node_->get_key(iid_.slot_no), ih_->get_fhdr_col_tot_len());
+    return *cached_node_->get_rid(iid_.slot_no);
+}

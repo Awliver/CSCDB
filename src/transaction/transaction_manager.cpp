@@ -40,7 +40,12 @@ void rollback_index_on_abort(SmManager *sm, const std::string &tab_name, const R
         } else if (wtype == WType::UPDATE_TUPLE && !old_data.empty() && !new_data.empty() &&
                    memcmp(old_key.data(), new_key.data(), index.col_tot_len) != 0) {
             ih->delete_entry(new_key.data(), nullptr);
-            ih->insert_entry(old_key.data(), rid, nullptr);
+            // MVCC 路径的旧项在语句期从未删除（延迟到 commit），此处通常仍在——
+            // 仅缺失时补插（物理快路径等遗留场景），避免对已存在 key 重复插入
+            std::vector<Rid> found;
+            if (!ih->get_value(old_key.data(), &found, nullptr)) {
+                ih->insert_entry(old_key.data(), rid, nullptr);
+            }
         }
     }
 }
@@ -69,6 +74,33 @@ void remove_index_entries_on_commit(SmManager *sm, const std::string &tab_name, 
             if (fr == rid) { points_here = true; break; }
         }
         if (points_here) ih->delete_entry(key.data(), nullptr);
+    }
+}
+
+/* 已提交 UPDATE 的旧索引项清理：MVCC 路径语句期不删旧项（他人快照读需要），
+ * 提交后按"旧 key ≠ 当前 key 且旧项仍指向本 rid"逐索引删除。cur_data 取当前
+ * 已提交记录字节：若后续事务把 key 改回旧值，old==cur 判定自然跳过，不会误删。 */
+void remove_stale_update_index_entries(SmManager *sm, const std::string &tab_name, const Rid &rid,
+                                       const std::string &old_data, const char *cur_data) {
+    if (sm == nullptr || old_data.empty() || cur_data == nullptr) return;
+    TabMeta &tab = sm->db_.get_table(tab_name);
+    for (auto &index : tab.indexes) {
+        std::vector<char> old_key(index.col_tot_len), cur_key(index.col_tot_len);
+        int off = 0;
+        for (auto &idx_col : index.cols) {
+            memcpy(old_key.data() + off, old_data.data() + idx_col.offset, idx_col.len);
+            memcpy(cur_key.data() + off, cur_data + idx_col.offset, idx_col.len);
+            off += idx_col.len;
+        }
+        if (memcmp(old_key.data(), cur_key.data(), index.col_tot_len) == 0) continue;
+        auto ih = sm->ihs_.at(sm->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        std::vector<Rid> found;
+        if (!ih->get_value(old_key.data(), &found, nullptr)) continue;
+        bool points_here = false;
+        for (auto &fr : found) {
+            if (fr == rid) { points_here = true; break; }
+        }
+        if (points_here) ih->delete_entry(old_key.data(), nullptr);
     }
 }
 
@@ -325,6 +357,21 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             } else if (!ch.writer_data.empty()) {
                 sm_manager_->fhs_.at(tab)->update_record(wr->GetRid(),
                                                          (char *)ch.writer_data.data(), nullptr);
+                // MVCC UPDATE 语句期只插新索引项、旧项保留（他人快照读经旧 key 找行）。
+                // 提交后旧项成为陈旧引用：无更旧活跃快照即刻清理；否则登记延迟，
+                // 待水位越过 cts 由 drain_deferred_deletes 清理。
+                RmRecord &undo_old = wr->GetRecord();
+                if (wr->GetWriteType() == WType::UPDATE_TUPLE && undo_old.size > 0) {
+                    std::string old_bytes(undo_old.data, (size_t)undo_old.size);
+                    if (prune_wm >= cts) {
+                        remove_stale_update_index_entries(sm_manager_, tab, wr->GetRid(),
+                                                          old_bytes, ch.writer_data.data());
+                    } else {
+                        std::scoped_lock<std::mutex> dl(deferred_del_latch_);
+                        deferred_dels_.push_back(
+                            DeferredDelete{tab, wr->GetRid(), cts, std::move(old_bytes)});
+                    }
+                }
             }
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
@@ -1329,6 +1376,14 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
         RmFileHandle *fh = fit->second.get();
         int64_t rkey = mvcc_key(d.rid);
         size_t sh = mvcc_shard_idx(d.tab, rkey);
+        if (!d.unindex_data.empty()) {
+            // UPDATE 旧 key 项清理模式：水位已越过 cts，无快照再需要经旧 key 找到该行
+            if (fh->is_record(d.rid)) {
+                auto cur = fh->get_record(d.rid, nullptr);
+                remove_stale_update_index_entries(sm_manager_, d.tab, d.rid, d.unindex_data, cur->data);
+            }
+            continue;
+        }
         std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
         auto &sd = mvcc_shard_data_[sh];
         auto tit = sd.store.find(d.tab);

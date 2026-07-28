@@ -33,7 +33,7 @@ class IndexScanExecutor : public AbstractExecutor {
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
 
     Rid rid_;
-    std::unique_ptr<RecScan> scan_;
+    std::unique_ptr<IxScan> scan_;   // 具体类型：需要 rid_and_key（MVCC key 一致性过滤）
 
     SmManager *sm_manager_;
 
@@ -47,6 +47,7 @@ class IndexScanExecutor : public AbstractExecutor {
     Page *cached_table_page_ = nullptr;
     char *cached_table_slots_ = nullptr;
     char *cached_table_bitmap_ = nullptr;   // 槽位存活性校验（陈旧索引项防护）
+    std::vector<char> cur_key_buf_;         // 当前索引项 key（MVCC key 一致性过滤用）
     int table_record_size_ = 0;
 
     // 题3 批 11：预编译条件 + 跳过冗余检查
@@ -231,7 +232,16 @@ class IndexScanExecutor : public AbstractExecutor {
             if (!mvcc_on_ && context_ && context_->txn_mgr_ && context_->txn_) {
                 mvcc_on_ = context_->txn_mgr_->table_is_dirty(tab_name_);
             }
-            rid_ = scan_->rid();
+            if (mvcc_on_) {
+                // MVCC 下同一 rid 可能有多个索引项（未提交 UPDATE 保留旧项+插入新项）：
+                // 同锁取出本项 key，稍后与可见版本的 key 比对，非一致项跳过（防重复行）
+                if ((int)cur_key_buf_.size() < index_meta_.col_tot_len) {
+                    cur_key_buf_.resize(index_meta_.col_tot_len);
+                }
+                rid_ = scan_->rid_and_key(cur_key_buf_.data());
+            } else {
+                rid_ = scan_->rid();
+            }
             if (scan_->is_end() || rid_.page_no < 0 || rid_.slot_no < 0) {
                 break;
             }
@@ -255,6 +265,24 @@ class IndexScanExecutor : public AbstractExecutor {
                     continue;
                 }
                 rec_data = mvcc_buf_.data();
+                // key 一致性：可见版本按索引列重建的 key 必须等于本索引项的 key，
+                // 否则本项是"其他版本的 key"（如未提交 UPDATE 的新 key 项对旧快照）——
+                // 跳过，行只经与其可见 key 一致的项输出一次
+                {
+                    int koff = 0;
+                    bool key_same = true;
+                    for (const auto &icol : index_meta_.cols) {
+                        if (memcmp(rec_data + icol.offset, cur_key_buf_.data() + koff, icol.len) != 0) {
+                            key_same = false;
+                            break;
+                        }
+                        koff += icol.len;
+                    }
+                    if (!key_same) {
+                        scan_->next();
+                        continue;
+                    }
+                }
             } else if (!slot_live) {
                 scan_->next();
                 continue;
@@ -272,6 +300,13 @@ class IndexScanExecutor : public AbstractExecutor {
                     offset += col.len;
                 }
                 if (!match) {
+                    if (mvcc_on_) {
+                        // MVCC 下索引可含"未提交 UPDATE 插入的新 key 项"：其可见版本
+                        // 的列值仍是旧值，与扫描前缀不匹配属正常，跳过继续——据此
+                        // 终止整个扫描会漏掉后续真正匹配的行
+                        scan_->next();
+                        continue;
+                    }
                     range_exhausted_ = true;
                     return;
                 }

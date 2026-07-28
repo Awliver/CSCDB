@@ -51,5 +51,10 @@ class IxScan : public RecScan {
 
     Rid rid() const override;
 
+    /* 同一把锁内取 rid + 拷贝当前索引项 key（key_out 须有 col_tot_len 字节）。
+     * MVCC 下同一 rid 可有多个索引项（未提交 UPDATE 的新旧 key），扫描端需用
+     * "项 key == 可见版本 key" 做一致性过滤，否则同一行经多个项重复输出。 */
+    Rid rid_and_key(char *key_out) const;
+
     const Iid &iid() const { return iid_; }
 };

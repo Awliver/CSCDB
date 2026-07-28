@@ -215,6 +215,9 @@ class IxIndexHandle {
 
     Iid leaf_begin() const;
 
+    /* 索引 key 总字节数（IxScan::rid_and_key 拷贝 key 用） */
+    int get_fhdr_col_tot_len() const { return file_hdr_->col_tot_len_; }
+
    private:
     // 辅助函数
     void update_root_page_no(page_id_t root) { file_hdr_->root_page_ = root; }
