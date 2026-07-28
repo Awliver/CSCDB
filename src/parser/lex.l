@@ -126,6 +126,9 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 ">=" { return GEQ; }
 "<=" { return LEQ; }
 "<>" { return NEQ; }
+    /* 决赛 LOAD 校验 SQL 使用 != 形式的不等号（此前 '!' 落入未知字符规则被静默丢弃，
+     * "a != 0" 被吃成 "a = 0"，OJ initial_stock_ytd_zero 校验 0 vs 5000000 实测） */
+"!=" { return NEQ; }
 {single_op} { return yytext[0]; }
     /* id */
 {identifier} {
@@ -147,6 +150,10 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 }
     /* EOF */
 <<EOF>> { return T_EOF; }
-    /* unexpected char */
-. { std::cerr << "Lexer Error: unexpected character " << yytext[0] << std::endl; }
+    /* unexpected char：必须交给 yacc 报 parse error，不能静默跳过——
+     * 静默丢字符会改写查询语义（如 "!=" 曾被吃成 "="，返回错误结果比报错致命）。 */
+. {
+    std::cerr << "Lexer Error: unexpected character " << yytext[0] << std::endl;
+    return yytext[0];
+}
 %%
