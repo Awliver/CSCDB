@@ -31,6 +31,7 @@ See the Mulan PSL v2 for more details. */
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <malloc.h>
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 32
@@ -934,6 +935,9 @@ static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id,
                 ql_manager->run_load(load_file, load_tab, context);
                 if (context->txn_->get_txn_mode() == false) txn_manager->commit(context->txn_, context->log_mgr_);
                 txn_manager->reap(context->txn_);
+                // 大表装载的 CSV 解析产生海量短命分配，glibc 不会主动把保留堆还给 OS；
+                // 及时归还，避免 RSS 长期虚高挤占后续 benchmark 的内存余量（OJ 有内存上限）
+                malloc_trim(0);
             } catch (std::exception &e) {
                 try { txn_manager->abort(context->txn_, log_manager.get()); } catch (...) {}
                 wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));

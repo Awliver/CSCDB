@@ -61,6 +61,7 @@ class BufferPoolManager {
     static constexpr int CLEANER_INTERVAL_MS = 20;
     static constexpr int CLEANER_BATCH = 256;
     std::thread cleaner_thread_;
+    int trim_tick_ = 0;
     std::mutex cleaner_mtx_;
     std::condition_variable cleaner_cv_;
     bool cleaner_stop_ = false;

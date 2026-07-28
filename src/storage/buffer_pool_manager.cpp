@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "buffer_pool_manager.h"
 #include "recovery/log_manager.h"
 #include <cstring>
+#include <malloc.h>
 
 void BufferPoolManager::start_cleaner() {
     std::scoped_lock lk(cleaner_mtx_);
@@ -54,6 +55,12 @@ void BufferPoolManager::cleaner_loop() {
             cleaner_cv_.wait_for(lk, std::chrono::milliseconds(CLEANER_INTERVAL_MS),
                                  [this] { return cleaner_stop_; });
             if (cleaner_stop_) break;
+        }
+        // 周期性归还 glibc 保留堆（约 30s 一次）：长跑中事务对象/链表 churn 的堆碎片
+        // 不会自动还 OS，RSS 虚高会触顶评测内存上限（bad_alloc → 语句 ERROR）
+        if (++trim_tick_ * CLEANER_INTERVAL_MS >= 30000) {
+            trim_tick_ = 0;
+            malloc_trim(0);
         }
         {
             size_t total_free = 0;
