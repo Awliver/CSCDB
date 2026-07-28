@@ -1,0 +1,5 @@
+| id |
+| 1 |
+Project(columns=[*], rows=1)
+	Filter(condition=[t.id=1], rows=1)
+		Scan(table=t, type=SeqScan, rows=2)

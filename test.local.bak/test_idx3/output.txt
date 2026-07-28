@@ -1,0 +1,3 @@
+Project(columns=[*], rows=1)
+	Filter(condition=[t.id=1], rows=1)
+		Scan(table=t, type=IndexScan, rows=2)

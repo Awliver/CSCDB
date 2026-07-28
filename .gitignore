@@ -38,10 +38,7 @@ db.meta
 db.restart
 my_db/
 **/db_files/
-**/test_db/
-**/*_test_db/
 **/*_db/
-**/checkpoint_test/
 **/tpcc_data/
 
 # ============================================

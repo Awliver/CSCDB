@@ -1,0 +1,6 @@
+Project(columns=[A.x, B.z], rows=2)
+	Join(tables=[A, B], condition=[A.x=B.x], rows=2)
+		Project(columns=[A.x], rows=2)
+			Scan(table=A, type=SeqScan, rows=2)
+		Project(columns=[B.x, B.z], rows=4)
+			Scan(table=B, type=SeqScan, rows=4)
