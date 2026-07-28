@@ -154,9 +154,16 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             auto it = shard.page_table_.find(key);
             if (it != shard.page_table_.end()) {
                 hit_frame = it->second;
-                if (pages_[hit_frame].pin_count_ > 0) {
-                    pages_[hit_frame].pin_count_++;
-                    return &pages_[hit_frame];
+                // 共享锁下多个读者并发命中同一页：普通 ++ 会丢增量（pin 被"偷"，在用页被
+                // 提前淘汰 → 帧复用 → 堆损坏）。CAS 仅在 >0 时自增；0→1 的复活只允许走
+                // 下方 unique 锁路径（需同步 replacer->pin）。
+                Page &hp = pages_[hit_frame];
+                int cur = hp.pin_count_.load(std::memory_order_relaxed);
+                while (cur > 0) {
+                    if (hp.pin_count_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
+                                                            std::memory_order_relaxed)) {
+                        return &hp;
+                    }
                 }
             }
         }
@@ -265,7 +272,9 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     frame_id_t frame_id = it->second;
     Page& page = pages_[frame_id];
     if (is_dirty) page.is_dirty_ = true;
-    if (page.pin_count_ <= 0) return false;
+    if (page.pin_count_ <= 0) {
+        return false;
+    }
     page.pin_count_--;
     // page_id 必归属本分片，故在本分片锁下操作本分片 replacer，无全局锁（热路径）
     if (page.pin_count_ == 0) shard.replacer_->unpin(frame_id);

@@ -592,11 +592,20 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
         outcome = ExecOutcome::ERROR;
     }
 
-    // 与历史 NUL 协议一致：非显式事务在此无条件提交/回收——回复即持久
-    if (context->txn_->get_txn_mode() == false) {
-        txn_manager->commit(context->txn_, context->log_mgr_);
+    // 与历史 NUL 协议一致：非显式事务在此无条件提交/回收——回复即持久。
+    // commit/reap 也可能抛异常（缓冲池压力下的页 IO 等），必须捕获转 ERROR，
+    // 否则逃出本函数的调用方无 catch → std::terminate → 服务器 SIGABRT
+    try {
+        if (context->txn_->get_txn_mode() == false) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+        }
+        txn_manager->reap(context->txn_);
+    } catch (std::exception &e) {
+        if (outcome == ExecOutcome::OK) {
+            diag = e.what();
+            outcome = ExecOutcome::ERROR;
+        }
     }
-    txn_manager->reap(context->txn_);
     return outcome;
 }
 
@@ -862,12 +871,17 @@ static void handle_exec_batch(int fd, const std::string &payload,
         executed++;
     }
 
-    // AUTO_ABORT：失败且连接存在活动（显式）事务时，必须先完成回滚再回失败响应
+    // AUTO_ABORT：失败且连接存在活动（显式）事务时，必须先完成回滚再回失败响应。
+    // abort 抛异常同样不能逃逸（调用方只 catch WireProtocolError → 否则 SIGABRT）
     if (status != wire::BATCH_STATUS_OK) {
-        Transaction *t = txn_manager->get_transaction(*txn_id);
-        if (t != nullptr && t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
-            t->get_state() != TransactionState::ABORTED) {
-            txn_manager->abort(t, log_manager.get());
+        try {
+            Transaction *t = txn_manager->get_transaction(*txn_id);
+            if (t != nullptr && t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
+                t->get_state() != TransactionState::ABORTED) {
+                txn_manager->abort(t, log_manager.get());
+            }
+        } catch (std::exception &e) {
+            std::cerr << "[wire] auto-abort failed: " << e.what() << std::endl;
         }
     }
 
@@ -918,13 +932,13 @@ static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id,
             SetTransaction(txn_id, context, sess_iso);
             try {
                 ql_manager->run_load(load_file, load_tab, context);
+                if (context->txn_->get_txn_mode() == false) txn_manager->commit(context->txn_, context->log_mgr_);
+                txn_manager->reap(context->txn_);
             } catch (std::exception &e) {
-                txn_manager->abort(context->txn_, log_manager.get());
+                try { txn_manager->abort(context->txn_, log_manager.get()); } catch (...) {}
                 wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));
                 return;
             }
-            if (context->txn_->get_txn_mode() == false) txn_manager->commit(context->txn_, context->log_mgr_);
-            txn_manager->reap(context->txn_);
             if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
             return;
         }
@@ -991,6 +1005,12 @@ static void handle_wire_connection(int fd) {
             }
         } catch (wire::WireProtocolError &e) {
             std::cerr << "[wire] protocol error, closing connection: " << e.what() << std::endl;
+            wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));
+            break;
+        } catch (std::exception &e) {
+            // 兜底：任何逃逸到此的异常（如 commit/abort 内部抛出）只断本连接，绝不
+            // 逃到线程函数触发 std::terminate 杀死整个服务器（SIGABRT）
+            std::cerr << "[wire] unexpected exception, closing connection: " << e.what() << std::endl;
             wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));
             break;
         }
