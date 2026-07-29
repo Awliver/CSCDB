@@ -1480,6 +1480,24 @@ int main(int argc, char **argv) {
         // 上限 2 个 arena：虚存封顶 ~128MB，争用由内部分片锁结构消化
         mallopt(M_ARENA_MAX, 2);
 
+        // 恢复各阶段堆归因（RMDB_MVCC_STATS=1 时打印）：mallinfo2 只覆盖 main arena +
+        // 统计口径有限，但足以定位"恢复后基线虚存"的产生阶段
+        auto log_heap = [](const char *phase) {
+            if (std::getenv("RMDB_MVCC_STATS") == nullptr) return;
+            struct mallinfo2 mi = mallinfo2();
+            long vsz_kb = 0;
+            if (FILE *f = fopen("/proc/self/status", "r")) {
+                char line[256];
+                while (fgets(line, sizeof line, f)) {
+                    if (sscanf(line, "VmSize: %ld kB", &vsz_kb) == 1) break;
+                }
+                fclose(f);
+            }
+            fprintf(stderr, "[heap] %-14s live_mb=%.0f free_mb=%.0f arena_mb=%.0f mmap_mb=%.0f vsz_mb=%ld\n",
+                    phase, mi.uordblks / 1048576.0, mi.fordblks / 1048576.0,
+                    mi.arena / 1048576.0, mi.hblkhd / 1048576.0, vsz_kb / 1024);
+        };
+
         // Database name is passed by args
         std::string db_name = argv[1];
         if (!sm_manager->is_dir(db_name)) {
@@ -1488,13 +1506,18 @@ int main(int argc, char **argv) {
         }
         // Open database
         sm_manager->open_db(db_name);
+        log_heap("open_db");
 
         // recovery database
         g_log_manager = log_manager.get();
         recovery->set_log_manager(log_manager.get());
         recovery->analyze();
+        log_heap("analyze");
         recovery->redo();
+        log_heap("redo");
         recovery->undo();
+        malloc_trim(0);   // 恢复期 churn 的空闲堆立即还 OS，压低 benchmark 前的水位基线
+        log_heap("undo+rebuild");
 
         buffer_pool_manager->start_cleaner();  // recovery 后
         txn_manager->start_chain_sweeper();    // MVCC 干净链后台回收（防测量轮内存线性增长）
@@ -1506,6 +1529,8 @@ int main(int argc, char **argv) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     size_t chains = 0, vers = 0, bytes = 0;
                     txn_manager->debug_mvcc_stats(chains, vers, bytes);
+                    size_t rw = 0, dk = 0, dd = 0, se = 0;
+                    txn_manager->debug_aux_stats(rw, dk, dd, se);
                     long rss_kb = 0, vsz_kb = 0;
                     if (FILE *f = fopen("/proc/self/status", "r")) {
                         char line[256];
@@ -1515,8 +1540,12 @@ int main(int argc, char **argv) {
                         }
                         fclose(f);
                     }
-                    fprintf(stderr, "[mvcc-stats] chains=%zu vers=%zu data_mb=%.1f rlocks=%zu rss_mb=%ld vsz_mb=%ld\n",
+                    struct mallinfo2 mi = mallinfo2();
+                    fprintf(stderr, "[mvcc-stats] chains=%zu vers=%zu data_mb=%.1f rlocks=%zu "
+                            "rwrites=%zu delkeys=%zu deferred=%zu ser=%zu "
+                            "heap_live_mb=%.0f heap_free_mb=%.0f rss_mb=%ld vsz_mb=%ld\n",
                             chains, vers, bytes / 1048576.0, lock_manager->record_lock_count(),
+                            rw, dk, dd, se, mi.uordblks / 1048576.0, mi.fordblks / 1048576.0,
                             rss_kb / 1024, vsz_kb / 1024);
                 }
             }).detach();

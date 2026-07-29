@@ -220,6 +220,12 @@ public:
         log_tot_len_ += sizeof(size_t) + table_name_size_;
     }
 
+    // 无析构则 table_name_ 每条日志泄漏一次：LOAD 25M 行泄 ~600MB、
+    // benchmark 每秒 MB 级——评测地址空间上限下测量中段 bad_alloc → ERROR
+    ~InsertLogRecord() { delete[] table_name_; }
+    InsertLogRecord(const InsertLogRecord&) = delete;
+    InsertLogRecord& operator=(const InsertLogRecord&) = delete;
+
     // 把insert日志记录序列化到dest中
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
@@ -282,6 +288,9 @@ public:
         memcpy(table_name_, table_name.c_str(), table_name_size_);
         log_tot_len_ += sizeof(size_t) + table_name_size_;
     }
+    ~DeleteLogRecord() { delete[] table_name_; }
+    DeleteLogRecord(const DeleteLogRecord&) = delete;
+    DeleteLogRecord& operator=(const DeleteLogRecord&) = delete;
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
         int offset = OFFSET_LOG_DATA;
@@ -339,6 +348,9 @@ public:
         memcpy(table_name_, table_name.c_str(), table_name_size_);
         log_tot_len_ += sizeof(size_t) + table_name_size_;
     }
+    ~UpdateLogRecord() { delete[] table_name_; }
+    UpdateLogRecord(const UpdateLogRecord&) = delete;
+    UpdateLogRecord& operator=(const UpdateLogRecord&) = delete;
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
         int offset = OFFSET_LOG_DATA;

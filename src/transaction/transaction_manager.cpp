@@ -1558,6 +1558,53 @@ void TransactionManager::sweep_clean_chains() {
             else ++tit;
         }
     }
+
+    // recent_writes_ 对账清理：该集合只被 SSI 的 ser_read_pred_check 消费，其惰性剔除
+    // 只在 SER 谓词读发生时才触发——纯 SI 负载（决赛 benchmark）下集合只增不减
+    //（实测 150s 积 218 万条 ≈ 100MB，评测地址空间上限下测量中段 bad_alloc → ERROR）。
+    // 规则：无对应链的 rkey 连续两个周期出现才摘（"先登记后写链"的在飞窗口不能只凭
+    // 单次缺链判死——注册与链创建之间隔微秒级，两周期间隔 1s 足以豁免）；
+    // 有链的 rkey 一律保留（冷链由本函数上方擦除，下一周期自然变"无链"）。
+    {
+        std::unordered_map<std::string, std::vector<int64_t>> snapshot;
+        {
+            std::scoped_lock<std::mutex> rl(recent_writes_latch_);
+            for (auto &tp : recent_writes_) {
+                if (!tp.second.empty())
+                    snapshot[tp.first].assign(tp.second.begin(), tp.second.end());
+            }
+        }
+        std::unordered_map<std::string, std::vector<int64_t>> absent_now;
+        for (auto &tp : snapshot) {
+            const std::string &tab = tp.first;
+            for (int64_t rkey : tp.second) {
+                size_t sh = mvcc_shard_idx(tab, rkey);
+                std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
+                auto tit = mvcc_shard_data_[sh].store.find(tab);
+                if (tit == mvcc_shard_data_[sh].store.end() ||
+                    tit->second.find(rkey) == tit->second.end()) {
+                    absent_now[tab].push_back(rkey);
+                }
+            }
+        }
+        // 与上一周期的缺链集求交 → 摘除；本周期缺链集留作下一周期基线
+        {
+            std::scoped_lock<std::mutex> rl(recent_writes_latch_);
+            for (auto &tp : absent_now) {
+                auto prev_it = rw_absent_prev_.find(tp.first);
+                if (prev_it == rw_absent_prev_.end()) continue;
+                auto &prev_set = prev_it->second;
+                auto set_it = recent_writes_.find(tp.first);
+                if (set_it == recent_writes_.end()) continue;
+                for (int64_t k : tp.second) {
+                    if (prev_set.count(k)) set_it->second.erase(k);
+                }
+            }
+        }
+        rw_absent_prev_.clear();
+        for (auto &tp : absent_now)
+            rw_absent_prev_[tp.first].insert(tp.second.begin(), tp.second.end());
+    }
 }
 
 void TransactionManager::start_chain_sweeper() {
@@ -1613,6 +1660,27 @@ void TransactionManager::debug_mvcc_stats(size_t &chains, size_t &vers, size_t &
                 for (const auto &v : cp.second.hist) bytes += v.data.size();
             }
         }
+    }
+}
+
+void TransactionManager::debug_aux_stats(size_t &recent_writes, size_t &del_keys,
+                                         size_t &deferred, size_t &ser_entries) const {
+    recent_writes = del_keys = deferred = ser_entries = 0;
+    {
+        std::scoped_lock<std::mutex> rl(recent_writes_latch_);
+        for (const auto &tp : recent_writes_) recent_writes += tp.second.size();
+    }
+    {
+        std::scoped_lock<std::mutex> dl(del_meta_latch_);
+        for (const auto &tp : del_keys_) del_keys += tp.second.size();
+    }
+    {
+        std::scoped_lock<std::mutex> ml(deferred_del_latch_);
+        deferred = deferred_dels_.size();
+    }
+    {
+        std::scoped_lock<std::mutex> sl(ser_latch_);
+        ser_entries = ser_.size();
     }
 }
 

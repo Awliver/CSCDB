@@ -210,7 +210,6 @@ void RecoveryManager::collect_uncommitted() {
                 op.table.assign(lr.table_name_, lr.table_name_size_);
                 op.rid = lr.rid_;
                 uncommitted_[tid].push_back(std::move(op));
-                delete[] lr.table_name_;
                 break;
             }
             case LogType::DELETE: {
@@ -222,7 +221,6 @@ void RecoveryManager::collect_uncommitted() {
                 op.rid = lr.rid_;
                 op.old_data.assign(lr.delete_value_.data, lr.delete_value_.size);
                 uncommitted_[tid].push_back(std::move(op));
-                delete[] lr.table_name_;
                 break;
             }
             case LogType::UPDATE: {
@@ -234,7 +232,6 @@ void RecoveryManager::collect_uncommitted() {
                 op.rid = lr.rid_;
                 op.old_data.assign(lr.old_value_.data, lr.old_value_.size);
                 uncommitted_[tid].push_back(std::move(op));
-                delete[] lr.table_name_;
                 break;
             }
             case LogType::UPDATE_DELTA: {
@@ -306,7 +303,6 @@ void RecoveryManager::redo() {
                 InsertLogRecord lr;
                 lr.deserialize(data);
                 std::string tab(lr.table_name_, lr.table_name_size_);
-                delete[] lr.table_name_;
                 if (RmFileHandle* fh = table_fh(tab)) {
                     apply_insert(fh, lr.rid_, lr.insert_value_.data);
                     touched_ = true;
@@ -317,7 +313,6 @@ void RecoveryManager::redo() {
                 DeleteLogRecord lr;
                 lr.deserialize(data);
                 std::string tab(lr.table_name_, lr.table_name_size_);
-                delete[] lr.table_name_;
                 if (RmFileHandle* fh = table_fh(tab)) {
                     apply_delete(fh, lr.rid_);
                     touched_ = true;
@@ -328,7 +323,6 @@ void RecoveryManager::redo() {
                 UpdateLogRecord lr;
                 lr.deserialize(data);
                 std::string tab(lr.table_name_, lr.table_name_size_);
-                delete[] lr.table_name_;
                 if (RmFileHandle* fh = table_fh(tab)) {
                     apply_update(fh, lr.rid_, lr.new_value_.data);
                     touched_ = true;

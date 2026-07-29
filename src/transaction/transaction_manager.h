@@ -296,6 +296,8 @@ public:
 
     /* 诊断（RMDB_MVCC_STATS）：链数/版本数/数据字节合计（逐分片短锁） */
     void debug_mvcc_stats(size_t &chains, size_t &vers, size_t &bytes) const;
+    void debug_aux_stats(size_t &recent_writes, size_t &del_keys,
+                         size_t &deferred, size_t &ser_entries) const;
 
     /* 干净链全量回收（后台线程周期调用）：与 commit 内嵌回收同一安全条件。
      * 内嵌回收只覆盖"同一 rid 被再次写"的链；纯插入行（orders/order_line/
@@ -393,6 +395,8 @@ private:
      * ——水位单调不减，剔除后不会重新变热。 */
     mutable std::mutex recent_writes_latch_;
     std::unordered_map<std::string, std::unordered_set<int64_t>> recent_writes_;
+    // sweeper 对账清理的上一周期"查无对应链"基线（仅 sweeper 线程访问，无锁）
+    std::unordered_map<std::string, std::unordered_set<int64_t>> rw_absent_prev_;
     void recent_writes_add(const std::string &tab, int64_t rkey) {
         std::scoped_lock<std::mutex> lck(recent_writes_latch_);
         recent_writes_[tab].insert(rkey);

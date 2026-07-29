@@ -61,6 +61,8 @@ struct RmRecord {
 
 
     RmRecord &operator=(const RmRecord& other) {
+        if (this == &other) return *this;
+        if (allocated_) delete[] data;   // 旧缓冲不释放会随每次赋值泄漏
         size = other.size;
         data = new char[size];
         memcpy(data, other.data, size);
@@ -91,6 +93,9 @@ struct RmRecord {
             delete[] data;
         }
         data = new char[size];
+        // 不置 allocated_ 则析构不释放：恢复 redo 每条日志泄一行数据
+        //（W=50 装载 WAL 重放泄 GB 级，评测地址空间上限下 bad_alloc → 语句 ERROR）
+        allocated_ = true;
         memcpy(data, data_ + sizeof(int), size);
     }
 
