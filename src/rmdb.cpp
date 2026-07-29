@@ -1070,6 +1070,10 @@ static void handle_wire_connection(int fd) {
 }
 
 void *client_handler(void *sock_fd) {
+    // 无人 join 的线程必须 detach，否则线程退出后 8MB 栈虚存永久滞留：评测一次跑
+    // 数百个连接（功能史/装载/warmup/逐轮测量各建一批），累计虚存以 GB 计，触顶
+    // RLIMIT_AS 后下一个 malloc/pthread_create 失败 → 语句 ERROR / accept 循环崩坏
+    pthread_detach(pthread_self());
     int fd = (int)(intptr_t)sock_fd;
     pthread_mutex_unlock(sockfd_mutex);
 
@@ -1418,10 +1422,23 @@ void start_server() {
             setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         }
         
-        // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        if (pthread_create(&thread_id, nullptr, &client_handler, (void *)(intptr_t)sockfd) != 0) {
+        // 和客户端建立连接，并开启一个线程负责处理客户端请求。
+        // 连接线程栈显式 1MB：默认 8MB 是纯虚存浪费（评测 RLIMIT_AS 上限）；
+        // 服务器语句处理无深递归（yacc 解析栈在堆上、B+ 树迭代式）。
+        pthread_attr_t tattr;
+        pthread_attr_init(&tattr);
+        pthread_attr_setstacksize(&tattr, 1 << 20);
+        int cret = pthread_create(&thread_id, &tattr, &client_handler, (void *)(intptr_t)sockfd);
+        pthread_attr_destroy(&tattr);
+        if (cret != 0) {
+            // 绝不能 break：跳出循环会走 close_db() 关掉所有表文件 fd，而存活连接
+            // 线程仍在服务 → 全部语句 EBADF（"进程存活但每条 SQL ERROR"，ulimit 复现
+            // 实测）。瞬时资源不足只放弃本连接，退避后继续 accept。
             std::cout << "Create thread fail!" << std::endl;
-            break;  // break while loop
+            close(sockfd);
+            pthread_mutex_unlock(sockfd_mutex);   // client_handler 未启动，锁由本方释放
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
         }
 
     }
@@ -1458,6 +1475,11 @@ int main(int argc, char **argv) {
                      "Welcome to RMDB!\n"
                      "Type 'help;' for help.\n"
                      "\n";
+        // glibc 每线程 arena 各占 64MB 虚存、随 malloc 争用渐进新建（上限 8×核数），
+        // 评测 RLIMIT_AS 上限下测量中段会被 arena 增长顶爆（bad_alloc → 语句 ERROR）。
+        // 上限 2 个 arena：虚存封顶 ~128MB，争用由内部分片锁结构消化
+        mallopt(M_ARENA_MAX, 2);
+
         // Database name is passed by args
         std::string db_name = argv[1];
         if (!sm_manager->is_dir(db_name)) {
@@ -1484,17 +1506,18 @@ int main(int argc, char **argv) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     size_t chains = 0, vers = 0, bytes = 0;
                     txn_manager->debug_mvcc_stats(chains, vers, bytes);
-                    long rss_kb = 0;
+                    long rss_kb = 0, vsz_kb = 0;
                     if (FILE *f = fopen("/proc/self/status", "r")) {
                         char line[256];
                         while (fgets(line, sizeof line, f)) {
-                            if (sscanf(line, "VmRSS: %ld kB", &rss_kb) == 1) break;
+                            if (sscanf(line, "VmRSS: %ld kB", &rss_kb) == 1) continue;
+                            if (sscanf(line, "VmSize: %ld kB", &vsz_kb) == 1) continue;
                         }
                         fclose(f);
                     }
-                    fprintf(stderr, "[mvcc-stats] chains=%zu vers=%zu data_mb=%.1f rlocks=%zu rss_mb=%ld\n",
+                    fprintf(stderr, "[mvcc-stats] chains=%zu vers=%zu data_mb=%.1f rlocks=%zu rss_mb=%ld vsz_mb=%ld\n",
                             chains, vers, bytes / 1048576.0, lock_manager->record_lock_count(),
-                            rss_kb / 1024);
+                            rss_kb / 1024, vsz_kb / 1024);
                 }
             }).detach();
         }

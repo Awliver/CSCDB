@@ -87,6 +87,11 @@ class Page {
     /** 脏页判断 */
     bool is_dirty_ = false;
 
+    /** 修改版本号（分片 unique latch 下于 unpin(dirty=true) 时自增）。cleaner 拷贝快照
+     *  锁外写盘后，仅当版本未变才允许清 is_dirty_——否则写盘期间新到的修改会被误标为
+     *  已落盘（脏标丢失 → 页被当干净页淘汰 → 已提交更新静默丢失）。 */
+    uint32_t mod_ver_ = 0;
+
     /** The pin count of this page.
      *  必须原子：fetch_page 命中快路径在【共享】分片锁下自增 pin，多个读者并发命中同一页时
      *  普通 int++ 会丢失增量（两个线程同读 1 同写 2），pin 计数低于真实持有者数 → 在用页/

@@ -54,7 +54,12 @@ class BufferPoolManager {
     DiskManager *disk_manager_;
     std::mutex io_mutex_;
     std::condition_variable io_cv_;
-    std::vector<bool> frame_io_inflight_;
+    /* 原子：fetch 命中快路径需在共享锁下无锁读取（淘汰刷盘期间表项刻意保留，
+     * 命中方必须能看到 in-flight 标记并退避）；写入仍在 io_mutex_ 内（cv 语义） */
+    std::vector<std::atomic<bool>> frame_io_inflight_;
+
+    /* 若 page_table_ 中 pid 仍映射到帧 f 则移除（淘汰刷盘完成后的延迟摘表） */
+    void erase_page_mapping(PageId pid, frame_id_t f);
     std::array<BpmShard, BPM_NSHARDS> shards_;
 
     // 后台 Page Cleaner：全局空闲帧总数偏低时刷 pin==0 脏页，减轻淘汰冷路径写盘。
@@ -82,7 +87,7 @@ class BufferPoolManager {
 
    public:
     BufferPoolManager(size_t pool_size, DiskManager *disk_manager)
-        : pool_size_(pool_size), disk_manager_(disk_manager), frame_io_inflight_(pool_size, false) {
+        : pool_size_(pool_size), disk_manager_(disk_manager), frame_io_inflight_(pool_size) {
         pages_ = new Page[pool_size_];
         for (auto &shard : shards_) {
             shard.replacer_ = std::make_unique<LRUReplacer>(pool_size_);

@@ -48,7 +48,18 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
     ssize_t bytes_read = pread(fd, offset, num_bytes, pos);
     if (bytes_read != num_bytes)
     {
-        throw InternalError("DiskManager::read_page Error");
+        // 诊断关键：短读=页从未写盘就被淘汰；got=-1 则看 errno（EBADF=fd 失效等）
+        int err = errno;
+        off_t fsize = lseek(fd, 0, SEEK_END);
+        std::string path = "?";
+        auto it = fd2path_.find(fd);
+        if (it != fd2path_.end()) path = it->second;
+        throw InternalError("DiskManager::read_page Error: file=" + path +
+                            " fd=" + std::to_string(fd) +
+                            " page=" + std::to_string(page_no) +
+                            " got=" + std::to_string((long)bytes_read) +
+                            " errno=" + std::string(bytes_read < 0 ? strerror(err) : "-") +
+                            " fsize_pages=" + std::to_string((long)(fsize / PAGE_SIZE)));
     }
 }
 

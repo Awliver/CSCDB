@@ -96,6 +96,7 @@ void BufferPoolManager::cleaner_loop() {
                 if (cleaner_stop_) return;
                 frame_id_t target = INVALID_FRAME_ID;
                 PageId pid{-1, INVALID_PAGE_ID};
+                uint32_t snap_ver = 0;
                 char flush_buf[PAGE_SIZE];
                 {
                     std::unique_lock<std::shared_mutex> lock(sh.latch_);
@@ -103,12 +104,10 @@ void BufferPoolManager::cleaner_loop() {
                         frame_id_t f = entry.second;
                         Page &pg = pages_[f];
                         if (pg.pin_count_ != 0 || !pg.is_dirty_) continue;
-                        {
-                            std::scoped_lock io_lock(io_mutex_);
-                            if (frame_io_inflight_[f]) continue;
-                        }
+                        if (frame_io_inflight_[f].load(std::memory_order_acquire)) continue;
                         target = f;
                         pid = pg.id_;
+                        snap_ver = pg.mod_ver_;
                         memcpy(flush_buf, pg.data_, PAGE_SIZE);
                         break;
                     }
@@ -119,7 +118,11 @@ void BufferPoolManager::cleaner_loop() {
                 {
                     std::unique_lock<std::shared_mutex> lock(sh.latch_);
                     Page &pg = pages_[target];
-                    if (pg.pin_count_ == 0 && pg.id_ == pid && pg.is_dirty_) {
+                    // mod_ver_ 相同才能清脏标：锁外写盘期间若有新修改（写者 pin→改→
+                    // unpin(dirty) 已完成），盘上是旧快照，清标会让新修改被当作已落盘
+                    // → 页被干净淘汰 → 已提交更新丢失
+                    if (pg.pin_count_ == 0 && pg.id_ == pid && pg.is_dirty_ &&
+                        pg.mod_ver_ == snap_ver) {
                         pg.is_dirty_ = false;
                     }
                 }
@@ -128,6 +131,14 @@ void BufferPoolManager::cleaner_loop() {
         }
         next_shard = (next_shard + 1) % BPM_NSHARDS;
     }
+}
+
+void BufferPoolManager::erase_page_mapping(PageId pid, frame_id_t f) {
+    if (pid.page_no == INVALID_PAGE_ID) return;
+    BpmShard &sh = shard_for_page(pid);
+    std::unique_lock<std::shared_mutex> lk(sh.latch_);
+    auto it = sh.page_table_.find(page_key(pid));
+    if (it != sh.page_table_.end() && it->second == f) sh.page_table_.erase(it);
 }
 
 bool BufferPoolManager::reserve_victim_nolock(size_t pref_shard, frame_id_t* out_frame,
@@ -157,7 +168,13 @@ bool BufferPoolManager::reserve_victim_nolock(size_t pref_shard, frame_id_t* out
         *out_frame = f;
         *old_page_id = victim.id_;
         *need_flush = victim.is_dirty_;
-        if (victim.id_.page_no != INVALID_PAGE_ID) {
+        // 干净 victim：磁盘副本有效，立即摘表（后续读者从盘装入即正确）。
+        // 脏 victim：表项【保留】到调用方锁外 write_page 完成后再摘
+        // （erase_page_mapping）——若此刻摘表，并发 fetch 同页会判未命中而在
+        // 刷盘完成前读盘：从未落盘的新页短读报错（DiskManager::read_page，
+        // OJ measurement 偶发 SELECT ERROR 实测），已落盘页则读到陈旧版本
+        // （已提交更新静默丢失）。保留期间命中方经 frame_io_inflight_ 退避等待。
+        if (victim.id_.page_no != INVALID_PAGE_ID && !victim.is_dirty_) {
             sh.page_table_.erase(page_key(victim.id_));
         }
         victim.pin_count_ = 1;                       // 预占，防止被并发再次选中
@@ -200,7 +217,15 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 while (cur > 0) {
                     if (hp.pin_count_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
                                                             std::memory_order_relaxed)) {
-                        return &hp;
+                        // 淘汰刷盘期间脏 victim 的表项被刻意保留（见 reserve_victim_nolock），
+                        // 此时帧被淘汰方独占（帧内容即将被换入页覆盖），不能借道命中：
+                        // 撤销 pin，落入下方 unique 路径按 in-flight 等待后重试。
+                        // 持共享分片锁期间摘表（unique）不可能发生，标志与表项状态一致。
+                        if (!frame_io_inflight_[hit_frame].load(std::memory_order_acquire)) {
+                            return &hp;
+                        }
+                        hp.pin_count_.fetch_sub(1, std::memory_order_acq_rel);
+                        break;
                     }
                 }
             }
@@ -266,9 +291,12 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         if (need_flush_old) {
             if (g_log_manager) g_log_manager->flush_log_to_disk();
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+            // 旧页已落盘，此刻起磁盘副本有效：摘除保留的表项，后续读者走冷路径装盘
+            erase_page_mapping(old_page_id, frame_id);
         }
         disk_manager_->read_page(page_id.fd, page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
     } catch (...) {
+        if (need_flush_old) erase_page_mapping(old_page_id, frame_id);
         Page &victim = pages_[frame_id];
         victim.id_ = PageId{-1, INVALID_PAGE_ID};
         victim.pin_count_ = 0;
@@ -318,7 +346,10 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     if (it == shard.page_table_.end()) return false;
     frame_id_t frame_id = it->second;
     Page& page = pages_[frame_id];
-    if (is_dirty) page.is_dirty_ = true;
+    if (is_dirty) {
+        page.is_dirty_ = true;
+        page.mod_ver_++;   // cleaner 锁外写盘期间的新修改凭此免于被误清脏标
+    }
     if (page.pin_count_ <= 0) {
         return false;
     }
@@ -362,6 +393,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     if (need_flush_old) {
         if (g_log_manager) g_log_manager->flush_log_to_disk();
         disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+        erase_page_mapping(old_page_id, frame_id);   // 同 fetch_page：落盘后才摘保留的表项
     }
     {
         std::unique_lock<std::shared_mutex> lock(shard.latch_);
