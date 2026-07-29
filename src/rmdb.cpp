@@ -597,7 +597,11 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
         }
     } catch (TransactionAbortException &e) {
         yacc_cleanup_if_needed();
-        txn_manager->abort(context->txn_, log_manager.get());
+        // abort() 自身可抛（取帧重试耗尽/bad_alloc）；再抛会把 ABORT 升级成断连，
+        // 且事务残留待连接收尾兜底。就地吞掉，回 ABORT 语义不变。
+        try { txn_manager->abort(context->txn_, log_manager.get()); }
+        catch (std::exception &e2) { std::cerr << "[wire] abort failed: " << e2.what() << std::endl; }
+        catch (...) { std::cerr << "[wire] abort failed: unknown" << std::endl; }
         diag = e.GetInfo();
         outcome = ExecOutcome::ABORT;
     } catch (RMDBError &e) {
@@ -911,6 +915,7 @@ static void handle_exec_batch(int fd, const std::string &payload,
             if (t != nullptr && t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
                 t->get_state() != TransactionState::ABORTED) {
                 txn_manager->abort(t, log_manager.get());
+                txn_manager->reap(t);   // 回滚即回收；不回收则对象滞留 txn_map 直到断连
             }
         } catch (std::exception &e) {
             std::cerr << "[wire] auto-abort failed: " << e.what() << std::endl;
@@ -1053,18 +1058,34 @@ static void handle_wire_connection(int fd) {
             std::cerr << "[wire] unexpected exception, closing connection: " << e.what() << std::endl;
             wire::send_frame(fd, wire::TAG_ERROR, wire::truncate_diag(e.what()));
             break;
+        } catch (...) {
+            // 非 std::exception 异常同样不得逃到线程函数（std::terminate → SIGABRT）
+            std::cerr << "[wire] unknown exception, closing connection" << std::endl;
+            wire::send_frame(fd, wire::TAG_ERROR, "internal error");
+            break;
         }
     }
 
+    // 连接收尾回滚必须自带兜底：abort() 内部可抛（缓冲池取帧重试耗尽的 InternalError、
+    // 内存上限下的 bad_alloc 等），此处已在连接主 try 之外，逃逸即 std::terminate
+    // 杀全进程——其它连接的评测端只会看到"响应中途 EOF"（transport failure）。
     if (txn_id != INVALID_TXN_ID) {
-        Transaction *t = txn_manager->get_transaction(txn_id);
-        if (t != nullptr) {
-            if (t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
-                t->get_state() != TransactionState::ABORTED) {
-                txn_manager->abort(t, log_manager.get());
-            } else {
+        try {
+            Transaction *t = txn_manager->get_transaction(txn_id);
+            if (t != nullptr) {
+                if (t->get_txn_mode() && t->get_state() != TransactionState::COMMITTED &&
+                    t->get_state() != TransactionState::ABORTED) {
+                    txn_manager->abort(t, log_manager.get());
+                }
+                // abort 后必须 reap：只回滚不回收则 txn_map 条目 + Transaction 对象
+                // 随每个"带活动事务断开"的连接泄漏（放弃/超时型驱动实测 20 万连接
+                // 泄 ~500MB，评测地址空间上限下 bad_alloc）
                 txn_manager->reap(t);
             }
+        } catch (std::exception &e) {
+            std::cerr << "[wire] teardown abort failed: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[wire] teardown abort failed: unknown exception" << std::endl;
         }
     }
 }
@@ -1084,7 +1105,14 @@ void *client_handler(void *sock_fd) {
         ssize_t pn = recv(fd, peek4, 4, MSG_PEEK);
         if (pn == 4 && peek4[0] == 'R' && peek4[1] == 'M' && peek4[2] == 'D' && peek4[3] == 'B') {
             std::cout << "Wire Protocol v3 connection, sockfd: " << fd << std::endl;
-            handle_wire_connection(fd);
+            // 线程函数级最终兜底：任何逃逸异常在此转为断连，绝不 std::terminate
+            try {
+                handle_wire_connection(fd);
+            } catch (std::exception &e) {
+                std::cerr << "[wire] connection thread escaped exception: " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[wire] connection thread escaped unknown exception" << std::endl;
+            }
             std::cout << "Terminating current wire client_connection..." << std::endl;
             close(fd);
             pthread_exit(NULL);
@@ -1187,7 +1215,7 @@ void *client_handler(void *sock_fd) {
                     data_send[e.get_msg_len() + 1] = '\0';
                     offset = e.get_msg_len() + 1;
                     append_output_file("failure\n");
-                    txn_manager->abort(context->txn_, log_manager.get());
+                    try { txn_manager->abort(context->txn_, log_manager.get()); } catch (...) {}
                     if (!write_all(fd, data_send, offset + 1)) break;
                     continue;
                 } catch (std::exception &e) {
@@ -1196,7 +1224,7 @@ void *client_handler(void *sock_fd) {
                     data_send[8] = '\0';
                     offset = 8;
                     append_output_file("failure\n");
-                    txn_manager->abort(context->txn_, log_manager.get());
+                    try { txn_manager->abort(context->txn_, log_manager.get()); } catch (...) {}
                     if (!write_all(fd, data_send, offset + 1)) break;
                     continue;
                 }
@@ -1238,7 +1266,7 @@ void *client_handler(void *sock_fd) {
                 memcpy(data_send, str.c_str(), str.length());
                 data_send[str.length()] = '\0';
                 offset = str.length();
-                txn_manager->abort(context->txn_, log_manager.get());
+                try { txn_manager->abort(context->txn_, log_manager.get()); } catch (...) {}
                 std::cout << e.GetInfo() << std::endl;
                 append_output_file(str);
             } catch (RMDBError &e) {
@@ -1282,8 +1310,8 @@ void *client_handler(void *sock_fd) {
                     data_send[str.length()] = '\0';
                     offset = str.length();
 
-                    // 回滚事务
-                    txn_manager->abort(context->txn_, log_manager.get());
+                    // 回滚事务（兜底 catch：此处已在语句 try 的 catch 手柄内，再抛即逃逸线程函数）
+                    try { txn_manager->abort(context->txn_, log_manager.get()); } catch (...) {}
                     std::cout << e.GetInfo() << std::endl;
 
                     append_output_file(str);
@@ -1339,17 +1367,23 @@ void *client_handler(void *sock_fd) {
         txn_manager->reap(context->txn_);
     }
 
-    // 客户端断开：回滚未结束的显式事务并 unlock_all，避免行锁泄漏
+    // 客户端断开：回滚未结束的显式事务并 unlock_all，避免行锁泄漏。
+    // 兜底 catch 理由同 wire 收尾：此处异常逃逸即 std::terminate 杀全进程。
     if (txn_id != INVALID_TXN_ID) {
-        Transaction *t = txn_manager->get_transaction(txn_id);
-        if (t != nullptr) {
-            if (t->get_txn_mode() &&
-                t->get_state() != TransactionState::COMMITTED &&
-                t->get_state() != TransactionState::ABORTED) {
-                txn_manager->abort(t, log_manager.get());
-            } else {
-                txn_manager->reap(t);
+        try {
+            Transaction *t = txn_manager->get_transaction(txn_id);
+            if (t != nullptr) {
+                if (t->get_txn_mode() &&
+                    t->get_state() != TransactionState::COMMITTED &&
+                    t->get_state() != TransactionState::ABORTED) {
+                    txn_manager->abort(t, log_manager.get());
+                }
+                txn_manager->reap(t);   // 理由同 wire 收尾：只 abort 不 reap 泄 txn 对象
             }
+        } catch (std::exception &e) {
+            std::cerr << "[nul] teardown abort failed: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[nul] teardown abort failed: unknown exception" << std::endl;
         }
     }
 

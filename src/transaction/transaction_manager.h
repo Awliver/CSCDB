@@ -362,6 +362,13 @@ private:
         Rid rid;
         timestamp_t cts;
         std::string unindex_data;
+        // 回滚 INSERT 残留清理模式：abort 后留下"空链壳（无版本、无写者）+ 活堆槽"，
+        // 二者配对保证被回滚的行不可见（mvcc_read 对空链禁止堆回退）。但壳与堆槽
+        // 均无人回收（sweeper 跳过 hist 空的链防误杀在飞注册）——高冲突负载下每笔
+        // 回滚插入净漏一链一槽（OJ 热点轮盘 + 放弃断连实测 150s 漏 30 万链、内存
+        // 触顶 bad_alloc）。置位时 drain 校验"仍是空壳"后清堆槽+摘链；任何快照都
+        // 不可能看见该行（从无已提交版本），故 cts=0 不等水位。
+        bool aborted_husk = false;
     };
     mutable std::mutex deferred_del_latch_;
     std::vector<DeferredDelete> deferred_dels_;

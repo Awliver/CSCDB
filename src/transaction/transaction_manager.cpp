@@ -547,6 +547,9 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     // 转入 physical_undo_write_record 用空 WriteRecord 数据覆写堆 → 崩溃/脏数据。
     restore_writers_from_overlays(txn);
     std::unordered_set<std::string> mvcc_undone_keys;
+    // 回滚 INSERT 会留下"空链壳+活堆槽"（壳承担不可见语义，见 mvcc_read）；
+    // 收集后统一登记 deferred 清理，否则二者永不回收（每笔回滚插入净漏一份）
+    std::vector<DeferredDelete> husks;
     for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
         WriteRecord *wr = *it;
         const std::string &tab = wr->GetTableName();
@@ -595,6 +598,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                                 rollback_index_on_abort(sm_manager_, tab, wr->GetRid(),
                                                         WType::INSERT_TUPLE, old_data, new_data);
                             }
+                            husks.push_back(DeferredDelete{tab, wr->GetRid(), 0, "", true});
                         } else if (wtype == WType::UPDATE_TUPLE && !old_data.empty()) {
                             // 堆在 MVCC 阶段从未物化过（仅早先快路径写落过一次堆)：
                             // 显式恢复堆到事务前原值，否则会停留在快路径写之后的中间态。
@@ -654,7 +658,15 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         if (!undone) {
             if (mvcc_undone_keys.count(undo_key)) continue;
             physical_undo_write_record(txn, wr);
+            // physical_undo 的 INSERT 分支同样以空链壳收场（甚至会新建壳）
+            if (wr->GetWriteType() == WType::INSERT_TUPLE) {
+                husks.push_back(DeferredDelete{tab, wr->GetRid(), 0, "", true});
+            }
         }
+    }
+    if (!husks.empty()) {
+        std::scoped_lock<std::mutex> dl(deferred_del_latch_);
+        for (auto &h : husks) deferred_dels_.push_back(std::move(h));
     }
     for (auto *wr : *write_set) delete wr;
     write_set->clear();
@@ -1463,6 +1475,21 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
         auto cit = tit->second.find(rkey);
         if (cit == tit->second.end()) continue;
         MvccChain &ch = cit->second;
+        if (d.aborted_husk) {
+            // 回滚 INSERT 残留：校验仍是空壳（writer 空、无任何版本），否则槽位已被
+            // 复用/复写，放弃。索引项已在 abort 时回滚；从无已提交版本 → 任何快照都
+            // 看不见该行，清堆槽+摘壳无需等水位。读者竞态由 from_heap 位图复查兜底。
+            if (ch.writer != INVALID_TXN_ID || !ch.hist.empty()) continue;
+            auto hpit = sd.pending.find(d.tab);
+            if (hpit != sd.pending.end() && hpit->second.count(rkey)) {
+                redo.push_back(d);                         // 他人 overlay 持有，保守重排队
+                continue;
+            }
+            if (fh->is_record(d.rid)) fh->delete_record(d.rid, nullptr);
+            tit->second.erase(cit);
+            if (tit->second.empty()) sd.store.erase(tit);
+            continue;
+        }
         // 校验链仍是本次登记的已提交墓碑（防表重建/rid 复用等错配）
         if (ch.writer != INVALID_TXN_ID || ch.hist.empty() ||
             !ch.hist.back().is_deleted || ch.hist.back().commit_ts != d.cts) {
@@ -1516,6 +1543,15 @@ void TransactionManager::sweep_clean_chains() {
         std::scoped_lock<std::mutex> rl(rts_latch_);
         timestamp_t published = last_commit_ts_.load(std::memory_order_acquire);
         wm = active_rts_.empty() ? published : std::min(*active_rts_.begin(), published);
+        // 水位诊断（RMDB_MVCC_STATS=1，约 10s 一行）：链只增不减时先看这里——
+        // rts_min 长期不动即有 active_rts_ 注册泄漏；published 不动即发布水位卡死
+        static const bool diag = std::getenv("RMDB_MVCC_STATS") != nullptr;
+        static int diag_tick = 0;
+        if (diag && ++diag_tick % 10 == 0) {
+            fprintf(stderr, "[sweep-wm] wm=%ld published=%ld rts_n=%zu rts_min=%ld\n",
+                    (long)wm, (long)published, active_rts_.size(),
+                    active_rts_.empty() ? -1L : (long)*active_rts_.begin());
+        }
     }
     if (wm == 0) return;
     for (size_t sh = 0; sh < MVCC_NSHARDS; ++sh) {
