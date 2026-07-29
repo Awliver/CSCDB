@@ -64,6 +64,23 @@ void BufferPoolManager::cleaner_loop() {
             trim_tick_ = 0;
             malloc_trim(0);
         }
+        // pin 泄漏诊断（RMDB_BPM_STATS=1）：pinned = pool - free - evictable 若单调增长
+        // 即有 fetch/new 后未 unpin 的路径；评测"失败时刻∝池大小"的 ERROR 由此归因
+        {
+            static const bool stats_on = std::getenv("RMDB_BPM_STATS") != nullptr;
+            static int stats_tick = 0;
+            if (stats_on && ++stats_tick * CLEANER_INTERVAL_MS >= 2000) {
+                stats_tick = 0;
+                size_t freec = 0, evict = 0;
+                for (auto &sh : shards_) {
+                    std::shared_lock<std::shared_mutex> lk(sh.latch_);
+                    freec += sh.free_frames_.size();
+                    evict += sh.replacer_->Size();
+                }
+                fprintf(stderr, "[bpm-stats] pool=%zu free=%zu evictable=%zu pinned=%zu\n",
+                        (size_t)pool_size_, freec, evict, (size_t)pool_size_ - freec - evict);
+            }
+        }
         {
             size_t total_free = 0;
             for (auto &sh : shards_) {

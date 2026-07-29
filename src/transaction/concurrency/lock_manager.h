@@ -49,6 +49,18 @@ class LockManager {
         std::mutex mtx;
         std::condition_variable cv;
         txn_id_t owner = INVALID_TXN_ID;  // 排他持有者；INVALID 表示空闲
+        int users = 0;  // 出借中的引用数（latch_ 保护）；回收器只删 users==0 && owner==INVALID
+    };
+    /* get_record_lock 出借引用的 RAII 归还（析构在 latch_ 内 users--）。
+     * 声明顺序须在 entry.mtx 的 unique_lock 之前：先放 mtx 再归还引用，
+     * 避免 latch_ → mtx 与 mtx → latch_ 的锁序交叉。 */
+    struct RecordLockRef {
+        LockManager *lm;
+        RecordLockEntry *e;
+        ~RecordLockRef() {
+            std::lock_guard<std::mutex> g(lm->latch_);
+            e->users--;
+        }
     };
 
 public:
@@ -71,6 +83,15 @@ public:
     bool unlock(Transaction* txn, LockDataId lock_data_id);
 
     void unlock_all(Transaction* txn);
+
+    /* 空闲行锁条目回收（后台周期调用，见实现注释） */
+    void reclaim_idle_record_locks();
+
+    /* 诊断：当前行锁条目数 */
+    size_t record_lock_count() {
+        std::lock_guard<std::mutex> g(latch_);
+        return record_locks_.size();
+    }
 
 private:
     RecordLockEntry &get_record_lock(const LockDataId &id);

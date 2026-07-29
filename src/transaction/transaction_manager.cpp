@@ -1507,6 +1507,115 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
     }
 }
 
+void TransactionManager::sweep_clean_chains() {
+    // 安全水位：min(最老活跃快照, 已发布水位)。所有当前与未来快照的 read_ts ≥ 该值
+    // （begin() 的采样+注册与本锁原子；read_ts 采样自单调的 last_commit_ts_），
+    // 故 commit_ts ≤ wm 的单版本非墓碑链与堆等价，摘除后堆回退读到同一数据。
+    timestamp_t wm;
+    {
+        std::scoped_lock<std::mutex> rl(rts_latch_);
+        timestamp_t published = last_commit_ts_.load(std::memory_order_acquire);
+        wm = active_rts_.empty() ? published : std::min(*active_rts_.begin(), published);
+    }
+    if (wm == 0) return;
+    for (size_t sh = 0; sh < MVCC_NSHARDS; ++sh) {
+        std::scoped_lock<std::mutex> lk(mvcc_shards_[sh]);
+        auto &sd = mvcc_shard_data_[sh];
+        for (auto tit = sd.store.begin(); tit != sd.store.end();) {
+            auto pit = sd.pending.find(tit->first);
+            const auto *pend = (pit != sd.pending.end()) ? &pit->second : nullptr;
+            for (auto cit = tit->second.begin(); cit != tit->second.end();) {
+                MvccChain &ch = cit->second;
+                if (ch.writer != INVALID_TXN_ID || ch.hist.empty() ||
+                    (pend != nullptr && pend->count(cit->first) != 0)) {
+                    ++cit;
+                    continue;
+                }
+                // 墓碑结尾的链整条留给 drain_deferred_deletes：不摘也不剪——drain 在
+                // 堆槽已被 checkpoint 清理时要用墓碑之下的旧版本 data 重建索引 key
+                if (ch.hist.back().is_deleted) {
+                    ++cit;
+                    continue;
+                }
+                // 与 prune_mvcc_after_commit 同规则：剪掉水位下的旧版本
+                //（保留最新一个 ≤ wm 的作基版本）
+                int keep_from = -1;
+                for (int i = (int)ch.hist.size() - 1; i >= 0; --i) {
+                    if (ch.hist[i].commit_ts <= wm) { keep_from = i; break; }
+                }
+                if (keep_from > 0) {
+                    ch.hist.erase(ch.hist.begin(), ch.hist.begin() + keep_from);
+                }
+                // 墓碑链不在此摘（归 drain_deferred_deletes：须与索引项/堆槽同步清理）
+                if (ch.hist.size() == 1 && !ch.hist[0].is_deleted &&
+                    ch.hist[0].commit_ts <= wm) {
+                    cit = tit->second.erase(cit);
+                } else {
+                    ++cit;
+                }
+            }
+            if (tit->second.empty()) tit = sd.store.erase(tit);
+            else ++tit;
+        }
+    }
+}
+
+void TransactionManager::start_chain_sweeper() {
+    std::scoped_lock lk(sweeper_mtx_);
+    if (sweeper_started_) return;
+    sweeper_stop_ = false;
+    sweeper_started_ = true;
+    sweeper_thread_ = std::thread([this] {
+        // 兜底 catch：后台清扫失败退化为无清扫（内存增长），不能异常逃逸杀进程
+        try {
+            int tick = 0;
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lk(sweeper_mtx_);
+                    sweeper_cv_.wait_for(lk, std::chrono::milliseconds(1000),
+                                         [this] { return sweeper_stop_; });
+                    if (sweeper_stop_) break;
+                }
+                sweep_clean_chains();
+                if (lock_manager_ != nullptr && ++tick % 5 == 0) {
+                    lock_manager_->reclaim_idle_record_locks();
+                }
+            }
+        } catch (std::exception &e) {
+            fprintf(stderr, "[chain-sweeper] fatal: %s (sweeper disabled)\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[chain-sweeper] fatal: unknown exception (sweeper disabled)\n");
+        }
+    });
+}
+
+void TransactionManager::stop_chain_sweeper() {
+    {
+        std::scoped_lock lk(sweeper_mtx_);
+        if (!sweeper_started_) return;
+        sweeper_stop_ = true;
+    }
+    sweeper_cv_.notify_all();
+    if (sweeper_thread_.joinable()) sweeper_thread_.join();
+    std::scoped_lock lk(sweeper_mtx_);
+    sweeper_started_ = false;
+}
+
+void TransactionManager::debug_mvcc_stats(size_t &chains, size_t &vers, size_t &bytes) const {
+    chains = vers = bytes = 0;
+    for (size_t sh = 0; sh < MVCC_NSHARDS; ++sh) {
+        std::scoped_lock<std::mutex> lk(mvcc_shards_[sh]);
+        for (const auto &tp : mvcc_shard_data_[sh].store) {
+            chains += tp.second.size();
+            for (const auto &cp : tp.second) {
+                vers += cp.second.hist.size();
+                bytes += cp.second.writer_data.size();
+                for (const auto &v : cp.second.hist) bytes += v.data.size();
+            }
+        }
+    }
+}
+
 void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecord *wr) {
     (void)txn;
     const std::string &tab_name = wr->GetTableName();

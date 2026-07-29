@@ -43,7 +43,16 @@ static bool should_exit = false;
 
 // 构建全局所需的管理器对象
 auto disk_manager = std::make_unique<DiskManager>();
-auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+// 池大小 env 覆盖仅供本地诊断（小池强制淘汰压力复现 OJ 数据≫池的条件）；OJ 无此 env 走默认
+static size_t effective_pool_size() {
+    if (const char *env = std::getenv("RMDB_POOL_FRAMES")) {
+        char *end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env && v >= 64 && v <= (16L << 20)) return (size_t)v;
+    }
+    return BUFFER_POOL_SIZE;
+}
+auto buffer_pool_manager = std::make_unique<BufferPoolManager>(effective_pool_size(), disk_manager.get());
 auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
 auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
 auto sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
@@ -1466,6 +1475,29 @@ int main(int argc, char **argv) {
         recovery->undo();
 
         buffer_pool_manager->start_cleaner();  // recovery 后
+        txn_manager->start_chain_sweeper();    // MVCC 干净链后台回收（防测量轮内存线性增长）
+
+        // MVCC 常驻内存诊断（RMDB_MVCC_STATS=1）：链/版本/字节 + RSS，5s 一行到 stderr
+        if (std::getenv("RMDB_MVCC_STATS") != nullptr) {
+            std::thread([] {
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    size_t chains = 0, vers = 0, bytes = 0;
+                    txn_manager->debug_mvcc_stats(chains, vers, bytes);
+                    long rss_kb = 0;
+                    if (FILE *f = fopen("/proc/self/status", "r")) {
+                        char line[256];
+                        while (fgets(line, sizeof line, f)) {
+                            if (sscanf(line, "VmRSS: %ld kB", &rss_kb) == 1) break;
+                        }
+                        fclose(f);
+                    }
+                    fprintf(stderr, "[mvcc-stats] chains=%zu vers=%zu data_mb=%.1f rlocks=%zu rss_mb=%ld\n",
+                            chains, vers, bytes / 1048576.0, lock_manager->record_lock_count(),
+                            rss_kb / 1024);
+                }
+            }).detach();
+        }
 
         // 开启服务端，开始接受客户端连接
         start_server();

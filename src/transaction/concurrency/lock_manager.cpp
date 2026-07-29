@@ -16,7 +16,26 @@ LockManager::RecordLockEntry &LockManager::get_record_lock(const LockDataId &id)
     std::lock_guard<std::mutex> g(latch_);
     auto &slot = record_locks_[id];
     if (!slot) slot = std::make_unique<RecordLockEntry>();
+    slot->users++;   // 出借引用；调用方以 RecordLockRef 归还
     return *slot;
+}
+
+/* 空闲行锁条目回收：record_locks_ 只建不删会随"曾被锁过的 rid"无界增长
+ * （TPC-C 每笔事务新插入的行都留下 ~200B 条目，测量轮内数百 MB，触顶评测
+ * 内存上限）。users==0（latch_ 内判定，与出借互斥）保证无线程持有/等待该
+ * 条目；try_lock 后读 owner 防与并发 unlock 的 owner 写撕裂。 */
+void LockManager::reclaim_idle_record_locks() {
+    std::lock_guard<std::mutex> g(latch_);
+    for (auto it = record_locks_.begin(); it != record_locks_.end();) {
+        RecordLockEntry *e = it->second.get();
+        bool erase = false;
+        if (e->users == 0 && e->mtx.try_lock()) {
+            erase = (e->owner == INVALID_TXN_ID);
+            e->mtx.unlock();
+        }
+        if (erase) it = record_locks_.erase(it);
+        else ++it;
+    }
 }
 
 bool LockManager::detect_deadlock_victim(txn_id_t start, txn_id_t &victim) {
@@ -94,6 +113,7 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     }
 
     RecordLockEntry &entry = get_record_lock(lock_id);
+    RecordLockRef entry_ref{this, &entry};   // 须在 lk 之前声明（先放 mtx 再归还引用）
     std::unique_lock<std::mutex> lk(entry.mtx);
     txn_id_t me = txn->get_transaction_id();
     // SI（非 SER）写写冲突 no-wait：同一记录存在其它活跃事务的未提交写时立即放弃
@@ -227,6 +247,7 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
 
     if (lock_data_id.type_ == LockDataType::RECORD) {
         RecordLockEntry &entry = get_record_lock(lock_data_id);
+        RecordLockRef entry_ref{this, &entry};
         std::lock_guard<std::mutex> lk(entry.mtx);
         if (entry.owner == txn->get_transaction_id()) {
             entry.owner = INVALID_TXN_ID;

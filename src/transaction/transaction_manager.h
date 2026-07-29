@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <array>
+#include <condition_variable>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -72,7 +74,7 @@ public:
         concurrency_mode_ = concurrency_mode;
     }
     
-    ~TransactionManager() = default;
+    ~TransactionManager() { stop_chain_sweeper(); }
 
     Transaction* begin(Transaction* txn, LogManager* log_manager);
 
@@ -292,6 +294,18 @@ public:
        仅牺牲其 seq scan（与推迟机制引入前行为一致）。 */
     void drain_deferred_deletes(bool force_heap_for_pending = false);
 
+    /* 诊断（RMDB_MVCC_STATS）：链数/版本数/数据字节合计（逐分片短锁） */
+    void debug_mvcc_stats(size_t &chains, size_t &vers, size_t &bytes) const;
+
+    /* 干净链全量回收（后台线程周期调用）：与 commit 内嵌回收同一安全条件。
+     * 内嵌回收只覆盖"同一 rid 被再次写"的链；纯插入行（orders/order_line/
+     * history）的链在恒定负载下永不复访 → 每笔事务净增 ~10 条链（含整行数据
+     * 拷贝），OJ 150s 测量轮增长数百 MB 触顶评测内存上限（bad_alloc → 语句
+     * ERROR 判负，Payment 高频语句概率性背锅）。 */
+    void sweep_clean_chains();
+    void start_chain_sweeper();
+    void stop_chain_sweeper();
+
 private:
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
@@ -317,6 +331,13 @@ private:
     std::atomic<bool> any_mvcc_dirty_{false};
     mutable std::mutex rts_latch_;              // active_rts_ 水位
     mutable std::mutex ser_latch_;              // ser_ 图与反查索引
+    // 链清扫线程（见 sweep_clean_chains 注释）
+    std::thread sweeper_thread_;
+    std::mutex sweeper_mtx_;
+    std::condition_variable sweeper_cv_;
+    bool sweeper_stop_ = false;
+    bool sweeper_started_ = false;
+
     mutable std::array<std::mutex, MVCC_NSHARDS> mvcc_shards_;  // mvcc_shards_[i] 保护 mvcc_shard_data_[i]
     // 每个分片拥有独立的版本存储/挂起写映射。(tab,rkey) 经 mvcc_shard_idx 固定映射到唯一分片，
     // 故同表不同 rkey 落在不同分片各自的 map，杜绝跨分片对同一 unordered_map 的并发结构改写
