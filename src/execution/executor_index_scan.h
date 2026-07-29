@@ -331,9 +331,10 @@ class IndexScanExecutor : public AbstractExecutor {
             if (!mvcc_on_ && context_ && context_->txn_mgr_ && context_->txn_) {
                 mvcc_on_ = context_->txn_mgr_->table_is_dirty(tab_name_);
             }
-            if (mvcc_on_) {
+            if (mvcc_on_ || need_prefix_check_) {
                 // MVCC 下同一 rid 可能有多个索引项（未提交 UPDATE 保留旧项+插入新项）：
-                // 同锁取出本项 key，稍后与可见版本的 key 比对，非一致项跳过（防重复行）
+                // 同锁取出本项 key，稍后与可见版本的 key 比对，非一致项跳过（防重复行）。
+                // 前缀早停也必须用项 key（见下），故 need_prefix_check_ 时同样取 key。
                 if ((int)cur_key_buf_.size() < index_meta_.col_tot_len) {
                     cur_key_buf_.resize(index_meta_.col_tot_len);
                 }
@@ -343,6 +344,29 @@ class IndexScanExecutor : public AbstractExecutor {
             }
             if (scan_->is_end() || rid_.page_no < 0 || rid_.slot_no < 0) {
                 break;
+            }
+
+            // EQ 前缀早停必须先于可见性判定：不可见行（墓碑/回滚残留/他事务新项）若
+            // 先走可见性 skip，就绕过了边界检查——扫描会以"每步两次全树下降"的代价
+            // 爬过范围之外的整片死项区（TPC-C MIN 实测分钟级假死；OJ 热点分区的
+            // 墓碑积压随轮内时间放大此代价）。项 key 与可见性无关，可最先判。
+            if (need_prefix_check_) {
+                int offset = 0;
+                bool match = true;
+                for (int i = 0; i < eq_match_count_; i++) {
+                    const auto &col = index_meta_.cols[i];
+                    if (memcmp(cur_key_buf_.data() + offset,
+                               eq_prefix_data_.data() + offset, col.len) != 0) {
+                        match = false;
+                        break;
+                    }
+                    offset += col.len;
+                }
+                if (!match) {
+                    if (ring_on) ReproRing::push(ReproRing::SKIPVIS, mvcc_on_ ? ring_key_oid_() : -1, 6, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
+                    range_exhausted_ = true;
+                    return;
+                }
             }
 
             // Fast path：range 已精确，且无残余 cond，直接返回匹配（无需 MVCC 重建/SER 跟踪时）
@@ -401,33 +425,6 @@ class IndexScanExecutor : public AbstractExecutor {
                 if (ring_on) ReproRing::push(ReproRing::SKIPVIS, -1, 4, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                 scan_->next();
                 continue;
-            }
-
-            if (need_prefix_check_) {
-                // 范围边界判定必须用【索引项 key】：项 key 一旦越出 eq 前缀即真越界，
-                // 立刻终止（保持点/前缀扫描早停——此前误用可见版本 key 判定并改为
-                // skip，导致未提交新 key 项触发后线性扫完整个索引，单条 UPDATE 高达
-                // 数十秒，OJ warmup 响应超时实测）。项 key 在前缀内但可见版本 key
-                // 不一致（未提交 UPDATE 新项）的情况由下方 key 一致性过滤跳过。
-                const char *bound_key = mvcc_on_ ? cur_key_buf_.data() : rec_data;
-                int offset = 0;
-                int koff_in_key = 0;
-                bool match = true;
-                for (int i = 0; i < eq_match_count_; i++) {
-                    const auto &col = index_meta_.cols[i];
-                    const char *lhs = mvcc_on_ ? bound_key + koff_in_key : rec_data + col.offset;
-                    if (memcmp(lhs, eq_prefix_data_.data() + offset, col.len) != 0) {
-                        match = false;
-                        break;
-                    }
-                    offset += col.len;
-                    koff_in_key += col.len;
-                }
-                if (!match) {
-                    if (ring_on) ReproRing::push(ReproRing::SKIPVIS, mvcc_on_ ? ring_key_oid_() : -1, 6, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
-                    range_exhausted_ = true;
-                    return;
-                }
             }
 
             if (need_eval_) {

@@ -278,11 +278,25 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             }
             // 瞬时无可用帧（IO 洪峰下大量帧 in-flight/pinned）：小睡重试而非立即失败——
             // 立即返回 nullptr 会让调用方抛错（ix "buffer pool full" / PageNotExist），
-            // 在评测里表现为偶发的语句 ERROR 直接判负。有限重试 ~500ms 兜住瞬时竞争。
-            if (++retry < 500) {
+            // 在评测里表现为偶发的语句 ERROR 直接判负。上限 ~2s：ERROR 是立即判负，
+            // 语句预算（~5s）内多等换生存。>=100ms 的近失打点（限流 5s 一行），给
+            // 压测门禁留"接近悬崖"的前导指标，而不是只有 pass/fail。
+            if (++retry < 2000) {
+                if (retry == 100) {
+                    static std::atomic<int64_t> last_warn{0};
+                    int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    int64_t prev = last_warn.load(std::memory_order_relaxed);
+                    if (now - prev >= 5 && last_warn.compare_exchange_strong(prev, now)) {
+                        fprintf(stderr, "[bpm-pressure] fetch_page frame wait >100ms (fd=%d page=%d)\n",
+                                page_id.fd, page_id.page_no);
+                    }
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            fprintf(stderr, "[bpm-pressure] fetch_page frame wait EXHAUSTED ~2s (fd=%d page=%d)\n",
+                    page_id.fd, page_id.page_no);
             return nullptr;
         }
         break;
@@ -385,7 +399,11 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     {
         int retry = 0;
         while (!reserve_victim_nolock(si, &frame_id, &old_page_id, &need_flush_old)) {
-            if (++retry >= 500) return nullptr;
+            if (++retry >= 2000) {   // 上限与 fetch_page 一致（~2s），ERROR 判负换生存
+                fprintf(stderr, "[bpm-pressure] new_page frame wait EXHAUSTED ~2s (fd=%d)\n",
+                        page_id->fd);
+                return nullptr;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }

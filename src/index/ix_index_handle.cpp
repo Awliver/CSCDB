@@ -733,20 +733,28 @@ Iid IxIndexHandle::upper_bound(const char *key) {
 Iid IxIndexHandle::upper_bound_nolock(const char *key) const {
     auto [leaf, _] = const_cast<IxIndexHandle *>(this)->find_leaf_page(key, Operation::FIND, nullptr);
     int slot = leaf->lower_bound(key);
-    // 注意：IxNodeHandle::upper_bound 是为内部节点设计的（从 1 开始）
-    // 这里要在叶子上找"严格 > target 的第一个"，所以用 lower_bound 后等值则跳一格
-    if (slot < leaf->get_size() &&
-        ix_compare(leaf->get_key(slot), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
-        slot++;
+    // 必须跳过【全部】等值项并且允许跨叶：同 key 多项是常态（删后重插同 key 的
+    // 墓碑项未 drain、MVCC UPDATE 版本化项）。此前只跳一格，upper_bound(K) 会停在
+    // 下一个等值项上（key 仍 == K）——key 锚定扫描以"返回 key 严格大于 anchor"为
+    // 进度保证，等值返回使 anchor 永不前进，扫描原地死循环（TPC-C MIN 实测卡死
+    // 20 分钟、CPU 100%，锚点被甩出范围后连带在全索引死项间乱撞）。
+    while (true) {
+        if (slot < leaf->get_size()) {
+            if (ix_compare(leaf->get_key(slot), key,
+                           file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+                slot++;
+                continue;
+            }
+            break;                                            // 严格 > key
+        }
+        if (leaf->get_page_no() == file_hdr_->last_leaf_) break;   // 树尾（等价 leaf_end）
+        page_id_t nxt = leaf->get_next_leaf();
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+        leaf = const_cast<IxIndexHandle *>(this)->fetch_node(nxt);
+        slot = 0;
     }
-    Iid iid;
-    if (slot < leaf->get_size()) {
-        iid = {leaf->get_page_no(), slot};
-    } else if (leaf->get_page_no() == file_hdr_->last_leaf_) {
-        iid = {leaf->get_page_no(), slot};
-    } else {
-        iid = {leaf->get_next_leaf(), 0};
-    }
+    Iid iid = {leaf->get_page_no(), slot};
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
     delete leaf;
     return iid;

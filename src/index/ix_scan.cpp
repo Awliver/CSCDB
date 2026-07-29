@@ -85,13 +85,60 @@ IxScan::IxScan(const IxIndexHandle *ih, const char *start_key, const char *end_k
 
 bool IxScan::locate_key_mode() const {
     auto *self = const_cast<IxScan *>(this);
-    Iid pos = has_anchor_ ? ih_->upper_bound_nolock(anchor_key_.data())
-                          : ih_->lower_bound_nolock(start_key_.data());
+    const IxFileHdr *fh = ih_->get_fhdr();
+    Iid pos;
+    if (!has_anchor_) {
+        pos = ih_->lower_bound_nolock(start_key_.data());
+    } else {
+        // 锚定推进：定位到"锚点项的下一项"。同 key 多项时仅凭 key 无法推进
+        //（upper_bound 只跳一格会在等值项上原地循环——MIN 假死实测；跳过整个
+        // 等值 run 会把后方同 key 活项一起跳掉——删后重插丢行）。做法：
+        // lower_bound(anchor_key) 起在等值 run 内找 anchor_rid_，找到则取其下一
+        // 项（可能仍是同 key 的未访问项）；锚点项已被物删则停在首个 key 严格
+        // 更大的项（等值 run 内未访问项让步——与"先读后 next"协议的既有
+        // 尽力语义一致，不回访已访问项）。
+        pos = ih_->lower_bound_nolock(anchor_key_.data());
+        bool found_anchor = false;
+        while (true) {
+            self->iid_ = pos;
+            if (!page_no_valid(pos.page_no)) return false;
+            ensure_cached(pos.page_no);
+            if (cached_node_ == nullptr || pos.slot_no < 0) return false;
+            if (pos.slot_no >= cached_size_) {
+                // 叶尾：跳下一叶继续（等值 run 可跨叶）
+                advance_to_next_leaf();
+                pos = iid_;
+                if (!page_no_valid(pos.page_no)) return false;
+                continue;
+            }
+            if (ix_compare(cached_node_->get_key(pos.slot_no), anchor_key_.data(),
+                           fh->col_types_, fh->col_lens_) != 0) {
+                break;   // 越过等值 run：锚点项已被物删，停在 key 严格更大处
+            }
+            if (found_anchor) break;   // 锚点项的下一项（可能仍同 key）
+            const Rid *r = cached_node_->get_rid(pos.slot_no);
+            if (r->page_no == anchor_rid_.page_no && r->slot_no == anchor_rid_.slot_no) {
+                found_anchor = true;   // 命中锚点项本体，再前进一格
+            }
+            pos.slot_no++;
+        }
+    }
     self->iid_ = pos;
     if (!page_no_valid(pos.page_no)) return false;
     ensure_cached(pos.page_no);
     if (cached_node_ == nullptr || pos.slot_no < 0 || pos.slot_no >= cached_size_) return false;  // 树尾
-    const IxFileHdr *fh = ih_->get_fhdr();
+    // 下界钳位：并发结构变更的窗口可把 anchor 弄到 start_key 之前（实测卡死扫描
+    // 的 anchor 在别的 district/仓库——随后每步都在范围外的死项间爬行）。位置一旦
+    // 低于范围起点，立即重定位回 lower_bound(start_key)：扫描位置恒被禁锢在
+    // [start,end] 内。
+    if (ix_compare(cached_node_->get_key(pos.slot_no), start_key_.data(),
+                   fh->col_types_, fh->col_lens_) < 0) {
+        pos = ih_->lower_bound_nolock(start_key_.data());
+        self->iid_ = pos;
+        if (!page_no_valid(pos.page_no)) return false;
+        ensure_cached(pos.page_no);
+        if (cached_node_ == nullptr || pos.slot_no < 0 || pos.slot_no >= cached_size_) return false;
+    }
     int c = ix_compare(cached_node_->get_key(pos.slot_no), end_key_.data(),
                        fh->col_types_, fh->col_lens_);
     if (c > 0 || (c == 0 && !end_inclusive_)) return false;
@@ -106,6 +153,7 @@ void IxScan::next() {
         // 纯本地状态更新，无需树锁。
         if (has_returned_) {
             anchor_key_.swap(returned_key_);
+            anchor_rid_ = returned_rid_;
             has_anchor_ = true;
             has_returned_ = false;
             returned_key_.resize(anchor_key_.size());
@@ -129,8 +177,9 @@ Rid IxScan::rid() const {
         if (!locate_key_mode()) return Rid{-1, -1};
         memcpy(returned_key_.data(), cached_node_->get_key(iid_.slot_no),
                ih_->get_fhdr_col_tot_len());
+        returned_rid_ = *cached_node_->get_rid(iid_.slot_no);
         has_returned_ = true;
-        return *cached_node_->get_rid(iid_.slot_no);
+        return returned_rid_;
     }
     normalize_position();
     if (iid_ == end_) {
@@ -149,8 +198,9 @@ Rid IxScan::rid_and_key(char *key_out) const {
         if (!locate_key_mode()) return Rid{-1, -1};
         memcpy(key_out, cached_node_->get_key(iid_.slot_no), ih_->get_fhdr_col_tot_len());
         memcpy(returned_key_.data(), key_out, ih_->get_fhdr_col_tot_len());
+        returned_rid_ = *cached_node_->get_rid(iid_.slot_no);
         has_returned_ = true;
-        return *cached_node_->get_rid(iid_.slot_no);
+        return returned_rid_;
     }
     normalize_position();
     if (iid_ == end_) {

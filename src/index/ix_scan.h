@@ -45,6 +45,13 @@ class IxScan : public RecScan {
     bool end_inclusive_ = true;
     mutable std::vector<char> anchor_key_;
     mutable bool has_anchor_ = false;
+    /* 锚点的 rid：同 key 多项（删后重插未 drain 的墓碑项、MVCC 版本化项）时，
+     * 仅凭 key 无法表达"该 key 的第几项已消费"。只跳一格会在 ≥2 个等值项上
+     * 原地循环（anchor 永不前进，MIN 实测假死）；严格跳过整个等值 run 则会把
+     * 排在后面的同 key 活项一起跳掉（删后重插丢行）。重定位在等值 run 内按
+     * rid 找到锚点项、取其下一项；锚点项已被物删时退化为跳到 key 严格更大处。*/
+    mutable Rid anchor_rid_{-1, -1};
+    mutable Rid returned_rid_{-1, -1};
     /* 最后一次经 rid()/rid_and_key() 真正交给调用方的行 key。next() 只能锚定它：
      * 若 next() 重定位"当前行"再取 key 当 anchor，当前行恰被并发 delete_entry 摘除
      * 时 upper_bound(旧anchor) 会落到下一行——把从未返回过的行当作已消费，整行被
