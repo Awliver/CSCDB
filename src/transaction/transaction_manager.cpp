@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 #include "index/ix.h"
+#include "common/repro_ring.h"
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -74,7 +75,14 @@ void remove_index_entries_on_commit(SmManager *sm, const std::string &tab_name, 
         for (auto &fr : found) {
             if (fr == rid) { points_here = true; break; }
         }
-        if (points_here) ih->delete_entry(key.data(), nullptr);
+        if (points_here) {
+            if (ReproRing::on() && tab_name == "new_orders" && data.size() >= 8) {
+                int32_t oid, d;
+                memcpy(&oid, data.data(), 4); memcpy(&d, data.data() + 4, 4);
+                ReproRing::push(ReproRing::IXDEL, oid, d, ReproRing::rid32(rid.page_no, rid.slot_no), 0);
+            }
+            ih->delete_entry(key.data(), nullptr);
+        }
     }
 }
 
@@ -262,15 +270,18 @@ struct MvccAllShardsGuard {
  */
 Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
     std::scoped_lock<std::mutex> lock(latch_);
-    if (txn == nullptr) {
+    const bool fresh_txn = (txn == nullptr);
+    if (fresh_txn) {
         txn_id_t new_id = next_txn_id_++;
         txn = new Transaction(new_id);
         txn->set_start_ts(next_timestamp_++);
-        // 题9：事务级快照——以当前最后提交序为快照标识
-        txn->set_read_ts(last_commit_ts_.load());
     }
     {
+        // 题9：事务级快照——以当前最后提交序为快照标识。采样与注册必须同锁
+        // 原子：若先采样后注册，[采样, 注册) 间隙里 commit/drain 按 active_rts_
+        // 计算物理清理水位会漏掉本快照，清掉它仍需可见的已删行。
         std::scoped_lock<std::mutex> lck(rts_latch_);
+        if (fresh_txn) txn->set_read_ts(last_commit_ts_.load());
         active_rts_.insert(txn->get_read_ts());
     }
     txn_map[txn->get_transaction_id()] = txn;
@@ -288,6 +299,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 
     timestamp_t cts = 0;
     timestamp_t prune_wm = 0;
+    timestamp_t phys_wm = 0;
     auto write_set = txn->get_write_set();
     const bool had_writes = !write_set->empty();
     std::unordered_set<std::string> touched_tabs;
@@ -327,6 +339,13 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         auto wit = active_rts_.find(txn->get_read_ts());
         if (wit != active_rts_.end()) active_rts_.erase(wit);
         prune_wm = active_rts_.empty() ? cts : *active_rts_.begin();
+        // 物理清理水位：本 cts 此刻尚未发布，发布前开始的新快照 read_ts < cts、
+        // 仍需经索引项/堆槽看到被删旧行——物理摘除（删索引项/清堆槽/整链摘除/
+        // 被删键元数据 GC）只能以已发布水位为上限；越过本 cts 的清理留给 commit
+        // 尾部 publish 之后的 drain_deferred_deletes（OJ Delivery MIN canary
+        // "MIN was not the earliest new_orders key"，canary3.py 账本复现）。
+        phys_wm = std::min(prune_wm,
+                           last_commit_ts_.load(std::memory_order_acquire));
     }
     if (is_ser(txn)) {
         std::scoped_lock<std::mutex> lck(ser_latch_);
@@ -356,10 +375,21 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             v.writer_txn = txn->get_transaction_id();
             if (!ch.writer_del) v.data = ch.writer_data;
             ch.hist.push_back(std::move(v));
+            if (ReproRing::on() && ch.writer_del && tab == "new_orders") {
+                int32_t oid = -1;
+                for (int hi = (int)ch.hist.size() - 2; hi >= 0; --hi) {
+                    if (!ch.hist[hi].is_deleted && ch.hist[hi].data.size() >= 4) {
+                        memcpy(&oid, ch.hist[hi].data.data(), 4); break;
+                    }
+                }
+                ReproRing::push(ReproRing::TOMBSTONE, oid, (int32_t)cts,
+                                ReproRing::rid32(wr->GetRid().page_no, wr->GetRid().slot_no),
+                                (int32_t)phys_wm);
+            }
             // 先物化堆再 prune：否则摘链后读者会读到未刷新的堆页
             if (ch.writer_del) {
                 if (sm_manager_->fhs_.at(tab)->is_record(wr->GetRid())) {
-                    if (prune_wm >= cts) {
+                    if (phys_wm >= cts) {
                         // 无更旧活跃快照：下方 prune 会把整条链连同墓碑一起摘除，索引项
                         // 将成为指向已释放槽位的悬空引用——必须与堆同步清理，否则索引
                         // 扫描会读到残留字节，已提交删除的行"复活"（OJ Transaction
@@ -389,7 +419,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
                 RmRecord &undo_old = wr->GetRecord();
                 if (wr->GetWriteType() == WType::UPDATE_TUPLE && undo_old.size > 0) {
                     std::string old_bytes(undo_old.data, (size_t)undo_old.size);
-                    if (prune_wm >= cts) {
+                    if (phys_wm >= cts) {
                         remove_stale_update_index_entries(sm_manager_, tab, wr->GetRid(),
                                                           old_bytes, ch.writer_data.data());
                     } else {
@@ -402,7 +432,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             ch.writer = INVALID_TXN_ID;
             ch.writer_data.clear();
             ch.hold_writer_to_commit = false;
-            prune_mvcc_after_commit(tab, wr->GetRid(), prune_wm, cts);
+            prune_mvcc_after_commit(tab, wr->GetRid(), phys_wm, cts);
         }
     }
     // 每表写活动收尾：记录含写提交的 cts、写者计数 -1（与 note_table_write 对称）。
@@ -428,7 +458,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             auto &tabmap = del_keys_[tk.first];
             if (tabmap.size() > 8192) {
                 for (auto it = tabmap.begin(); it != tabmap.end();) {
-                    if (it->second.writers.empty() && it->second.last_del_cts <= prune_wm)
+                    if (it->second.writers.empty() && it->second.last_del_cts <= phys_wm)
                         it = tabmap.erase(it);
                     else
                         ++it;
@@ -439,6 +469,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
     // 干净链回收：堆已物化后，单版本、非墓碑、低于水位且无 pending 的链与堆等价，
     // 可整链删除——否则 store 随事务数无界增长，插入端删-插冲突全链扫描 O(n²) 恶化。
+    // 此处刻意用未封顶的 prune_wm 而非 phys_wm：单版本链只可能是纯 INSERT（有更旧
+    // 已提交版本时上面 prune 至少保留两版），回收不摘除任何索引项/堆槽，行不会消失；
+    // 若换 phys_wm，纯插入负载（orders/order_line/history）的链永不回收 → 内存无界。
     for (auto *wr : *write_set) {
         const std::string &tab = wr->GetTableName();
         int64_t rkey = mvcc_key(wr->GetRid());
@@ -1447,6 +1480,10 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
             key_src.assign(rec->data, (size_t)fh->get_file_hdr().record_size);
         } else if (ch.hist.size() >= 2 && !ch.hist[ch.hist.size() - 2].is_deleted) {
             key_src = ch.hist[ch.hist.size() - 2].data;
+        }
+        if (ReproRing::on() && d.tab == "new_orders") {
+            ReproRing::push(ReproRing::DRAINCLEAN, -1, (int32_t)d.cts,
+                            ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
         }
         if (!key_src.empty()) {
             remove_index_entries_on_commit(sm_manager_, d.tab, d.rid, key_src);

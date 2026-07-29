@@ -45,6 +45,12 @@ class IxScan : public RecScan {
     bool end_inclusive_ = true;
     mutable std::vector<char> anchor_key_;
     mutable bool has_anchor_ = false;
+    /* 最后一次经 rid()/rid_and_key() 真正交给调用方的行 key。next() 只能锚定它：
+     * 若 next() 重定位"当前行"再取 key 当 anchor，当前行恰被并发 delete_entry 摘除
+     * 时 upper_bound(旧anchor) 会落到下一行——把从未返回过的行当作已消费，整行被
+     * 静默吞掉（OJ Delivery MIN canary "MIN was not the earliest key"，ring 实测）。*/
+    mutable std::vector<char> returned_key_;
+    mutable bool has_returned_ = false;
     /* 锁内定位当前行；true=iid_/cached_node_ 有效且未越过 end_key */
     bool locate_key_mode() const;
 

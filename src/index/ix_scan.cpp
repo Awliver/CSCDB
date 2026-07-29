@@ -80,6 +80,7 @@ IxScan::IxScan(const IxIndexHandle *ih, const char *start_key, const char *end_k
     end_key_.assign(end_key, end_key + klen);
     end_inclusive_ = end_inclusive;
     anchor_key_.resize(klen);
+    returned_key_.resize(klen);
 }
 
 bool IxScan::locate_key_mode() const {
@@ -98,16 +99,20 @@ bool IxScan::locate_key_mode() const {
 }
 
 void IxScan::next() {
-    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
     if (key_mode_) {
-        // 消费当前行：把它的 key 设为 anchor，下次 locate 用 upper_bound(anchor) 取下一行
-        if (locate_key_mode()) {
-            memcpy(anchor_key_.data(), cached_node_->get_key(iid_.slot_no),
-                   ih_->get_fhdr_col_tot_len());
+        // 消费的必须是【调用方实际读到过的行】：anchor 取 rid()/rid_and_key() 存下的
+        // returned_key_，绝不能重定位后取"现在停在哪"的 key——当前行被并发
+        // delete_entry 摘除时重定位会落到下一行，把从未返回的行当作已消费而吞行。
+        // 纯本地状态更新，无需树锁。
+        if (has_returned_) {
+            anchor_key_.swap(returned_key_);
             has_anchor_ = true;
+            has_returned_ = false;
+            returned_key_.resize(anchor_key_.size());
         }
         return;
     }
+    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
     normalize_position();
     if (iid_ == end_) return;
     iid_.slot_no++;
@@ -122,6 +127,9 @@ Rid IxScan::rid() const {
     std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
     if (key_mode_) {
         if (!locate_key_mode()) return Rid{-1, -1};
+        memcpy(returned_key_.data(), cached_node_->get_key(iid_.slot_no),
+               ih_->get_fhdr_col_tot_len());
+        has_returned_ = true;
         return *cached_node_->get_rid(iid_.slot_no);
     }
     normalize_position();
@@ -140,6 +148,8 @@ Rid IxScan::rid_and_key(char *key_out) const {
     if (key_mode_) {
         if (!locate_key_mode()) return Rid{-1, -1};
         memcpy(key_out, cached_node_->get_key(iid_.slot_no), ih_->get_fhdr_col_tot_len());
+        memcpy(returned_key_.data(), key_out, ih_->get_fhdr_col_tot_len());
+        has_returned_ = true;
         return *cached_node_->get_rid(iid_.slot_no);
     }
     normalize_position();

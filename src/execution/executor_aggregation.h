@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "executor_abstract.h"
 #include "common/common.h"
+#include "common/repro_ring.h"
 #include "analyze/analyze.h"
 
 namespace {
@@ -425,6 +426,14 @@ void AggExecutor::beginTuple() {
     if (groups_.empty() && plain_agg_) {
         groups_[""] = std::vector<AggState>(agg_exprs_.size());
         group_order_.push_back("");
+    }
+    if (ReproRing::on() && plain_agg_ && !groups_.empty()) {
+        for (size_t i = 0; i < agg_exprs_.size(); ++i) {
+            if (agg_exprs_[i].type != ast::AGG_MIN) continue;
+            auto &st = groups_.begin()->second[i];
+            ReproRing::push(ReproRing::AGGOUT, st.has_value ? st.int_min : -999,
+                            (int32_t)st.sum_cnt, 0, 0);
+        }
     }
 
     iter_idx_ = 0;

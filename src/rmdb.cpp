@@ -29,6 +29,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 #include "parser/ast.h"
 #include "common/output_control.h"
+#include "common/repro_ring.h"
 #include "common/wire_protocol.h"
 #include <cctype>
 #include <cmath>
@@ -932,6 +933,11 @@ static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id,
     IsolationLevel new_iso;
     if (parse_set_isolation(sql.c_str(), &new_iso)) {
         sess_iso = new_iso;
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+        return;
+    }
+    if (strncasecmp(sql.c_str(), "RINGDUMP", 8) == 0) {
+        ReproRing::dump(stderr, 6000);
         if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
         return;
     }

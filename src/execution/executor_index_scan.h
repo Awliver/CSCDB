@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "common/repro_ring.h"
 
 class IndexScanExecutor : public AbstractExecutor {
    private:
@@ -318,7 +319,13 @@ class IndexScanExecutor : public AbstractExecutor {
         return true;
     }
 
+    /* REPRO-TRACE 辅助：项 key 末 int（new_orders 索引 (w,d,o) 的 o_id）*/
+    int32_t ring_key_oid_() const {
+        if ((int)cur_key_buf_.size() < index_meta_.col_tot_len || index_meta_.col_tot_len < 4) return -1;
+        int32_t v; memcpy(&v, cur_key_buf_.data() + index_meta_.col_tot_len - 4, 4); return v;
+    }
     void position_to_match() {
+        const bool ring_on = ReproRing::on() && tab_name_ == "new_orders";
         while (!range_exhausted_ && !scan_->is_end()) {
             // 与 SeqScan 一致：扫描中途表变脏时打开 MVCC 读
             if (!mvcc_on_ && context_ && context_->txn_mgr_ && context_->txn_) {
@@ -340,6 +347,7 @@ class IndexScanExecutor : public AbstractExecutor {
 
             // Fast path：range 已精确，且无残余 cond，直接返回匹配（无需 MVCC 重建/SER 跟踪时）
             if (!mvcc_on_ && !ser_on_ && !need_eval_ && !need_prefix_check_) {
+                if (ring_on) ReproRing::push(ReproRing::FASTPATH, -1, 0, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                 return;
             }
 
@@ -349,12 +357,13 @@ class IndexScanExecutor : public AbstractExecutor {
             // 槽位不存活时，无版本链兜底的记录必须判为不可见，绝不能返回残留字节。
             const bool slot_live = table_slot_live(rid_);
 
+            bool from_heap = false;
             if (mvcc_on_) {
                 // 题9：按本事务快照重建可见版本；不可见/已删则跳过（与 SeqScan 一致）
-                bool from_heap = false;
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid_,
                                                    slot, table_record_size_, mvcc_buf_, slot_live,
                                                    &from_heap)) {
+                    if (ring_on) ReproRing::push(ReproRing::SKIPVIS, ring_key_oid_(), 1, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                     scan_->next();
                     continue;
                 }
@@ -364,6 +373,7 @@ class IndexScanExecutor : public AbstractExecutor {
                 // drain 都持分片锁互斥，读后复查 bitmap 必然看到 drain 的结果。
                 // 仅堆回退需要复查——链数据的可见性与堆槽无关（checkpoint 清堆场景合法）。
                 if (from_heap && !table_slot_live(rid_)) {
+                    if (ring_on) ReproRing::push(ReproRing::SKIPVIS, ring_key_oid_(), 2, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                     scan_->next();
                     continue;
                 }
@@ -382,11 +392,13 @@ class IndexScanExecutor : public AbstractExecutor {
                         koff += icol.len;
                     }
                     if (!key_same) {
+                        if (ring_on) ReproRing::push(ReproRing::SKIPVIS, ring_key_oid_(), 3, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                         scan_->next();
                         continue;
                     }
                 }
             } else if (!slot_live) {
+                if (ring_on) ReproRing::push(ReproRing::SKIPVIS, -1, 4, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                 scan_->next();
                 continue;
             }
@@ -412,6 +424,7 @@ class IndexScanExecutor : public AbstractExecutor {
                     koff_in_key += col.len;
                 }
                 if (!match) {
+                    if (ring_on) ReproRing::push(ReproRing::SKIPVIS, mvcc_on_ ? ring_key_oid_() : -1, 6, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                     range_exhausted_ = true;
                     return;
                 }
@@ -419,6 +432,7 @@ class IndexScanExecutor : public AbstractExecutor {
 
             if (need_eval_) {
                 if (!eval_compiled(rec_data)) {
+                    if (ring_on) ReproRing::push(ReproRing::SKIPVIS, mvcc_on_ ? ring_key_oid_() : -1, 5, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
                     scan_->next();
                     continue;
                 }
@@ -429,6 +443,13 @@ class IndexScanExecutor : public AbstractExecutor {
                 if (context_->txn_mgr_->ser_read_check(context_->txn_, tab_name_, rid_))
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                     AbortReason::DEADLOCK_PREVENTION);
+            }
+            if (ring_on) {
+                int32_t payload = -1;
+                if (table_record_size_ >= 4) memcpy(&payload, rec_data, 4);
+                ReproRing::push(ReproRing::ACCEPT, mvcc_on_ ? ring_key_oid_() : payload, payload,
+                                ReproRing::rid32(rid_.page_no, rid_.slot_no),
+                                (mvcc_on_ ? 1 : 0) | (from_heap ? 2 : 0));
             }
             return;
         }
