@@ -1,0 +1,16 @@
+# Adapted from DuckDB benchmark/micro/aggregate/simple_distinct.benchmark.
+# RMDB currently implements native COUNT(DISTINCT), not every DuckDB DISTINCT aggregate.
+name Integer Count Distinct (Ungrouped)
+group aggregate
+
+load
+CREATE TABLE integers (i INT);
+
+generate
+integers 100000 row%5
+
+run
+SELECT COUNT(DISTINCT i) FROM integers;
+
+result I
+5

@@ -1,0 +1,17 @@
+# Adapted from DuckDB benchmark/micro/index/create/create_art_sorted.benchmark.
+# DuckDB's named ART syntax is mapped to RMDB's unique-index DDL.
+name Create Index Sorted
+group art
+subgroup create
+
+load
+CREATE TABLE art (id INT);
+
+generate
+art 100000 row
+
+run
+CREATE INDEX art (id);
+
+cleanup
+DROP INDEX art (id);
