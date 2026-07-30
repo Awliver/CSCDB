@@ -184,6 +184,7 @@ class UpdateExecutor : public AbstractExecutor {
             const bool mvcc_path = context_ && context_->txn_mgr_ && context_->txn_ &&
                                    context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
             std::string mvcc_effective;
+            std::string visible;   // MVCC 快照可见值（含本事务前序语句累计写）——WAL diff 基准
 
             // 显式事务 MVCC 写：行锁与 delete 对称，持有到 commit/abort
             if (context_ && context_->lock_mgr_ && context_->txn_ && context_->txn_->get_txn_mode() &&
@@ -196,7 +197,6 @@ class UpdateExecutor : public AbstractExecutor {
 
             // 题9 MVCC：在改动 slot 之前做写写冲突检测 + 登记未提交版本
             if (mvcc_path) {
-                std::string visible;
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid,
                                                      slot, record_size_, visible)) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
@@ -364,17 +364,25 @@ class UpdateExecutor : public AbstractExecutor {
                 if (memcmp(orig_rec.data(), slot, record_size_) != 0) cached_page_dirty_ = true;
             }
 
-            // 题10 WAL：优先写增量差分；省不到 1/3 或段过多则回退全量镜像
+            // 题10 WAL：优先写增量差分；省不到 1/3 或段过多则回退全量镜像。
+            // diff/undo 基准必须是【本语句执行前的可见值】——MVCC 路径下即 visible
+            //（含本事务前序语句的累计写），绝不能用事务前堆镜像 orig_rec：同一事务
+            // 多次触碰同一行时，被前一语句改过又被本语句改回原值的字节会因
+            // diff(事务前值, 累计值) "看似未变"而漏出 ranges，恢复按"每字节最后
+            // 写者"合成出中间态（OJ 16:47 SUM(s_ytd) 0 ULP 判负实测：float 累加
+            // 使 s_ytd 尾数字节 00→80→00 往返，重放停在 80，恢复后 +1.0/行）。
             if (context_ && context_->log_mgr_ && context_->txn_) {
+                const bool have_visible = mvcc_path && (int)visible.size() >= record_size_;
+                const char* old_ptr = have_visible ? visible.data() : orig_rec.data();
                 const char* new_ptr = mvcc_path ? mvcc_effective.data() : slot;
                 Rid r = rid;
                 UpdateDeltaLogRecord dlr(context_->txn_->get_transaction_id(),
-                                        orig_rec.data(), new_ptr, record_size_, r, tab_name_);
+                                        old_ptr, new_ptr, record_size_, r, tab_name_);
                 if (dlr.useful()) {
                     context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&dlr));
                 } else {
                     RmRecord old_rec(record_size_), new_rec(record_size_);
-                    memcpy(old_rec.data, orig_rec.data(), record_size_);
+                    memcpy(old_rec.data, old_ptr, record_size_);
                     memcpy(new_rec.data, new_ptr, record_size_);
                     UpdateLogRecord lr(context_->txn_->get_transaction_id(), old_rec, new_rec, r, tab_name_);
                     context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));

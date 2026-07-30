@@ -25,6 +25,26 @@ See the Mulan PSL v2 for more details. */
  * P1：日志按批帧落盘 [magic|len|crc|records...]。恢复外层按批推进，CRC 不过则整批丢弃；
  * 批内仍用 per-record 解析。预分配后文件大小 ≠ 逻辑终点，不能再靠文件大小挡残尾。 */
 
+/* 诊断（RMDB_TRACE_ROW="v0,v1"）：追踪首两个 int 列等于 (v0,v1) 的行在恢复各阶段
+ * 被施加的每条记录（redo/undo、tid、字节段前后值）。用于崩溃镜像离线归因，零开销
+ *（未设环境变量时仅一次静态判定）。*/
+static bool trace_row_match(const char* row, int size) {
+    static int v0 = 0, v1 = 0, enabled = -1;
+    if (enabled < 0) {
+        const char* e = std::getenv("RMDB_TRACE_ROW");
+        enabled = (e != nullptr && sscanf(e, "%d,%d", &v0, &v1) == 2) ? 1 : 0;
+    }
+    if (!enabled || row == nullptr || size < 8) return false;
+    int a, b;
+    memcpy(&a, row, 4);
+    memcpy(&b, row + 4, 4);
+    return a == v0 && b == v1;
+}
+
+static void trace_hex(const char* p, int len) {
+    for (int k = 0; k < len && k < 24; k++) fprintf(stderr, "%02x", (unsigned char)p[k]);
+}
+
 // 滚动缓冲:保证 [offset, offset+need) 可由连续内存返回;失败返回 nullptr
 const char* RecoveryManager::ensure_bytes(long offset, int need) {
     if (offset < rdbuf_start_ || offset + need > rdbuf_start_ + rdbuf_len_) {
@@ -367,6 +387,10 @@ void RecoveryManager::redo() {
                 lr.deserialize(data);
                 std::string tab(lr.table_name_, lr.table_name_size_);
                 if (RmFileHandle* fh = table_fh(tab)) {
+                    if (trace_row_match(lr.new_value_.data, lr.new_value_.size)) {
+                        fprintf(stderr, "[trace-row] redo FULL tid=%ld %s(%d,%d)\n",
+                                (long)tid, tab.c_str(), lr.rid_.page_no, lr.rid_.slot_no);
+                    }
                     apply_update(fh, lr.rid_, lr.new_value_.data);
                     touched_ = true;
                 }
@@ -381,8 +405,20 @@ void RecoveryManager::redo() {
                     if (fh->is_record(lr.rid_)) {
                         auto cur = fh->get_record(lr.rid_, nullptr);
                         std::vector<char> buf(cur->data, cur->data + cur->size);
+                        const bool tr = trace_row_match(cur->data, cur->size);
+                        if (tr) fprintf(stderr, "[trace-row] redo DELTA tid=%ld %s(%d,%d) ranges=%d\n",
+                                        (long)tid, tab.c_str(), lr.rid_.page_no, lr.rid_.slot_no, lr.n_ranges_);
                         for (int i = 0; i < lr.n_ranges_; i++) {
                             if ((int)lr.ranges_[i].off + (int)lr.ranges_[i].len > (int)buf.size()) continue;
+                            if (tr) {
+                                fprintf(stderr, "  off=%d len=%d heap=", (int)lr.ranges_[i].off, (int)lr.ranges_[i].len);
+                                trace_hex(buf.data() + lr.ranges_[i].off, lr.ranges_[i].len);
+                                fprintf(stderr, " walold=");
+                                trace_hex(lr.old_ptrs_[i], lr.ranges_[i].len);
+                                fprintf(stderr, " walnew=");
+                                trace_hex(lr.new_ptrs_[i], lr.ranges_[i].len);
+                                fprintf(stderr, "\n");
+                            }
                             memcpy(buf.data() + lr.ranges_[i].off, lr.new_ptrs_[i], lr.ranges_[i].len);
                         }
                         apply_update(fh, lr.rid_, buf.data());
@@ -435,6 +471,10 @@ void RecoveryManager::undo_pass() {
                     apply_delete(fh, it->rid);
                     break;
                 case LogType::UPDATE:
+                    if (trace_row_match(it->old_data.data(), (int)it->old_data.size())) {
+                        fprintf(stderr, "[trace-row] undo FULL tid=%ld %s(%d,%d)\n",
+                                (long)kv.first, it->table.c_str(), it->rid.page_no, it->rid.slot_no);
+                    }
                     apply_update(fh, it->rid, it->old_data.data());
                     break;
                 case LogType::UPDATE_DELTA: {
@@ -442,9 +482,20 @@ void RecoveryManager::undo_pass() {
                     if (fh->is_record(it->rid)) {
                         auto cur = fh->get_record(it->rid, nullptr);
                         std::vector<char> buf(cur->data, cur->data + cur->size);
+                        const bool tr = trace_row_match(cur->data, cur->size);
+                        if (tr) fprintf(stderr, "[trace-row] undo DELTA tid=%ld %s(%d,%d) ranges=%zu\n",
+                                        (long)kv.first, it->table.c_str(), it->rid.page_no,
+                                        it->rid.slot_no, it->delta_ranges.size());
                         for (size_t i = 0; i < it->delta_ranges.size(); i++) {
                             auto& rg = it->delta_ranges[i];
                             if ((int)rg.off + (int)rg.len > (int)buf.size()) continue;
+                            if (tr) {
+                                fprintf(stderr, "  off=%d len=%d heap=", (int)rg.off, (int)rg.len);
+                                trace_hex(buf.data() + rg.off, rg.len);
+                                fprintf(stderr, " restore_old=");
+                                trace_hex(it->delta_old[i].data(), rg.len);
+                                fprintf(stderr, "\n");
+                            }
                             memcpy(buf.data() + rg.off, it->delta_old[i].data(), rg.len);
                         }
                         apply_update(fh, it->rid, buf.data());
