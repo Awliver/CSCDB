@@ -52,6 +52,32 @@ static size_t effective_pool_size() {
     }
     return BUFFER_POOL_SIZE;
 }
+
+struct HeapUsage {
+    size_t live = 0;
+    size_t free = 0;
+    size_t arena = 0;
+    size_t mmap = 0;
+};
+
+// mallinfo2 was added in glibc 2.33.  The local final-round toolchain still
+// uses glibc 2.31, while the grader currently provides the newer API.
+// Keep diagnostics buildable on both; these counters are observability-only.
+static HeapUsage current_heap_usage() {
+#if defined(__GLIBC__) && \
+    ((__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    const auto mi = mallinfo2();
+#else
+    const auto mi = mallinfo();
+#endif
+    return {
+        static_cast<size_t>(mi.uordblks),
+        static_cast<size_t>(mi.fordblks),
+        static_cast<size_t>(mi.arena),
+        static_cast<size_t>(mi.hblkhd),
+    };
+}
+
 auto buffer_pool_manager = std::make_unique<BufferPoolManager>(effective_pool_size(), disk_manager.get());
 auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
 auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
@@ -1537,7 +1563,7 @@ int main(int argc, char **argv) {
         // 统计口径有限，但足以定位"恢复后基线虚存"的产生阶段
         auto log_heap = [](const char *phase) {
             if (std::getenv("RMDB_MVCC_STATS") == nullptr) return;
-            struct mallinfo2 mi = mallinfo2();
+            const auto heap = current_heap_usage();
             long vsz_kb = 0;
             if (FILE *f = fopen("/proc/self/status", "r")) {
                 char line[256];
@@ -1547,8 +1573,8 @@ int main(int argc, char **argv) {
                 fclose(f);
             }
             fprintf(stderr, "[heap] %-14s live_mb=%.0f free_mb=%.0f arena_mb=%.0f mmap_mb=%.0f vsz_mb=%ld\n",
-                    phase, mi.uordblks / 1048576.0, mi.fordblks / 1048576.0,
-                    mi.arena / 1048576.0, mi.hblkhd / 1048576.0, vsz_kb / 1024);
+                    phase, heap.live / 1048576.0, heap.free / 1048576.0,
+                    heap.arena / 1048576.0, heap.mmap / 1048576.0, vsz_kb / 1024);
         };
 
         // Database name is passed by args
@@ -1593,12 +1619,12 @@ int main(int argc, char **argv) {
                         }
                         fclose(f);
                     }
-                    struct mallinfo2 mi = mallinfo2();
+                    const auto heap = current_heap_usage();
                     fprintf(stderr, "[mvcc-stats] chains=%zu vers=%zu data_mb=%.1f rlocks=%zu "
                             "rwrites=%zu delkeys=%zu deferred=%zu ser=%zu "
                             "heap_live_mb=%.0f heap_free_mb=%.0f rss_mb=%ld vsz_mb=%ld\n",
                             chains, vers, bytes / 1048576.0, lock_manager->record_lock_count(),
-                            rw, dk, dd, se, mi.uordblks / 1048576.0, mi.fordblks / 1048576.0,
+                            rw, dk, dd, se, heap.live / 1048576.0, heap.free / 1048576.0,
                             rss_kb / 1024, vsz_kb / 1024);
                 }
             }).detach();

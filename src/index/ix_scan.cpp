@@ -87,6 +87,34 @@ bool IxScan::locate_key_mode() const {
     auto *self = const_cast<IxScan *>(this);
     const IxFileHdr *fh = ih_->get_fhdr();
     Iid pos;
+
+    // lower/upper_bound 依赖内部结点分隔键。并发 delete/merge 后若某一级分隔键
+    // 短暂陈旧，树下降可能落到 anchor 之前的叶；只把位置钳到 start_key 仍会在
+    // 下一轮重新返回已经消费过的行。Sort 会把这种回环持续物化到内存，最终以
+    // bad_alloc/ERROR 结束。沿叶链向前找严格大于 anchor 的第一项，作为进度兜底。
+    auto seek_strictly_after_anchor = [&]() -> bool {
+        pos = ih_->upper_bound_nolock(anchor_key_.data());
+        size_t leaf_hops = 0;
+        while (true) {
+            self->iid_ = pos;
+            if (!page_no_valid(pos.page_no)) return false;
+            ensure_cached(pos.page_no);
+            if (cached_node_ == nullptr || pos.slot_no < 0) return false;
+            if (pos.slot_no >= cached_size_) {
+                if (++leaf_hops > static_cast<size_t>(fh->num_pages_)) return false;
+                advance_to_next_leaf();
+                pos = iid_;
+                continue;
+            }
+            int cmp = ix_compare(cached_node_->get_key(pos.slot_no), anchor_key_.data(),
+                                 fh->col_types_, fh->col_lens_);
+            if (cmp > 0) return true;
+            // upper_bound 本应已越过等值 run；若分隔键把下降点带早了，则顺着
+            // 叶链跳过所有 <= anchor 的项，保证扫描游标绝不倒退。
+            pos.slot_no++;
+        }
+    };
+
     if (!has_anchor_) {
         pos = ih_->lower_bound_nolock(start_key_.data());
     } else {
@@ -139,6 +167,19 @@ bool IxScan::locate_key_mode() const {
         ensure_cached(pos.page_no);
         if (cached_node_ == nullptr || pos.slot_no < 0 || pos.slot_no >= cached_size_) return false;
     }
+
+    if (has_anchor_) {
+        int progress = ix_compare(cached_node_->get_key(pos.slot_no), anchor_key_.data(),
+                                  fh->col_types_, fh->col_lens_);
+        const Rid *candidate = cached_node_->get_rid(pos.slot_no);
+        const bool repeated_item =
+            progress == 0 && candidate->page_no == anchor_rid_.page_no &&
+            candidate->slot_no == anchor_rid_.slot_no;
+        if (progress < 0 || repeated_item) {
+            if (!seek_strictly_after_anchor()) return false;
+        }
+    }
+
     int c = ix_compare(cached_node_->get_key(pos.slot_no), end_key_.data(),
                        fh->col_types_, fh->col_lens_);
     if (c > 0 || (c == 0 && !end_inclusive_)) return false;

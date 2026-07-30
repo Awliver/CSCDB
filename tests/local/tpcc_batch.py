@@ -55,6 +55,7 @@ S_UPD_CUST_DEL = 39
 S_STOCK_LEVEL = 40
 S_SEL_CUST_NO = 41
 S_SEL_CUST_WH_JOIN = 42  # 决赛 PDF NewOrder 首语句：customer × warehouse 逗号连接
+S_SEL_OL_DEL_DETAILS = 43  # 决赛 Delivery：逐行金额账本（与 SUM 做 0 ULP 对照）
 
 
 def _stock_sel_id(d_id: int) -> int:
@@ -240,6 +241,13 @@ def build_prepare_stmts() -> List[Tuple[int, bool, Sequence[int], str]]:
             [I, I, I],
             "select c_discount, c_last, c_credit, w_tax from customer, warehouse "
             "where w_id=$1 and c_w_id=w_id and c_d_id=$2 and c_id=$3",
+        ),
+        (
+            S_SEL_OL_DEL_DETAILS,
+            True,
+            [I, I, I],
+            "select ol_number, ol_amount, ol_delivery_d from order_line "
+            "where ol_w_id=$1 and ol_d_id=$2 and ol_o_id=$3 order by ol_number",
         ),
     ]
     for d in range(1, 11):
@@ -519,6 +527,7 @@ def run_delivery_batch(cli: WireClient, rng, scale):
         ops2.append((S_DEL_NO, [w_id, d_id, o_id]))
         ops2.append((S_UPD_ORDERS_CARRIER, [w_id, d_id, o_id]))
         ops2.append((S_UPD_OL_DELIVERY, [ENTRY_D, w_id, d_id, o_id]))
+        ops2.append((S_SEL_OL_DEL_DETAILS, [w_id, d_id, o_id]))
         sum_ops.append(len(ops2))
         ops2.append((S_SUM_OL, [w_id, d_id, o_id]))
         cid_ops.append(len(ops2))
@@ -534,6 +543,9 @@ def run_delivery_batch(cli: WireClient, rng, scale):
         total = _cell_float(br2.results, sum_ops[i])
         c_id = _cell_int(br2.results, cid_ops[i])
         if total is None or c_id is None:
+            # br2 本身成功时 AUTO_ABORT 不会介入；不能带着半成品显式事务进入
+            # 下一轮 BEGIN，否则旧快照会长期卡住 MVCC 水位并污染后续压力结论。
+            cli.exec_batch([(S_ABORT, [])])
             return False, "delivery: sum/c_id missing d=%d" % d_id
         ops3.append((S_UPD_CUST_DEL, [float(total), w_id, d_id, c_id]))
     ops3.append((S_COMMIT, []))
