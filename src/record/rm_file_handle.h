@@ -73,6 +73,15 @@ class RmFileHandle {
         // 这里实际就是初始化file_hdr，只不过是从磁盘中读出进行初始化
         // init file_hdr_
         disk_manager_->read_page(fd, RM_FILE_HDR_PAGE, (char *)&file_hdr_, sizeof(file_hdr_));
+        // 头页自愈：页 0 只在 checkpoint 落盘。热表头页常驻缓存时 kill -9，盘上
+        // num_pages 停在旧值而数据页俱在（BPM 淘汰会写数据页）——全表"看似空"、
+        // 索引重建也建成空（W=50 崩溃恢复 orders 1.5M→0 的直接原因之一）。
+        // 文件物理大小是页数的下界真相，取 max 自愈。
+        long fsize = disk_manager_->get_file_size(disk_manager_->get_file_name(fd));
+        if (fsize > 0) {
+            int pages_on_disk = (int)(fsize / PAGE_SIZE);
+            if (pages_on_disk > file_hdr_.num_pages) file_hdr_.num_pages = pages_on_disk;
+        }
         // disk_manager管理的fd对应的文件中，设置从file_hdr_.num_pages开始分配page_no
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
     }

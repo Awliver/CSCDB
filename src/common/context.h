@@ -75,4 +75,7 @@ public:
     bool ellipsis_;
     bool ser_in_select_ = false;   // 题9 SER：当前扫描是否属于 SELECT（仅 SELECT 记录读集）
     WireResultSink *wire_sink_ = nullptr;  // 决赛：非空时查询结果走 Wire v3 二进制帧，不走 RecordPrinter
+    // LOAD 语句置位：语句事务提交后做一次检查点（装载耐久性不能指望"数据页恰好被
+    // 淘汰刷盘 + WAL 全量重放"——W=50 全量重放 + 索引重建远超崩后 90s 就绪预算）
+    bool checkpoint_after_commit_ = false;
 };

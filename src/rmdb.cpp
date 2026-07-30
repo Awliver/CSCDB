@@ -636,6 +636,13 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
             txn_manager->commit(context->txn_, context->log_mgr_);
         }
         txn_manager->reap(context->txn_);
+        // LOAD 提交后打检查点（见 Context::checkpoint_after_commit_ 注释）。
+        // 必须在 commit 之后：检查点会推进 restart 起点，若数据尚未提交就打点，
+        // 崩后 undo 信息落在 restart 之前而数据页已落盘，无从回滚。
+        if (context->checkpoint_after_commit_ && outcome == ExecOutcome::OK) {
+            context->checkpoint_after_commit_ = false;
+            sm_manager->do_checkpoint(context->log_mgr_);
+        }
     } catch (std::exception &e) {
         if (outcome == ExecOutcome::OK) {
             diag = e.what();

@@ -160,7 +160,7 @@ void IxScan::next() {
         }
         return;
     }
-    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    std::shared_lock<FairSharedMutex> lock(ih_->root_latch_);
     normalize_position();
     if (iid_ == end_) return;
     iid_.slot_no++;
@@ -172,7 +172,7 @@ void IxScan::next() {
 }
 
 Rid IxScan::rid() const {
-    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    std::shared_lock<FairSharedMutex> lock(ih_->root_latch_);
     if (key_mode_) {
         if (!locate_key_mode()) return Rid{-1, -1};
         memcpy(returned_key_.data(), cached_node_->get_key(iid_.slot_no),
@@ -193,7 +193,7 @@ Rid IxScan::rid() const {
 }
 
 Rid IxScan::rid_and_key(char *key_out) const {
-    std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+    std::shared_lock<FairSharedMutex> lock(ih_->root_latch_);
     if (key_mode_) {
         if (!locate_key_mode()) return Rid{-1, -1};
         memcpy(key_out, cached_node_->get_key(iid_.slot_no), ih_->get_fhdr_col_tot_len());

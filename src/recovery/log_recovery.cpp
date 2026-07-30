@@ -35,7 +35,7 @@ const char* RecoveryManager::ensure_bytes(long offset, int need) {
         long take = log_end_ - offset;
         if (take > (long)rdbuf_.size()) take = (long)rdbuf_.size();
         if (take < need) return nullptr;
-        int n = disk_manager_->read_log(rdbuf_.data(), (int)take, (int)offset);
+        int n = disk_manager_->read_log(rdbuf_.data(), (int)take, offset);
         rdbuf_start_ = offset;
         rdbuf_len_ = n;
         if (n < need) return nullptr;
@@ -53,6 +53,36 @@ int RecoveryManager::read_one(long offset, std::vector<char>& scratch) {
     if (rec == nullptr) return 0;
     scratch.assign(rec, rec + tot);
     return (int)tot;
+}
+
+long RecoveryManager::probe_next_batch(long from, long limit) {
+    const uint32_t magic = WAL_BATCH_MAGIC;
+    const unsigned char m0 = (unsigned char)(magic & 0xff);   // 小端首字节
+    const int CHUNK = 1 << 20;
+    long p = from;
+    while (p + WAL_BATCH_HDR_SIZE <= limit) {
+        int want = (int)std::min<long>(CHUNK, limit - p);
+        const char* buf = ensure_bytes(p, want);
+        if (buf == nullptr) return -1;
+        // 批可起于任意字节偏移：memchr 找 magic 首字节做候选，再整验
+        for (int i = 0; i + WAL_BATCH_HDR_SIZE <= want;) {
+            const char* hit = (const char*)memchr(buf + i, m0, want - WAL_BATCH_HDR_SIZE - i + 1);
+            if (hit == nullptr) break;
+            int off = (int)(hit - buf);
+            uint32_t cand;
+            memcpy(&cand, hit, 4);
+            if (cand == magic) {
+                long body_off = 0;
+                uint32_t body_len = 0;
+                if (read_batch(p + off, body_off, body_len) > 0) return p + off;
+                buf = ensure_bytes(p, want);   // read_batch 可能重装了滚动缓冲
+                if (buf == nullptr) return -1;
+            }
+            i = off + 1;
+        }
+        p += want - (WAL_BATCH_HDR_SIZE - 1);   // 重叠推进，防批头跨块
+    }
+    return -1;
 }
 
 int RecoveryManager::read_batch(long offset, long& body_off, uint32_t& body_len) {
@@ -160,11 +190,27 @@ void RecoveryManager::analyze() {
     };
 
     if (use_batch_) {
+        batches_.clear();
         long body_off = 0;
         uint32_t body_len = 0;
         int span;
         long file_end = log_end_;
-        while ((span = read_batch(pos, body_off, body_len)) > 0) {
+        long logical_end = pos;
+        while (pos < file_end) {
+            span = read_batch(pos, body_off, body_len);
+            if (span <= 0) {
+                // 坏批/残尾：探测后方是否还有有效批（坏批可能是中部损伤——如
+                // 32 位偏移回绕这类读错位——而非日志尾；截断有效日志比跳过一批
+                // 致命得多）。找不到才认定日志到此为止。
+                long nxt = probe_next_batch(pos + 1, file_end);
+                if (nxt < 0) break;
+                fprintf(stderr,
+                        "[recovery] bad WAL batch at %ld, next valid batch found at %ld "
+                        "(skipped %ld bytes)\n", pos, nxt, nxt - pos);
+                pos = nxt;
+                continue;
+            }
+            batches_.emplace_back(body_off, body_len);
             log_end_ = body_off + body_len;  // 限制 read_one 在批内
             long bpos = body_off;
             int len;
@@ -174,8 +220,9 @@ void RecoveryManager::analyze() {
             }
             log_end_ = file_end;
             pos += span;
+            logical_end = pos;
         }
-        log_end_ = pos;
+        log_end_ = logical_end;
     } else {
         int len;
         while ((len = read_one(pos, rec)) > 0) {
@@ -255,21 +302,17 @@ void RecoveryManager::collect_uncommitted() {
     };
 
     if (use_batch_) {
-        long file_end = log_end_;
-        long body_off = 0;
-        uint32_t body_len = 0;
-        int span;
-        while (pos < file_end && (span = read_batch(pos, body_off, body_len)) > 0) {
+        // 迭代 analyze 收集的有效批列表（与坏批跳过决策严格一致）
+        for (const auto& b : batches_) {
             long saved = log_end_;
-            log_end_ = body_off + body_len;
-            long bpos = body_off;
+            log_end_ = b.first + b.second;
+            long bpos = b.first;
             int len;
             while ((len = read_one(bpos, rec)) > 0) {
                 handle_rec(rec.data());
                 bpos += len;
             }
             log_end_ = saved;
-            pos += span;
         }
     } else {
         int len;
@@ -357,23 +400,17 @@ void RecoveryManager::redo() {
     };
 
     if (use_batch_) {
-        long file_end = log_end_;
-        // analyze 已把 log_end_ 收成逻辑终点；读批时需能读到该终点内的批头
-        // 批扫描用「逻辑终点」作上限即可（残缺批已在 analyze 丢弃）
-        long body_off = 0;
-        uint32_t body_len = 0;
-        int span;
-        while (pos < file_end && (span = read_batch(pos, body_off, body_len)) > 0) {
+        // 迭代 analyze 收集的有效批列表（与坏批跳过决策严格一致）
+        for (const auto& b : batches_) {
             long saved = log_end_;
-            log_end_ = body_off + body_len;
-            long bpos = body_off;
+            log_end_ = b.first + b.second;
+            long bpos = b.first;
             int len;
             while ((len = read_one(bpos, rec)) > 0) {
                 redo_one(rec.data());
                 bpos += len;
             }
             log_end_ = saved;
-            pos += span;
         }
     } else {
         int len;

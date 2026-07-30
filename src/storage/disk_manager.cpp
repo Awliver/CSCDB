@@ -164,13 +164,14 @@ void DiskManager::close_file(int fd) {
 
 /**
  * @description: 获得文件的大小
- * @return {int} 文件的大小
+ * @return {long} 文件的大小（必须 64 位：W=50 装载的 WAL ~5.9GB，int 截断回绕成
+ *   ~1.6GB，恢复扫描的 log_end_ 直接错位——决赛崩溃恢复丢数 GB 日志的根因之一）
  * @param {string} &file_name 文件名
  */
-int DiskManager::get_file_size(const std::string &file_name) {
+long DiskManager::get_file_size(const std::string &file_name) {
     struct stat stat_buf;
     int rc = stat(file_name.c_str(), &stat_buf);
-    return rc == 0 ? stat_buf.st_size : -1;
+    return rc == 0 ? (long)stat_buf.st_size : -1;
 }
 
 /**
@@ -205,30 +206,43 @@ int DiskManager::get_file_fd(const std::string &file_name) {
  * @param {int} size 读取的数据量大小
  * @param {int} offset 读取的内容在文件中的位置
  */
-int DiskManager::read_log(char *log_data, int size, int offset) {
+int DiskManager::read_log(char *log_data, int size, long offset) {
     // read log file from the previous end
+    // offset 必须 64 位：>2.1GB 的 WAL（W=50 装载 ~5.9GB）用 int 偏移会回绕成负数/
+    // 错位，读出的字节 CRC 必错，恢复端误判"坏批"后截断有效日志
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
-        int fs = get_file_size(LOG_FILE_NAME);
+        long fs = get_file_size(LOG_FILE_NAME);
         if (fs > 0) log_prealloc_end_ = fs;
     }
-    int file_size = get_file_size(LOG_FILE_NAME);
+    long file_size = get_file_size(LOG_FILE_NAME);
     if (offset > file_size) {
         return -1;
     }
 
-    size = std::min(size, file_size - offset);
-    if(size == 0) return 0;
-    lseek(log_fd_, offset, SEEK_SET);
-    ssize_t bytes_read = read(log_fd_, log_data, size);
-    assert(bytes_read == size);
-    return bytes_read;
+    if ((long)size > file_size - offset) size = (int)(file_size - offset);
+    if (size <= 0) return 0;
+    int remain = size;
+    char *p = log_data;
+    long off = offset;
+    while (remain > 0) {
+        ssize_t n = pread(log_fd_, p, remain, off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw UnixError();
+        }
+        if (n == 0) break;
+        p += n;
+        off += n;
+        remain -= (int)n;
+    }
+    return size - remain;
 }
 
 void DiskManager::ensure_log_capacity(long need_end) {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
-        int fs = get_file_size(LOG_FILE_NAME);
+        long fs = get_file_size(LOG_FILE_NAME);
         if (fs > 0) log_prealloc_end_ = fs;
     }
     if (need_end <= log_prealloc_end_) return;
@@ -256,7 +270,7 @@ void DiskManager::reset_log_prealloc(long size) {
 void DiskManager::write_log(char *log_data, int size, long offset) {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
-        int fs = get_file_size(LOG_FILE_NAME);
+        long fs = get_file_size(LOG_FILE_NAME);
         if (fs > 0) log_prealloc_end_ = fs;
     }
     ensure_log_capacity(offset + size);

@@ -376,18 +376,75 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     ix_manager_->create_index(tab_name, index.cols);
     auto ih = ix_manager_->open_index(tab_name, index.cols);
 
-    // 5. 把表里现有所有记录都插到索引里（唯一索引：重复 key 会被 insert_entry 内部 ignored）
+    // 5. 把表里现有所有记录都插到索引里（唯一索引：重复 key 保留首个，与
+    //    insert_entry 的重复忽略语义一致）
     auto fh = fhs_[tab_name].get();
-    for (RmScan scan(fh); !scan.is_end(); scan.next()) {
-        auto rec = fh->get_record(scan.rid(), context);
-        char* key = new char[index.col_tot_len];
-        int offset = 0;
-        for (auto& col : index.cols) {
-            memcpy(key + offset, rec->data + col.offset, col.len);
-            offset += col.len;
+    bool all_int = true;
+    for (auto& col : index.cols) {
+        if (col.type != TYPE_INT) { all_int = false; break; }
+    }
+    if (all_int && index.col_tot_len <= 16) {
+        // 批量快路径（TPC-C 全部索引都是纯 INT 复合键）：直扫堆页收集
+        // (编码key, rid)，memcmp 排序后自底向上批量建树。逐条 insert_entry 的
+        // 全树下降在 W=50 恢复重建是 30+ 分钟量级，此路径为秒级。
+        // 编码：int 转大端并翻转符号位，使 memcmp 序 == ix_compare 序。
+        struct Ent { unsigned char k[16]; Rid rid; };
+        const auto& hdr = fh->get_file_hdr();
+        std::vector<Ent> ents;
+        ents.reserve((size_t)std::max(0, hdr.num_pages - 1) * hdr.num_records_per_page);
+        for (int pno = 1; pno < hdr.num_pages; pno++) {
+            RmPageHandle ph = fh->fetch_page_handle(pno);
+            for (int slot = 0; slot < hdr.num_records_per_page; slot++) {
+                if (!Bitmap::is_set(ph.bitmap, slot)) continue;
+                const char* rec = ph.get_slot(slot);
+                Ent e{};
+                int off = 0;
+                for (auto& col : index.cols) {
+                    uint32_t u;
+                    memcpy(&u, rec + col.offset, 4);
+                    u ^= 0x80000000u;
+                    e.k[off + 0] = (unsigned char)(u >> 24);
+                    e.k[off + 1] = (unsigned char)(u >> 16);
+                    e.k[off + 2] = (unsigned char)(u >> 8);
+                    e.k[off + 3] = (unsigned char)u;
+                    off += 4;
+                }
+                e.rid = Rid{pno, slot};
+                ents.push_back(e);
+            }
+            buffer_pool_manager_->unpin_page(PageId{fh->GetFd(), pno}, false);
         }
-        ih->insert_entry(key, scan.rid(), context ? context->txn_ : nullptr);
-        delete[] key;
+        std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+            return memcmp(a.k, b.k, sizeof(a.k)) < 0;
+        });
+        // 重复 key 保留首个
+        ents.erase(std::unique(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+                       return memcmp(a.k, b.k, sizeof(a.k)) == 0;
+                   }), ents.end());
+        const int klen = index.col_tot_len;
+        size_t pos = 0;
+        ih->bulk_load((long)ents.size(), [&](char* key_out, Rid* rid_out) {
+            const Ent& e = ents[pos++];
+            for (int off = 0; off < klen; off += 4) {
+                uint32_t u = ((uint32_t)e.k[off] << 24) | ((uint32_t)e.k[off + 1] << 16) |
+                             ((uint32_t)e.k[off + 2] << 8) | (uint32_t)e.k[off + 3];
+                u ^= 0x80000000u;
+                memcpy(key_out + off, &u, 4);
+            }
+            *rid_out = e.rid;
+        });
+    } else {
+        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+            auto rec = fh->get_record(scan.rid(), context);
+            char* key = new char[index.col_tot_len];
+            int offset = 0;
+            for (auto& col : index.cols) {
+                memcpy(key + offset, rec->data + col.offset, col.len);
+                offset += col.len;
+            }
+            ih->insert_entry(key, scan.rid(), context ? context->txn_ : nullptr);
+            delete[] key;
+        }
     }
 
     // 6. 注册到 ihs_ + IndexMeta 加入 tab + 持久化

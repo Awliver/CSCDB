@@ -74,7 +74,7 @@ class IxScan : public RecScan {
     void next() override;
 
     bool is_end() const override {
-        std::shared_lock<std::shared_mutex> lock(ih_->root_latch_);
+        std::shared_lock<FairSharedMutex> lock(ih_->root_latch_);
         if (key_mode_) return !locate_key_mode();
         normalize_position();
         return iid_ == end_;
