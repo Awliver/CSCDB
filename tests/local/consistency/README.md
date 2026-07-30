@@ -1,6 +1,6 @@
 # 一致性回归测试集
 
-> **待办归档**：[Docs/Todo/一致性审计与回归用例.md](../../Docs/Todo/一致性审计与回归用例.md) · 目录 [Docs/Todo/README.md](../../Docs/Todo/README.md)
+> **待办归档**：[Docs/FinalCompetition/一致性审计与回归用例.md](../../Docs/FinalCompetition/一致性审计与回归用例.md) · 目录 [Docs/FinalCompetition/README.md](../../Docs/FinalCompetition/README.md)
 
 针对 [一致性审计](../../Docs/Analysis/ProjectAnalysis/5.陷阱清单与编程契约.md) 中 **C1–M8** 类漏洞设计的本地复现/回归用例。与 `tests/local/debug/`（gitignore、临时脚本）不同，本目录**可提交**，作为修复前后的门禁。
 
@@ -111,4 +111,4 @@ tests/local/consistency/
 
 **注意**：`--stability N` 统计的是**漏洞检出率**（修前应为 100% detected）。修后请用普通跑法验 PASS。
 
-**2026-07-14 完整复验**：功能 11/11 + C1/C2/H5 PASS + `--mid` median **3943.73**（NewOrder 0 abort）→ 见 Docs/Todo/决赛准备Todo §1。
+**2026-07-14 完整复验**：功能 11/11 + C1/C2/H5 PASS + `--mid` median **3943.73**（NewOrder 0 abort）→ 见 Docs/FinalCompetition/决赛准备Todo §1。

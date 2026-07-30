@@ -316,6 +316,18 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_update(const char *s) {
                     if (*p == ',') { ++p; continue; }
                     break;
                 }
+                if (rhs_col == col) {
+                    // 决赛 TPC-C 用 UPDATE col=col 获取写冲突保护。纯自赋值没有
+                    // 算术项，过去会落回全局 yacc；在 32 客户端 EXEC_BATCH 路径中
+                    // 既放大解析锁竞争，也使快/慢解析器支持面不一致。沿用 yacc 的
+                    // AST 表示并显式打标，执行器仍完整执行锁、MVCC、WAL 与回滚。
+                    auto self = std::make_shared<ast::SetClause>(
+                        col, rhs_col, std::make_shared<ast::IntLit>(0), false);
+                    self->self_copy = true;
+                    sets.push_back(std::move(self));
+                    if (*p == ',') { ++p; continue; }
+                    break;
+                }
             }
             p = save;
         }
