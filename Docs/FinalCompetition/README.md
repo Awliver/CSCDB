@@ -28,6 +28,18 @@ python3 tests/local/consistency/run_consistency_regress.py \
 python3 tests/run_tests.py
 ```
 
+## 提交前总门禁（07-30 后一律用这个）
+
+```bash
+bash tests/local/pre_oj_submit.sh          # 正式验收：fresh W=50 全流程（~35min）
+FAST=1 bash tests/local/pre_oj_submit.sh   # 快速迭代：复用已装载库 + 45s 窗
+```
+
+覆盖：Release 构建 → 功能 11 项 → 一致性 C1/C2/H5 → 自赋值矩阵/扫描回环复现器 →
+增强版 oj_gate（装载预算/完整性/装载崩溃耐久、EXHAUSTED=0、降级中止阈值、
+峰值 RSS/fd/磁盘水位、崩前崩后**七项 FLOAT32 聚合位对比**、关系不变量、
+churn 中途 kill -9、二次恢复幂等）。
+
 修复前曾 `--stability 10` → **100% detected**；修复后连跑 10 轮 → **100% PASS**（2026-07-14）。
 
 完整复验（2026-07-27）：`run_tests` 11/11 + consistency P0 + `--mid`（**BATCH**）median **3578.46**（NewOrder 0 abort）→ 见 [`决赛准备Todo`](./决赛准备Todo.md) §1。
