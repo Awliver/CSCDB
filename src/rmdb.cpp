@@ -578,8 +578,15 @@ static bool sql_is_commit_stmt(const char *s) {
 // (autocommit 则 commit) -> reap。与历史 NUL 协议 client_handler 主循环体行为一致
 // （包括“RMDBError/std::exception 不主动 abort、仍落入尾部 autocommit”的历史语义），
 // 供 EXEC_STREAM 与 EXEC_BATCH 的每个 operation 共用。
+// batch_retryable：EXEC_BATCH 专用——批内语句全部经 PREPARE_SET 探测预验证，运行期
+// 异常绝不是"用户 SQL 非法"，只可能是瞬时资源/竞态/内部缺陷。此时回 ERROR 终结评测
+// 一条即判负（07-30 两轮 33.5s 实例，服务端 diag 不透出、无法归因）；改为回滚 +
+// TRANSACTION_ABORT 让驱动重试：瞬时故障被消化，持续故障退化为该事务放弃，运行存活。
+// COMMIT 语句仍除外（WAL 临界点后不可谎报可重试）。EXEC_STREAM 功能路径不启用——
+// 功能测试依赖非法 SQL 返回 ERROR 的语义。
 static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, IsolationLevel &sess_iso,
-                                      WireResultSink *sink, std::string &diag) {
+                                      WireResultSink *sink, std::string &diag,
+                                      bool batch_retryable = false) {
     const auto stmt_start = std::chrono::steady_clock::now();
     std::vector<char> scratch(BUFFER_LENGTH);
     int off = 0;
@@ -673,7 +680,15 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
     } catch (RMDBError &e) {
         yacc_cleanup_if_needed();
         diag = e.what();
-        outcome = ExecOutcome::ERROR;
+        if (batch_retryable && !sql_is_commit_stmt(sql.c_str())) {
+            try { txn_manager->abort(context->txn_, log_manager.get()); }
+            catch (std::exception &e2) { std::cerr << "[wire] error-abort failed: " << e2.what() << std::endl; }
+            catch (...) { std::cerr << "[wire] error-abort failed: unknown" << std::endl; }
+            outcome = ExecOutcome::ABORT;
+            fprintf(stderr, "[error-abort] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
+        } else {
+            outcome = ExecOutcome::ERROR;
+        }
     } catch (std::bad_alloc &e) {
         // RLIMIT_AS 触顶时的分配失败（rmdb.cpp 线程栈/arena 注释记录过测量中段实例）：
         // 同帧耗尽——内存压力可随重试方退避缓解，回 ABORT 而非 ERROR 终结；COMMIT 例外同上
@@ -692,7 +707,15 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
     } catch (std::exception &e) {
         yacc_cleanup_if_needed();
         diag = e.what();
-        outcome = ExecOutcome::ERROR;
+        if (batch_retryable && !sql_is_commit_stmt(sql.c_str())) {
+            try { txn_manager->abort(context->txn_, log_manager.get()); }
+            catch (std::exception &e2) { std::cerr << "[wire] error-abort failed: " << e2.what() << std::endl; }
+            catch (...) { std::cerr << "[wire] error-abort failed: unknown" << std::endl; }
+            outcome = ExecOutcome::ABORT;
+            fprintf(stderr, "[error-abort] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
+        } else {
+            outcome = ExecOutcome::ERROR;
+        }
     }
     if (outcome == ExecOutcome::ERROR) {
         // ERROR 是稀有事件（正常负载不产生），必须留下服务器端痕迹：评测端只回报
@@ -994,7 +1017,7 @@ static void handle_exec_batch(int fd, const std::string &payload,
 
         if (st.is_query) {
             BufferSink sink;
-            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag);
+            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag, /*batch_retryable=*/true);
             if (outc != ExecOutcome::OK) {
                 status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
                 failed_op = op;
@@ -1002,7 +1025,7 @@ static void handle_exec_batch(int fd, const std::string &payload,
             }
             results.push_back(OpResult{op, sink.row_count(), sink.rows_payload()});
         } else {
-            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag);
+            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag, /*batch_retryable=*/true);
             if (outc != ExecOutcome::OK) {
                 status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
                 failed_op = op;
