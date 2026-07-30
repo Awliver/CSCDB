@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_index_handle.h"
 
+#include <unistd.h>
+
 #include "ix_scan.h"
 
 /**
@@ -216,7 +218,7 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
-    std::shared_lock<std::shared_mutex> lock(root_latch_);
+    std::shared_lock<FairSharedMutex> lock(root_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, transaction);
     Rid *rid_ptr = nullptr;
     bool found = leaf->leaf_lookup(key, &rid_ptr);
@@ -343,7 +345,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
-    std::unique_lock<std::shared_mutex> lock(root_latch_);
+    std::unique_lock<FairSharedMutex> lock(root_latch_);
 
     // 顺序追加快路径：缓存的叶仍是最右叶且 key 不小于其首 key 时，落点必在此叶。
     // 若上次那页的 pin 还攥着（pinned_leaf_no_ 命中），直接用，连 fetch_node 都省了；
@@ -429,7 +431,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
-    std::unique_lock<std::shared_mutex> lock(root_latch_);
+    std::unique_lock<FairSharedMutex> lock(root_latch_);
     cached_leaf_no_ = IX_NO_PAGE;   // 删除可能合并/重分配改变叶结构，作废顺序插入缓存
     release_pinned_leaf();         // 同时放掉顺序插入长期攥着的 pin，避免和 coalesce/redistribute 冲突
 
@@ -671,7 +673,7 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
  * @note iid和rid存的不是一个东西，rid是上层传过来的记录位置，iid是索引内部生成的索引槽位置
  */
 Rid IxIndexHandle::get_rid(const Iid &iid) const {
-    std::shared_lock<std::shared_mutex> lock(root_latch_);  // 与写路径共享，分裂未完成前写方持独占锁
+    std::shared_lock<FairSharedMutex> lock(root_latch_);  // 与写路径共享，分裂未完成前写方持独占锁
     IxNodeHandle *node = fetch_node(iid.page_no);
     if (iid.slot_no >= node->get_size()) {
         buffer_pool_manager_->unpin_page(node->get_page_id(), false);
@@ -694,7 +696,7 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char *key) {
-    std::shared_lock<std::shared_mutex> lock(root_latch_);
+    std::shared_lock<FairSharedMutex> lock(root_latch_);
     return lower_bound_nolock(key);
 }
 
@@ -725,7 +727,7 @@ Iid IxIndexHandle::lower_bound_nolock(const char *key) const {
  * @return Iid
  */
 Iid IxIndexHandle::upper_bound(const char *key) {
-    std::shared_lock<std::shared_mutex> lock(root_latch_);
+    std::shared_lock<FairSharedMutex> lock(root_latch_);
     return upper_bound_nolock(key);
 }
 
@@ -767,7 +769,7 @@ Iid IxIndexHandle::upper_bound_nolock(const char *key) const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_end() const {
-    std::shared_lock<std::shared_mutex> lock(root_latch_);  // last_leaf_ 随分裂变，与写方共享读
+    std::shared_lock<FairSharedMutex> lock(root_latch_);  // last_leaf_ 随分裂变，与写方共享读
     IxNodeHandle *node = fetch_node(file_hdr_->last_leaf_);
     Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node->get_size()};
     buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
@@ -782,7 +784,7 @@ Iid IxIndexHandle::leaf_end() const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_begin() const {
-    std::shared_lock<std::shared_mutex> lock(root_latch_);  // first_leaf_ 与写方共享读
+    std::shared_lock<FairSharedMutex> lock(root_latch_);  // first_leaf_ 与写方共享读
     Iid iid = {.page_no = file_hdr_->first_leaf_, .slot_no = 0};
     return iid;
 }
@@ -903,4 +905,125 @@ void IxIndexHandle::maintain_child(IxNodeHandle *node, int child_idx) {
         child->set_parent_page_no(node->get_page_no());
         buffer_pool_manager_->unpin_page(child->get_page_id(), true);
     }
+}
+/* 批量装载（恢复期索引重建的快路径）：自底向上顺序构建整棵 B+ 树。
+ * 布局：页 0 文件头、页 1 叶链哨兵、页 2 起按层连续排布（叶层在前，逐层向上，
+ * 根页号最大）。所有页面镜像在内存拼好后经 disk_manager 直写（绕过 BPM），
+ * 结束时 fdatasync。节点填充率 ~90%（≤ btree_order_，不触发后续首插分裂）。
+ * 内部节点不变量与增量插入一致：keys[i] = 第 i 个子树的最小 key，
+ * rids[i].page_no = 孩子页号（internal_lookup 用 upper_bound(key)-1 下降）。 */
+void IxIndexHandle::bulk_load(long n, const std::function<void(char *key_out, Rid *rid_out)> &next) {
+    std::unique_lock<FairSharedMutex> lock(root_latch_);
+    release_pinned_leaf();
+    cached_leaf_no_ = IX_NO_PAGE;
+    // create/open 可能已在 BPM 缓存 0/1/2 页；直写前必须清空本 fd 的缓存页，
+    // 否则后续 fetch 命中旧缓存读到构建前的空节点
+    buffer_pool_manager_->flush_all_pages(fd_);
+    buffer_pool_manager_->delete_all_pages(fd_);
+
+    const int klen = file_hdr_->col_tot_len_;
+    const int max_keys = file_hdr_->btree_order_ + 1;
+    int fill = max_keys * 9 / 10;
+    if (fill < 2) fill = 2;
+    if (fill > max_keys - 1) fill = max_keys - 1;
+
+    std::vector<char> pagebuf(PAGE_SIZE);
+    char *kbase = pagebuf.data() + sizeof(IxPageHdr);
+    Rid *rbase = reinterpret_cast<Rid *>(kbase + file_hdr_->keys_size_);
+
+    long n_leaves = (n + fill - 1) / fill;
+    if (n_leaves < 1) n_leaves = 1;
+
+    std::vector<long> level_cnt{n_leaves};              // [0]=叶层
+    while (level_cnt.back() > 1) {
+        level_cnt.push_back((level_cnt.back() + fill - 1) / fill);
+    }
+    std::vector<long> level_start;
+    long next_id = IX_INIT_ROOT_PAGE;
+    for (long c : level_cnt) {
+        level_start.push_back(next_id);
+        next_id += c;
+    }
+    const long total_pages = next_id;
+    const page_id_t root_pno = (page_id_t)(next_id - 1);
+
+    auto parent_of = [&](size_t level, long idx) -> page_id_t {
+        if (level + 1 >= level_cnt.size()) return IX_NO_PAGE;   // 根
+        return (page_id_t)(level_start[level + 1] + idx / fill);
+    };
+
+    // 叶层：流式消费排序条目，同时收集每叶最小 key 供上层构建
+    std::vector<char> minkeys((size_t)n_leaves * klen);
+    long produced = 0;
+    for (long li = 0; li < n_leaves; li++) {
+        memset(pagebuf.data(), 0, PAGE_SIZE);
+        IxPageHdr *ph = reinterpret_cast<IxPageHdr *>(pagebuf.data());
+        page_id_t me = (page_id_t)(level_start[0] + li);
+        long cnt = n - produced;
+        if (cnt > fill) cnt = fill;
+        if (cnt < 0) cnt = 0;
+        ph->next_free_page_no = IX_NO_PAGE;
+        ph->parent = parent_of(0, li);
+        ph->num_key = (int)cnt;
+        ph->is_leaf = true;
+        ph->prev_leaf = (li == 0) ? IX_LEAF_HEADER_PAGE : me - 1;
+        ph->next_leaf = (li == n_leaves - 1) ? IX_LEAF_HEADER_PAGE : me + 1;
+        for (long i = 0; i < cnt; i++) {
+            next(kbase + i * klen, rbase + i);
+        }
+        produced += cnt;
+        if (cnt > 0) memcpy(minkeys.data() + (size_t)li * klen, kbase, klen);
+        disk_manager_->write_page(fd_, me, pagebuf.data(), PAGE_SIZE);
+    }
+
+    // 内部层
+    for (size_t lv = 1; lv < level_cnt.size(); lv++) {
+        long n_children = level_cnt[lv - 1];
+        std::vector<char> next_min((size_t)level_cnt[lv] * klen);
+        for (long ni = 0; ni < level_cnt[lv]; ni++) {
+            memset(pagebuf.data(), 0, PAGE_SIZE);
+            IxPageHdr *ph = reinterpret_cast<IxPageHdr *>(pagebuf.data());
+            long c0 = ni * fill;
+            long cn = n_children - c0;
+            if (cn > fill) cn = fill;
+            ph->next_free_page_no = IX_NO_PAGE;
+            ph->parent = parent_of(lv, ni);
+            ph->num_key = (int)cn;
+            ph->is_leaf = false;
+            ph->prev_leaf = IX_NO_PAGE;
+            ph->next_leaf = IX_NO_PAGE;
+            for (long c = 0; c < cn; c++) {
+                memcpy(kbase + c * klen, minkeys.data() + (size_t)(c0 + c) * klen, klen);
+                rbase[c] = Rid{(int)(level_start[lv - 1] + c0 + c), 0};
+            }
+            memcpy(next_min.data() + (size_t)ni * klen, kbase, klen);
+            disk_manager_->write_page(fd_, (page_id_t)(level_start[lv] + ni), pagebuf.data(), PAGE_SIZE);
+        }
+        minkeys.swap(next_min);
+    }
+
+    // 叶链哨兵（页 1）：环通过它闭合
+    memset(pagebuf.data(), 0, PAGE_SIZE);
+    {
+        IxPageHdr *ph = reinterpret_cast<IxPageHdr *>(pagebuf.data());
+        ph->next_free_page_no = IX_NO_PAGE;
+        ph->parent = IX_NO_PAGE;
+        ph->num_key = 0;
+        ph->is_leaf = true;
+        ph->prev_leaf = (page_id_t)(level_start[0] + n_leaves - 1);
+        ph->next_leaf = (page_id_t)level_start[0];
+    }
+    disk_manager_->write_page(fd_, IX_LEAF_HEADER_PAGE, pagebuf.data(), PAGE_SIZE);
+
+    // 文件头 + 分配计数（open 后约定 fd2pageno == num_pages_）
+    file_hdr_->first_free_page_no_ = IX_NO_PAGE;
+    file_hdr_->num_pages_ = (int)total_pages;
+    file_hdr_->root_page_ = root_pno;
+    file_hdr_->first_leaf_ = (page_id_t)level_start[0];
+    file_hdr_->last_leaf_ = (page_id_t)(level_start[0] + n_leaves - 1);
+    memset(pagebuf.data(), 0, PAGE_SIZE);
+    file_hdr_->serialize(pagebuf.data());
+    disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, pagebuf.data(), file_hdr_->tot_len_);
+    disk_manager_->set_fd2pageno(fd_, file_hdr_->num_pages_);
+    fdatasync(fd_);
 }

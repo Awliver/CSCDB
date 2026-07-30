@@ -81,6 +81,14 @@ private:
     long start_offset_ = 0;                                         // 扫描起点（restart 文件）
     long log_end_ = 0;                                              // 有效日志终点
     bool use_batch_ = false;                                        // P1：是否批帧格式
+    /* analyze 一次性收集的有效批 (body_off, body_len) 列表；collect/redo 直接
+     * 迭代它，与 analyze 的坏批跳过决策严格一致（三遍各自扫描会在坏批处提前
+     * 停止，行为分叉）。W=50 ~6000 项，内存可忽略。 */
+    std::vector<std::pair<long, uint32_t>> batches_;
+    /* 从 from 起在 [from, limit) 内探测下一个有效批头；找不到返回 -1。
+     * 坏批可能是中部损伤而非日志尾——直接"停扫+截断"会把后面数 GB 有效日志
+     * 物理切掉。 */
+    long probe_next_batch(long from, long limit);
     std::unordered_set<txn_id_t> committed_;                        // redo list
     std::map<txn_id_t, std::vector<PendingOp>> uncommitted_;        // undo list（操作按记录序）
     bool touched_ = false;                                          // 本次恢复是否有重放动作

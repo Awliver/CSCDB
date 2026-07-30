@@ -10,8 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <functional>
 #include <shared_mutex>
 
+#include "common/fair_shared_mutex.h"
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
@@ -169,7 +171,9 @@ class IxIndexHandle {
     BufferPoolManager *buffer_pool_manager_;
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
-    mutable std::shared_mutex root_latch_;      // 读 shared、写 unique，分裂/合并与扫描并发
+    // 读 shared、写 unique，分裂/合并与扫描并发。写者优先（见 FairSharedMutex 注释）：
+    // key 锚定扫描按行取共享锁形成常驻读流量，读者优先策略下写者会饿死到秒级
+    mutable FairSharedMutex root_latch_;
     page_id_t cached_leaf_no_ = IX_NO_PAGE;     // 顺序追加插入缓存的最右叶页号，命中则跳过从根遍历
 
     // 顺序插入落在同一叶时，把上次的 pin 一直攥着不放：命中时连 fetch_node 都不用调，
@@ -190,6 +194,12 @@ class IxIndexHandle {
 
     // for insert
     page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction);
+
+    /* 批量装载：next(key_out, rid_out) 按 key 升序（ix_compare 序）逐条产出 n 条
+     * 键值对，自底向上顺序构建整棵树并直接写盘（绕过逐条 insert_entry 的全树下降
+     * 与分裂）。恢复期全量索引重建 W=50 从 30+ 分钟降到秒级的关键路径。
+     * 要求：索引当前为空（刚 create）；调用期间无并发访问。 */
+    void bulk_load(long n, const std::function<void(char *key_out, Rid *rid_out)> &next);
 
     IxNodeHandle *split(IxNodeHandle *node);
 

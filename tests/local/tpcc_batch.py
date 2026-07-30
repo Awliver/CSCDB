@@ -54,6 +54,7 @@ S_SEL_CUST_DEL = 38
 S_UPD_CUST_DEL = 39
 S_STOCK_LEVEL = 40
 S_SEL_CUST_NO = 41
+S_SEL_CUST_WH_JOIN = 42  # 决赛 PDF NewOrder 首语句：customer × warehouse 逗号连接
 
 
 def _stock_sel_id(d_id: int) -> int:
@@ -233,6 +234,13 @@ def build_prepare_stmts() -> List[Tuple[int, bool, Sequence[int], str]]:
             "select c_discount, c_last, c_credit from customer "
             "where c_w_id=$1 and c_d_id=$2 and c_id=$3",
         ),
+        (
+            S_SEL_CUST_WH_JOIN,
+            True,
+            [I, I, I],
+            "select c_discount, c_last, c_credit, w_tax from customer, warehouse "
+            "where w_id=$1 and c_w_id=w_id and c_d_id=$2 and c_id=$3",
+        ),
     ]
     for d in range(1, 11):
         dist = "s_dist_%02d" % d
@@ -312,8 +320,7 @@ def run_neworder_batch(cli: WireClient, rng, scale, d_id=None, c_id=None, ol_cnt
     # ---- batch1: BEGIN / 基础行 / 锁库存 / 按原序读 item+stock ----
     ops1 = [
         (S_BEGIN, []),
-        (S_SEL_W_TAX, [w_id]),
-        (S_SEL_CUST_NO, [w_id, d_id, c_id]),
+        (S_SEL_CUST_WH_JOIN, [w_id, d_id, c_id]),
         (S_SEL_D_TAX_NEXT, [w_id, d_id]),
         (S_UPD_D_NEXT, [w_id, d_id]),
         (S_SEL_D_NEXT, [w_id, d_id]),
@@ -332,12 +339,10 @@ def run_neworder_batch(cli: WireClient, rng, scale, d_id=None, c_id=None, ol_cnt
         return _fail(br1, "neworder b1 ")
 
     if not br1.results.get(1):
-        return False, "neworder: warehouse missing"
+        return False, "neworder: customer×warehouse join missing"
     if not br1.results.get(2):
-        return False, "neworder: customer missing"
-    if not br1.results.get(3):
         return False, "neworder: district missing"
-    o_id = _cell_int(br1.results, 5)
+    o_id = _cell_int(br1.results, 4)
     if o_id is None:
         return False, "neworder: district re-read empty"
     o_id = o_id - 1

@@ -735,6 +735,10 @@ void QlManager::run_load(const std::string &file_path, const std::string &tab_na
             ih->insert_entry(key.data(), rid, context ? context->txn_ : nullptr);
         }
     }
+    // 每表装载完成后（语句事务提交后）打检查点：装载数据全量落盘 + 推进 restart
+    // 起点。否则崩后恢复须全量重放装载 WAL（W=50 ~5.9GB）+ 全量重建索引，远超
+    // 90s 就绪预算；且堆头页/索引页从不主动落盘，两条腿都断则装载全丢。
+    if (context) context->checkpoint_after_commit_ = true;
 }
 
 // 题4：EXPLAIN ANALYZE —— 构建优化后计划树、计数执行、输出计划树（不输出结果集）

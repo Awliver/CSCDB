@@ -58,14 +58,14 @@ class DiskManager {
 
     void close_file(int fd);
 
-    int get_file_size(const std::string &file_name);
+    long get_file_size(const std::string &file_name);
 
     std::string get_file_name(int fd);
 
     int get_file_fd(const std::string &file_name);
 
     /*日志操作*/
-    int read_log(char *log_data, int size, int offset);
+    int read_log(char *log_data, int size, long offset);
 
     // P1：按逻辑偏移 pwrite；内部 ensure_log_capacity，正常运行期 fdatasync 不再碰 inode 大小
     void write_log(char *log_data, int size, long offset);

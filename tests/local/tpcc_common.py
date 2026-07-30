@@ -158,8 +158,23 @@ def start_rmdb(db_name, log_path=None):
     if os.path.isdir(dbpath):
         shutil.rmtree(dbpath)
     os.makedirs(dbpath, exist_ok=True)
-    stdout = open(log_path, "w") if log_path else subprocess.DEVNULL
-    proc = subprocess.Popen([RMDB, db_name], cwd=BUILD, stdout=stdout, stderr=subprocess.STDOUT)
+    # 默认保留服务器输出（[sql-error]/[sql-slow]/mvcc-stats 是 ERROR 归因的唯一线索）
+    if log_path is None:
+        log_path = dbpath + ".server.log"
+    stdout = open(log_path, "w")
+    # RMDB_ULIMIT_V_MB：以 RLIMIT_AS 模拟评测虚存上限（ulimit -v 型，看 VmSize 不是 RSS）
+    preexec = None
+    cap_mb = os.environ.get("RMDB_ULIMIT_V_MB")
+    if cap_mb:
+        import resource
+
+        cap = int(cap_mb) * 1024 * 1024
+
+        def preexec():
+            resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+
+    proc = subprocess.Popen([RMDB, db_name], cwd=BUILD, stdout=stdout, stderr=subprocess.STDOUT,
+                            preexec_fn=preexec)
     wait_ready(timeout=60.0)
     return proc, dbpath
 

@@ -42,6 +42,11 @@ class IndexScanExecutor : public AbstractExecutor {
     int eq_match_count_ = 0;            // 前 N 个索引列有 EQ 条件
     std::vector<char> eq_prefix_data_;  // EQ 前缀的拼接字节（按索引列顺序）
     bool range_exhausted_ = false;      // 标记"EQ 前缀已被超出"
+    // 当前是否定位在一条已通过全部过滤的行上。key 锚定模式下 scan_->is_end() 每次
+    // 调用都是一趟锁内全树重定位——is_end/nextTuple/循环条件若直接问 scan_，每行
+    // 要付 3 次重定位与 3 次 root_latch 共享锁（饱和负载下读流量饿死写者的主源）。
+    // position_to_match 返回后此标志即为真值来源，问它零成本。
+    bool positioned_ = false;
 
     // 决赛 index skip scan：索引首列无条件、第 2 列起有连续 EQ（Delivery 的
     // sum(ol_amount) where ol_o_id=? and ol_d_id=? 形态）——枚举首列 distinct 值，
@@ -296,7 +301,7 @@ class IndexScanExecutor : public AbstractExecutor {
     /* skip scan：当前子范围耗尽时推进到下一首列值，直到定位有效行或全部枚举完 */
     void skip_fill_valid() {
         while (skip_mode_ && !skip_done_ &&
-               (range_exhausted_ || scan_ == nullptr || scan_->is_end())) {
+               (range_exhausted_ || scan_ == nullptr || !positioned_)) {
             if (!skip_advance_first_col()) return;
             position_to_match();
         }
@@ -326,7 +331,10 @@ class IndexScanExecutor : public AbstractExecutor {
     }
     void position_to_match() {
         const bool ring_on = ReproRing::on() && tab_name_ == "new_orders";
-        while (!range_exhausted_ && !scan_->is_end()) {
+        positioned_ = false;
+        // 终止判定用 rid 哨兵（{-1,-1}），不问 scan_->is_end()：key 模式下那是
+        // 一趟额外的锁内全树重定位，rid_and_key/rid 本身已含同样的定位结果
+        while (!range_exhausted_) {
             // 与 SeqScan 一致：扫描中途表变脏时打开 MVCC 读
             if (!mvcc_on_ && context_ && context_->txn_mgr_ && context_->txn_) {
                 mvcc_on_ = context_->txn_mgr_->table_is_dirty(tab_name_);
@@ -342,7 +350,7 @@ class IndexScanExecutor : public AbstractExecutor {
             } else {
                 rid_ = scan_->rid();
             }
-            if (scan_->is_end() || rid_.page_no < 0 || rid_.slot_no < 0) {
+            if (rid_.page_no < 0 || rid_.slot_no < 0) {
                 break;
             }
 
@@ -372,6 +380,7 @@ class IndexScanExecutor : public AbstractExecutor {
             // Fast path：range 已精确，且无残余 cond，直接返回匹配（无需 MVCC 重建/SER 跟踪时）
             if (!mvcc_on_ && !ser_on_ && !need_eval_ && !need_prefix_check_) {
                 if (ring_on) ReproRing::push(ReproRing::FASTPATH, -1, 0, ReproRing::rid32(rid_.page_no, rid_.slot_no), 0);
+                positioned_ = true;
                 return;
             }
 
@@ -448,6 +457,7 @@ class IndexScanExecutor : public AbstractExecutor {
                                 ReproRing::rid32(rid_.page_no, rid_.slot_no),
                                 (mvcc_on_ ? 1 : 0) | (from_heap ? 2 : 0));
             }
+            positioned_ = true;
             return;
         }
     }
@@ -561,6 +571,7 @@ class IndexScanExecutor : public AbstractExecutor {
         analyze_conditions();
         compile_conds();
         range_exhausted_ = false;
+        positioned_ = false;   // 嵌套循环 join 会反复 beginTuple，须清上轮定位态
         ih_ = ih;
 
         if (skip_mode_) {
@@ -660,7 +671,7 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void nextTuple() override {
-        if (range_exhausted_ || scan_->is_end()) {
+        if (range_exhausted_ || !positioned_) {
             if (skip_mode_) skip_fill_valid();
             return;
         }
@@ -669,7 +680,7 @@ class IndexScanExecutor : public AbstractExecutor {
         if (skip_mode_) skip_fill_valid();
     }
 
-    bool is_end() const override { return range_exhausted_ || scan_->is_end(); }
+    bool is_end() const override { return !positioned_; }
 
     std::unique_ptr<RmRecord> Next() override {
         auto rec = std::make_unique<RmRecord>(table_record_size_);
