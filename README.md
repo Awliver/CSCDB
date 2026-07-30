@@ -21,7 +21,7 @@
 | 决赛成绩结构 | 正确性门禁 100/0 + NewOrder/min 排名（SI） |
 | 本机 Git 远端 | 仅 `gitlab`（教育平台） |
 
-主线文档：[`Docs/Competition/决赛赛题整理.md`](Docs/Competition/决赛赛题整理.md) · [`Docs/Todo/决赛准备Todo.md`](Docs/Todo/决赛准备Todo.md)
+主线文档：[`Docs/FinalCompetition/决赛赛题整理.md`](Docs/FinalCompetition/决赛赛题整理.md) · [`Docs/FinalCompetition/决赛准备Todo.md`](Docs/FinalCompetition/决赛准备Todo.md)
 
 ## 系统模块
 

@@ -31,6 +31,7 @@ class UpdateExecutor : public AbstractExecutor {
     int cached_page_no_ = -1;
     Page *cached_page_ = nullptr;
     char *cached_slots_ = nullptr;
+    bool cached_page_dirty_ = false;
     int record_size_ = 0;
 
    public:
@@ -49,10 +50,15 @@ class UpdateExecutor : public AbstractExecutor {
 
     void release_cached_page() {
         if (cached_page_) {
-            sm_manager_->get_bpm()->unpin_page(cached_page_->get_page_id(), true);
+            // MVCC UPDATE 只在版本链/overlay 中生成新版本，堆页由 COMMIT 物化时
+            // 另行标脏；自赋值连字节都不变。旧代码在这里无条件 dirty=true，
+            // 会把每次 Stock 锁定读到的随机堆页都变成脏页，W=50 时造成无意义
+            // cleaner/淘汰写盘，并可能把瞬时换页压力升级成语句 ERROR。
+            sm_manager_->get_bpm()->unpin_page(cached_page_->get_page_id(), cached_page_dirty_);
             cached_page_ = nullptr;
             cached_page_no_ = -1;
             cached_slots_ = nullptr;
+            cached_page_dirty_ = false;
         }
     }
 
@@ -63,6 +69,7 @@ class UpdateExecutor : public AbstractExecutor {
             cached_page_ = handle.page;
             cached_page_no_ = rid.page_no;
             cached_slots_ = handle.slots;
+            cached_page_dirty_ = false;
         }
         return cached_slots_ + rid.slot_no * record_size_;
     }
@@ -346,12 +353,15 @@ class UpdateExecutor : public AbstractExecutor {
 
             // 应用 SET 子句到 slot（非 MVCC 路径）
             if (!mvcc_path) {
-            for (const auto &set : set_clauses_) {
-                auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
-                                           [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
-                if (col_it == tab_.cols.end()) continue;
-                apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
-            }
+                for (const auto &set : set_clauses_) {
+                    auto col_it = std::find_if(tab_.cols.begin(), tab_.cols.end(),
+                                               [&](const ColMeta &c) { return c.name == set.lhs.col_name; });
+                    if (col_it == tab_.cols.end()) continue;
+                    apply_set_value(orig_rec.data(), slot + col_it->offset, set, *col_it);
+                }
+                // 非 MVCC 路径确有物理字节变化才标脏；SET col=col 仍完整走锁、冲突
+                // 检测、WAL/undo，但不制造一张内容未变的脏页。
+                if (memcmp(orig_rec.data(), slot, record_size_) != 0) cached_page_dirty_ = true;
             }
 
             // 题10 WAL：优先写增量差分；省不到 1/3 或段过多则回退全量镜像

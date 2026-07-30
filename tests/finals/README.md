@@ -1,6 +1,6 @@
 # 决赛本地测试入口
 
-此目录以 `Docs/Competition/决赛赛题整理.md` 为准：Wire v3、SI、50 仓、32 客户端、
+此目录以 `Docs/FinalCompetition/决赛赛题整理.md` 为准：Wire v3、SI、50 仓、32 客户端、
 30 秒预热、3×150 秒测量、45/43/4/4/4 事务混合。旧的 P2 / 专项脚本没有删除，
 仍保留在 `tests/run_tests.py`、`tests/framework/` 和 `test.local.bak/`，供定位单模块
 问题；它们不再是决赛提交前的主入口。
