@@ -33,6 +33,15 @@ class InternalError : public RMDBError {
     InternalError(const std::string &msg) : RMDBError(msg) {}
 };
 
+// 缓冲池瞬时无可用帧（fetch_page/new_page 重试 ~2s 后放弃）。与 InternalError 分开：
+// 这是可重试的资源压力而非逻辑错误——语句路径捕获后回滚事务并回 TRANSACTION_ABORT
+// 让驱动重试；若与其他异常一样落到 ERROR 终结，评测一条即判负（决赛 07-30 报告的
+// TPC-C measurement Server ERROR 属于此类悬崖）。
+class BufferPoolPressureError : public RMDBError {
+   public:
+    BufferPoolPressureError(const std::string &msg) : RMDBError(msg) {}
+};
+
 // PF errors
 class UnixError : public RMDBError {
    public:

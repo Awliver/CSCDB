@@ -261,7 +261,10 @@ RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
     PageId pid{fd_, page_no};
     Page* page = buffer_pool_manager_->fetch_page(pid);
     if (page == nullptr) {
-        throw PageNotExistError("", page_no);
+        // page_no 已过上方合法性校验，走到这里只可能是瞬时帧耗尽——与"页不存在"
+        // 语义不同，抛可重试压力异常（语句层转 TRANSACTION_ABORT，不落 ERROR 终结）
+        throw BufferPoolPressureError("RmFileHandle::fetch_page_handle: buffer pool full for page " +
+                                      std::to_string(page_no));
     }
     return RmPageHandle(&file_hdr_, page);
 }
@@ -274,7 +277,8 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
     PageId pid{fd_, INVALID_PAGE_ID};
     Page* page = buffer_pool_manager_->new_page(&pid);
     if (page == nullptr) {
-        throw InternalError("RmFileHandle::create_new_page_handle: new_page failed");
+        // 同 fetch_page_handle：瞬时帧耗尽，可重试
+        throw BufferPoolPressureError("RmFileHandle::create_new_page_handle: new_page failed");
     }
 
     RmPageHandle page_handle(&file_hdr_, page);

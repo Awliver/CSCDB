@@ -802,7 +802,9 @@ IxNodeHandle *IxIndexHandle::fetch_node(int page_no) const {
     }
     Page *page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
     if (page == nullptr) {
-        throw InternalError("IxIndexHandle::fetch_node: buffer pool full for page " + std::to_string(page_no));
+        // 瞬时帧耗尽（fetch_page ~2s 重试后放弃）：抛可重试压力异常，语句层转
+        // TRANSACTION_ABORT；此前抛 InternalError 会被映射成 ERROR 终结直接判负
+        throw BufferPoolPressureError("IxIndexHandle::fetch_node: buffer pool full for page " + std::to_string(page_no));
     }
     return new IxNodeHandle(file_hdr_, page);
 }
@@ -825,7 +827,8 @@ IxNodeHandle *IxIndexHandle::create_node() {
     // 从3开始分配page_no，第一次分配之后，new_page_id.page_no=3，file_hdr_.num_pages=4
     Page *page = buffer_pool_manager_->new_page(&new_page_id);
     if (page == nullptr) {
-        throw InternalError("IxIndexHandle::create_node: buffer pool full");
+        // 同 fetch_node：瞬时帧耗尽是可重试压力，不是逻辑错误
+        throw BufferPoolPressureError("IxIndexHandle::create_node: buffer pool full");
     }
     node = new IxNodeHandle(file_hdr_, page);
     return node;
