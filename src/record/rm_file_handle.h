@@ -82,16 +82,54 @@ class RmFileHandle {
             int pages_on_disk = (int)(fsize / PAGE_SIZE);
             if (pages_on_disk > file_hdr_.num_pages) file_hdr_.num_pages = pages_on_disk;
         }
+        // 头页派生字段自愈：nrpp/bitmap_size 是 record_size 的纯函数、建表后不变。
+        // 实测存在页 0 被当数据页写坏的形态（order_line bitmap_size 被 Bitmap::set
+        // 踩成负数 → get_slot 野指针 → 恢复 undo memcpy SIGSEGV），按公式重导出。
+        // record_size 本身坏则无从自愈，交由上层以 PageNotExist/元数据错误失败。
+        if (file_hdr_.record_size >= 1 && file_hdr_.record_size <= RM_MAX_RECORD_SIZE) {
+            const int nrpp = (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) /
+                             (1 + file_hdr_.record_size * BITMAP_WIDTH);
+            const int bms = (nrpp + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
+            if (file_hdr_.num_records_per_page != nrpp || file_hdr_.bitmap_size != bms) {
+                fprintf(stderr,
+                        "[rm-hdr-heal] fd=%d rec=%d nrpp %d->%d bitmap %d->%d\n", fd,
+                        file_hdr_.record_size, file_hdr_.num_records_per_page, nrpp,
+                        file_hdr_.bitmap_size, bms);
+                file_hdr_.num_records_per_page = nrpp;
+                file_hdr_.bitmap_size = bms;
+            }
+        }
+        // 空闲链头消毒：页 0/越界页混入链头会把后续插入导向头页（本次事故根因之一）
+        if (file_hdr_.first_free_page_no != RM_NO_PAGE &&
+            (file_hdr_.first_free_page_no < RM_FIRST_RECORD_PAGE ||
+             file_hdr_.first_free_page_no >= file_hdr_.num_pages)) {
+            fprintf(stderr, "[rm-hdr-heal] fd=%d first_free %d->-1\n", fd,
+                    file_hdr_.first_free_page_no);
+            file_hdr_.first_free_page_no = RM_NO_PAGE;
+        }
         // disk_manager管理的fd对应的文件中，设置从file_hdr_.num_pages开始分配page_no
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
     }
 
     RmFileHdr& get_file_hdr_mut() { return file_hdr_; }
     RmFileHdr get_file_hdr() { return file_hdr_; }
+
+    /* 空闲链指针消毒：next_free_page_no 只有在页曾正规入链时才可信。恢复 redo 在
+     * 全零盘面上重建整页时该字段是 0（而非 -1），一旦被弹上链头，后续插入会直写
+     * 头页（页 0）。凡从页头读出准备写回 first_free 的值都过这一道。 */
+    int sanitize_free_link(int v) const {
+        return (v >= RM_FIRST_RECORD_PAGE && v < file_hdr_.num_pages) ? v : RM_NO_PAGE;
+    }
     int GetFd() { return fd_; }
 
     /* 判断指定位置上是否已经存在一条记录，通过Bitmap来判断 */
     bool is_record(const Rid &rid) const {
+        // 头页/越界 rid（历史损坏的 WAL/索引里可能残留）一律视作"无此记录"，
+        // 不能让 fetch 的护栏异常炸穿恢复/扫描路径
+        if (rid.page_no < RM_FIRST_RECORD_PAGE || rid.page_no >= file_hdr_.num_pages ||
+            rid.slot_no < 0 || rid.slot_no >= file_hdr_.num_records_per_page) {
+            return false;
+        }
         RmPageHandle page_handle = fetch_page_handle(rid.page_no);
         bool exists = Bitmap::is_set(page_handle.bitmap, rid.slot_no);
         buffer_pool_manager_->unpin_page({fd_, rid.page_no}, false);

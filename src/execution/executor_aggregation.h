@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
 #include <climits>
 #include <cstring>
 #include <map>
@@ -331,7 +332,17 @@ void AggExecutor::beginTuple() {
     group_order_.clear();
     done_ = false;
 
-    for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+    prev_->beginTuple();
+    // MIN 索引早停：无分组、唯一聚合是 MIN(col)、无 HAVING，且子执行器保证输出按
+    // col 升序（见 IndexScanExecutor::sorted_asc_on）——首个非 NULL 值即全局最小，
+    // 不必耗尽子扫描。Delivery 的 min(no_o_id) 在热点长队列上从 O(队列) 降为 O(1)，
+    // 这是 07-31 定量分析里 ~90% 线程时间的来源（Docs/Optimize/14）。
+    static const bool min_es_off = std::getenv("RMDB_NO_MIN_EARLYSTOP") != nullptr;  // A/B 归因开关
+    const bool min_early_stop_ = !min_es_off && plain_agg_ && agg_exprs_.size() == 1 &&
+                                 agg_exprs_[0].type == ast::AGG_MIN && !agg_exprs_[0].is_star &&
+                                 having_conds_.empty() && prev_->sorted_asc_on(agg_exprs_[0].col);
+
+    for (; !prev_->is_end(); prev_->nextTuple()) {
         auto rec = prev_->Next();
         if (!rec) continue;
 
@@ -421,6 +432,9 @@ void AggExecutor::beginTuple() {
                 }
             }
         }
+
+        // NULL 行不置 has_value，须继续找首个非 NULL 值才能停
+        if (min_early_stop_ && states[0].has_value) break;
     }
 
     if (groups_.empty() && plain_agg_) {

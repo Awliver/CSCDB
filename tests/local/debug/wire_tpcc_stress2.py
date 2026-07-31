@@ -17,9 +17,14 @@ SCHEMAS = [
  "create table stock (s_i_id int, s_w_id int, s_quantity int, s_dist_01 char(24), s_dist_02 char(24), s_dist_03 char(24), s_dist_04 char(24), s_dist_05 char(24), s_dist_06 char(24), s_dist_07 char(24), s_dist_08 char(24), s_dist_09 char(24), s_dist_10 char(24), s_ytd float, s_order_cnt int, s_remote_cnt int, s_data char(50));",
 ]
 INDEXES = [
+ # 官方 10 索引全量（决赛 PDF §3.5；此前缺 #4 c_last 与 #8 o_c_id 两个：
+ # 按姓 Payment/OrderStatus 最近单退化全表扫 p50 400ms，本地性能结论全部失真——07-30 定量分析实测）
  "create index warehouse (w_id);", "create index district (d_w_id, d_id);",
- "create index customer (c_w_id, c_d_id, c_id);", "create index item (i_id);",
+ "create index customer (c_w_id, c_d_id, c_id);",
+ "create index customer (c_w_id, c_d_id, c_last, c_id);",
+ "create index item (i_id);",
  "create index stock (s_w_id, s_i_id);", "create index orders (o_w_id, o_d_id, o_id);",
+ "create index orders (o_w_id, o_d_id, o_c_id, o_id);",
  "create index new_orders (no_w_id, no_d_id, no_o_id);",
  "create index order_line (ol_w_id, ol_d_id, ol_o_id, ol_number);",
 ]
@@ -40,6 +45,7 @@ def bootstrap():
 
 STOP = False
 stats = {'ok':0, 'abort':0, 'err':0, 'transport':0}
+LAT = {}   # (fam, phase) -> [seconds]（定量分析：家族×批次延迟分布）
 FAMS = ['neworder', 'payment', 'delivery', 'orderstatus', 'stocklevel']
 for _f in FAMS:
     stats[_f + '_ok'] = 0
@@ -47,6 +53,30 @@ for _f in FAMS:
     stats[_f + '_err'] = 0
 slock = threading.Lock()
 errs = []
+
+
+def timed_batch(c, fam, phase, ops, tid=None):
+    """exec_batch + 延迟采样（含 >5s SLOW 告警）。批延迟按 (家族,批次) 归档。"""
+    t0 = time.time()
+    r = c.exec_batch(ops)
+    dt = time.time() - t0
+    with slock:
+        LAT.setdefault((fam, phase), []).append(dt)
+        if dt > 5:
+            errs.append(f'SLOW {dt:.1f}s tid={tid} {fam}/{phase} ops={[o[0] for o in ops]}')
+            print(f'!! SLOW batch {dt:.1f}s tid={tid} {fam}/{phase}', flush=True)
+    return r
+
+
+def lat_report():
+    for (fam, phase), xs in sorted(LAT.items()):
+        xs = sorted(xs)
+        n = len(xs)
+        if not n:
+            continue
+        p = lambda q: xs[min(n - 1, int(n * q))] * 1000
+        print(f"LAT {fam}/{phase} n={n} p50={p(0.50):.1f}ms p95={p(0.95):.1f}ms "
+              f"p99={p(0.99):.1f}ms max={xs[-1]*1000:.0f}ms", flush=True)
 
 
 def bump(fam, status, diag=None):
@@ -232,8 +262,8 @@ def worker(tid):
                        (2, [])]
             elif kind < 0.95:  # Delivery（词典形态：一笔覆盖全部 10 个 district，三段 batch）
                 fam = 'delivery'
-                r = c.exec_batch([(1, [])] +
-                                 [(16, [('i', dd), ('i', w)]) for dd in range(1, 11)])
+                r = timed_batch(c, fam, 'b1_min10', [(1, [])] +
+                                [(16, [('i', dd), ('i', w)]) for dd in range(1, 11)], tid)
                 if r['status'] != 0:
                     with slock:
                         bump(fam, r['status'])
@@ -255,7 +285,7 @@ def worker(tid):
                              (24, [('s', '2026-07-28 09:30:00'), ('i', mo), ('i', dd), ('i', w)])]
                     sum_idx[dd] = len(ops2); ops2.append((25, [('i', mo), ('i', dd)]))
                     cid_idx[dd] = len(ops2); ops2.append((26, [('i', mo), ('i', dd), ('i', w)]))
-                r2 = c.exec_batch(ops2)
+                r2 = timed_batch(c, fam, 'b2_upd', ops2, tid)
                 if r2['status'] != 0:
                     with slock:
                         bump(fam, r2['status'])
@@ -271,7 +301,7 @@ def worker(tid):
                 ops = ops3
             elif kind < 0.98:  # OrderStatus：客户 → 最近订单(ORDER BY DESC) → 明细
                 fam = 'orderstatus'
-                r = c.exec_batch([(41, [('i', w), ('i', d), ('i', cust)])])
+                r = timed_batch(c, fam, 'b1_cust', [(41, [('i', w), ('i', d), ('i', cust)])], tid)
                 latest = None
                 if r['status'] == 0 and r['tail']:
                     _, cnt = struct.unpack_from('>HI', r['tail'], 0)
@@ -282,7 +312,7 @@ def worker(tid):
                     ops = [(42, [('i', w), ('i', d), ('i', latest)])] + ops
             else:  # StockLevel：next order → 官方 DISTINCT 连接（双括号变体混跑）
                 fam = 'stocklevel'
-                r = c.exec_batch([(3, [('i', d), ('i', w)])])
+                r = timed_batch(c, fam, 'b1_dnext', [(3, [('i', d), ('i', w)])], tid)
                 no = None
                 if r['status'] == 0 and r['tail']:
                     _, cnt = struct.unpack_from('>HI', r['tail'], 0)
@@ -293,13 +323,7 @@ def worker(tid):
                 sid = 43 if rng.random() < 0.5 else 44
                 ops = [(sid, [('i', w), ('i', d), ('i', no), ('i', no - 20), ('i', w), ('i', rng.randint(10, 20))])]
             try:
-                _t0 = time.time()
-                r = c.exec_batch(ops)
-                _dt = time.time() - _t0
-                if _dt > 5:
-                    with slock:
-                        errs.append(f'SLOW {_dt:.1f}s tid={tid} ops={[o[0] for o in ops]}')
-                        print(f'!! SLOW batch {_dt:.1f}s tid={tid} stmts={[o[0] for o in ops]}', flush=True)
+                r = timed_batch(c, fam, 'tail', ops, tid)
                 with slock:
                     bump(fam, r['status'], r.get('diag'))
             except Exception as e:
@@ -333,4 +357,5 @@ if __name__ == '__main__':
     print('FINAL:', {k: stats[k] for k in ('ok', 'abort', 'err', 'transport')})
     for f in FAMS:
         print(f"  {f}: ok={stats[f+'_ok']} abort={stats[f+'_abort']} err={stats[f+'_err']}")
+    lat_report()
     for e in errs: print('ERR:', e)

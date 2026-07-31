@@ -90,7 +90,8 @@ class Page {
     /** 修改版本号（分片 unique latch 下于 unpin(dirty=true) 时自增）。cleaner 拷贝快照
      *  锁外写盘后，仅当版本未变才允许清 is_dirty_——否则写盘期间新到的修改会被误标为
      *  已落盘（脏标丢失 → 页被当干净页淘汰 → 已提交更新静默丢失）。 */
-    uint32_t mod_ver_ = 0;
+    // unpin 快路径（分片共享锁）下并发自增，须原子；cleaner 的快照比对读它
+    std::atomic<uint32_t> mod_ver_{0};
 
     /** The pin count of this page.
      *  必须原子：fetch_page 命中快路径在【共享】分片锁下自增 pin，多个读者并发命中同一页时

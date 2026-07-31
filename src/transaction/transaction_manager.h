@@ -198,6 +198,9 @@ public:
     void inc_explicit() { active_explicit_count_++; }
     /* 该表是否被 MVCC 写过（读时才需查版本链，未脏表直接读堆，保持非事务负载性能） */
     bool table_is_dirty(const std::string &tab);
+
+    /* 调试取证（CHAINSTATE 命令）：向 stderr 打印 (tab,rid) 的链/位图/deferred 现场 */
+    void debug_chain_state(const std::string &tab, const Rid &rid);
     /* 单连接 SI 快路径【已禁用】：判定条件（"当前无并发"）在另一连接 begin 的瞬间失效，
      * 但本事务已物理落堆/落索引的写没有版本链保护，后来的事务会直接看到未提交状态
      * （OJ 'dirty read and abort restoration' 场景实测：s2 在 s1 首写之后 begin，

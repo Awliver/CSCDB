@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
+#include <atomic>
+#include <cstdlib>
 
 void IxScan::release_cached() const {
     if (cached_node_) {
@@ -88,11 +90,61 @@ bool IxScan::locate_key_mode() const {
     const IxFileHdr *fh = ih_->get_fhdr();
     Iid pos;
 
+    // 叶级续扫快路径：调用方持 root_latch_（共享），结构写者全部持排它——本次持锁
+    // 期间整棵树冻结。若上次返回的锚定项仍在原位（key+rid 双验证，防插入位移/合并
+    // 搬迁/删后重插同槽），其叶内/跨叶后继即为下一项，免去整树重下降。07-31 profile：
+    // 每行从根重下降的 find_leaf_page 占 53% CPU、其 BPM 往返的分片锁 futex 占 12%。
+    // 验证失败零成本回落慢路径，正确性包络不变。
+    // 默认关闭（RMDB_SCAN_FASTPATH=1 显式开启）：07-31 在 churn 后的老库上实测
+    // gap-EQ 宽扫描 0.1s 返回空（同查询关闭后正确返回），疑与 MVCC 残留态（墓碑/
+    // 陈旧索引项）交互提前终止；全新表 5 万行×715 查询与并发搅动 37 轮均无法复现，
+    // 归因未收口前不冒结果正确性的险。收益大头在 MIN 早停 + unpin 去写锁。
+    static const bool fastpath_on = std::getenv("RMDB_SCAN_FASTPATH") != nullptr;
+    if (fastpath_on && has_anchor_ && cached_node_ && iid_.page_no == cached_page_no_ &&
+        page_no_valid(cached_page_no_) && cached_node_->is_leaf_page()) {
+        cached_size_ = cached_node_->get_size();
+        const int s = iid_.slot_no;
+        if (s >= 0 && s < cached_size_ &&
+            ix_compare(cached_node_->get_key(s), anchor_key_.data(),
+                       fh->col_types_, fh->col_lens_) == 0) {
+            const Rid *r = cached_node_->get_rid(s);
+            if (r->page_no == anchor_rid_.page_no && r->slot_no == anchor_rid_.slot_no) {
+                bool ok = true;
+                self->iid_.slot_no = s + 1;
+                if (self->iid_.slot_no >= cached_size_) {
+                    advance_to_next_leaf();          // 跨叶（尾叶则置 end_）
+                    if (!page_no_valid(iid_.page_no)) return false;
+                    ensure_cached(iid_.page_no);
+                    // 空叶/失效叶不该在冻结树上出现，保守回落慢路径
+                    if (cached_node_ == nullptr || cached_size_ <= 0 ||
+                        iid_.slot_no >= cached_size_ || !cached_node_->is_leaf_page()) {
+                        ok = false;
+                    }
+                }
+                if (ok) {
+                    int c = ix_compare(cached_node_->get_key(iid_.slot_no), end_key_.data(),
+                                       fh->col_types_, fh->col_lens_);
+                    if (c > 0 || (c == 0 && !end_inclusive_)) return false;   // 越过范围尾
+                    return true;
+                }
+                // 快路径失效：回落慢路径重定位（iid_ 会被重算，无需恢复）
+            }
+        }
+    }
+
     // lower/upper_bound 依赖内部结点分隔键。并发 delete/merge 后若某一级分隔键
     // 短暂陈旧，树下降可能落到 anchor 之前的叶；只把位置钳到 start_key 仍会在
     // 下一轮重新返回已经消费过的行。Sort 会把这种回环持续物化到内存，最终以
     // bad_alloc/ERROR 结束。沿叶链向前找严格大于 anchor 的第一项，作为进度兜底。
     auto seek_strictly_after_anchor = [&]() -> bool {
+        // 定量诊断：兜底触发频度（高频 = 重定位倒退常态化，是扫描成本热点信号）
+        {
+            static std::atomic<uint64_t> seek_cnt{0};
+            uint64_t n = seek_cnt.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0xFFF) == 0) {
+                fprintf(stderr, "[anchor-seek] fallback count=%llu\n", (unsigned long long)n);
+            }
+        }
         pos = ih_->upper_bound_nolock(anchor_key_.data());
         size_t leaf_hops = 0;
         while (true) {
