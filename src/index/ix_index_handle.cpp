@@ -11,6 +11,9 @@ See the Mulan PSL v2 for more details. */
 #include "ix_index_handle.h"
 
 #include <unistd.h>
+#include <algorithm>
+#include <map>
+#include <set>
 
 #include "ix_scan.h"
 
@@ -168,9 +171,19 @@ IxIndexHandle::IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffe
     file_hdr_->deserialize(buf);
     delete[] buf;
     
-    // disk_manager管理的fd对应的文件中，设置从file_hdr_->num_pages开始分配page_no
-    int now_page_no = disk_manager_->get_fd2pageno(fd);
-    disk_manager_->set_fd2pageno(fd, now_page_no + 1);
+    // 分配计数器必须从【文件真实页数】起步（与 RmFileHandle 同约定）。
+    // 旧实现是 get()+1：计数器初值 0 时被设成 1——凡本次打开不经 bulk_load
+    // （bulk 末尾会纠正为 num_pages_，如检查点快速恢复路径），运行期首次分裂
+    // create_node→allocate_page 就发出页 1（叶链哨兵）/页 2、3（现存叶）当"新页"，
+    // 现存页被清空改装成分裂新叶 → 双亲引用、叶链孤儿段（树可达/链不可达，宽扫描
+    // 系统性漏行）、幽灵项、prev/next 盖章式扩散。2026-07-31 paranoid 日志实锤：
+    // `[ix-op] split node=882 new=2`。头页 num_pages_ 可能因崩溃未刷而陈旧，
+    // 与磁盘实际文件大小取 max 兜底；计数器只上调不下调。
+    int pages_on_disk = (int)(disk_manager_->get_file_size(disk_manager_->get_file_name(fd)) / PAGE_SIZE);
+    int start = std::max(file_hdr_->num_pages_, pages_on_disk);
+    if (disk_manager_->get_fd2pageno(fd) < start) {
+        disk_manager_->set_fd2pageno(fd, start);
+    }
 }
 
 IxIndexHandle::~IxIndexHandle() {
@@ -239,6 +252,12 @@ bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transac
  */
 IxNodeHandle *IxIndexHandle::split(IxNodeHandle *node) {
     IxNodeHandle *new_node = create_node();
+    static const bool paranoid = std::getenv("RMDB_IX_PARANOID") != nullptr;
+    if (paranoid) {
+        fprintf(stderr, "[ix-op] split fd=%d node=%d new=%d node_parent=%d leaf=%d\n", fd_,
+                node->get_page_no(), new_node->get_page_no(), node->get_parent_page_no(),
+                (int)node->is_leaf_page());
+    }
     new_node->page_hdr->is_leaf = node->is_leaf_page();
     new_node->page_hdr->parent = node->get_parent_page_no();
     new_node->page_hdr->num_key = 0;
@@ -323,6 +342,20 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
     // 2. 非根：找到 old_node 在 parent 中的位置，把 (key, new_node) 插在它后一格
     IxNodeHandle *parent = fetch_node(old_node->get_parent_page_no());
     int old_idx = parent->find_child(old_node);
+    if (old_idx < 0) {
+        // parent 指针陈旧/被踩且分裂已过半（new_node 已链入叶链）：不能中止，
+        // 退而按 key 序找本 parent 内的插入位，至少保持该节点有序。misplaced
+        // 分裂曾产生"链上可见、树下降不可达"的幽灵项（点查无、宽扫描有）。
+        int pos = 0;
+        while (pos < parent->get_size() &&
+               ix_compare(parent->get_key(pos), key, file_hdr_->col_types_,
+                          file_hdr_->col_lens_) <= 0)
+            pos++;
+        old_idx = pos - 1;
+        fprintf(stderr, "[ix-guard] insert_into_parent: stale parent=%d for child=%d, "
+                        "key-ordered fallback pos=%d\n",
+                parent->get_page_no(), old_node->get_page_no(), pos);
+    }
     parent->insert_pair(old_idx + 1, key, Rid{new_node->get_page_no(), -1});
     new_node->set_parent_page_no(parent->get_page_no());
 
@@ -422,6 +455,8 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
             delete leaf;
         }
     }
+    static const bool paranoid = std::getenv("RMDB_IX_PARANOID") != nullptr;
+    if (paranoid) paranoid_verify(leaf_page, "insert");
     return leaf_page;
 }
 
@@ -451,6 +486,7 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
         maintain_parent(leaf);
     }
 
+    page_id_t leaf_page_for_verify = leaf->get_page_no();
     bool node_deleted = coalesce_or_redistribute(leaf, transaction);
 
     if (node_deleted) {
@@ -460,6 +496,8 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
         buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
         delete leaf;
     }
+    static const bool paranoid = std::getenv("RMDB_IX_PARANOID") != nullptr;
+    if (paranoid && !node_deleted) paranoid_verify(leaf_page_for_verify, "delete");
     return true;
 }
 
@@ -488,8 +526,39 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle *node, Transaction *tr
     // 3. 找 parent + sibling（优先前驱）
     IxNodeHandle *parent = fetch_node(node->get_parent_page_no());
     int idx = parent->find_child(node);
+    if (idx < 0) {
+        // parent 指针陈旧/被踩：拒绝本次调整（欠填叶合法），绝不能拿垃圾 idx 选兄弟
+        buffer_pool_manager_->unpin_page(parent->get_page_id(), false);
+        delete parent;
+        return false;
+    }
     int sibling_idx = (idx == 0) ? 1 : idx - 1;
+    if (sibling_idx >= parent->get_size()) {   // 单孩子 parent（瞬态/受损）：无兄弟可调
+        buffer_pool_manager_->unpin_page(parent->get_page_id(), false);
+        delete parent;
+        return false;
+    }
     IxNodeHandle *sibling = fetch_node(parent->value_at(sibling_idx));
+
+    // 叶合并/重分配前的相邻性验证：tree 序上的兄弟必须同时是叶链上的直接邻居。
+    // 不满足即结构已分叉（find_child 陈旧、页头被踩等），此时任何缝合都会把
+    // 中间段摘出链——宁可留欠填叶也不动链。
+    if (node->is_leaf_page()) {
+        IxNodeHandle *l = (idx == 0) ? node : sibling;
+        IxNodeHandle *r = (idx == 0) ? sibling : node;
+        if (l->get_next_leaf() != r->get_page_no() ||
+            r->get_prev_leaf() != l->get_page_no()) {
+            fprintf(stderr,
+                    "[ix-guard] leaf adjacency violation: left=%d(next=%d) right=%d(prev=%d), "
+                    "refuse coalesce/redistribute\n",
+                    l->get_page_no(), l->get_next_leaf(), r->get_page_no(), r->get_prev_leaf());
+            buffer_pool_manager_->unpin_page(sibling->get_page_id(), false);
+            delete sibling;
+            buffer_pool_manager_->unpin_page(parent->get_page_id(), false);
+            delete parent;
+            return false;
+        }
+    }
 
     // 4. 重分配 vs 合并
     if (node->get_size() + sibling->get_size() >= 2 * node->get_min_size()) {
@@ -571,6 +640,12 @@ bool IxIndexHandle::adjust_root(IxNodeHandle *old_root_node) {
  * 注意更新parent结点的相关kv对
  */
 void IxIndexHandle::redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node, IxNodeHandle *parent, int index) {
+    static const bool paranoid = std::getenv("RMDB_IX_PARANOID") != nullptr;
+    if (paranoid) {
+        fprintf(stderr, "[ix-op] redis fd=%d node=%d nb=%d parent=%d idx=%d leaf=%d\n", fd_,
+                node->get_page_no(), neighbor_node->get_page_no(), parent->get_page_no(), index,
+                (int)node->is_leaf_page());
+    }
     if (index == 0) {
         // node 在 parent 的索引 0，neighbor 在索引 1（neighbor 是后继）
         // 把 neighbor 第一个 (key, rid) 移到 node 末尾
@@ -623,6 +698,12 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
     IxNodeHandle *right = *node;
     int left_size = left->get_size();
     int right_size = right->get_size();
+    static const bool paranoid = std::getenv("RMDB_IX_PARANOID") != nullptr;
+    if (paranoid) {
+        fprintf(stderr, "[ix-op] coalesce fd=%d left=%d right=%d parent=%d idx=%d leaf=%d\n", fd_,
+                left->get_page_no(), right->get_page_no(), (*parent)->get_page_no(), index,
+                (int)left->is_leaf_page());
+    }
 
     // 2. 把 right 的所有 (key, rid) 追加到 left 末尾
     if (right_size > 0) {
@@ -821,6 +902,13 @@ IxNodeHandle *IxIndexHandle::fetch_node(int page_no) const {
  */
 IxNodeHandle *IxIndexHandle::create_node() {
     IxNodeHandle *node;
+    // 页号冲突纵深防线：分配计数器低于已知页数=即将把现存页当新页发出（构造函数
+    // 已按文件大小初始化,此处兜住运行期任何路径把计数器改小的意外）
+    if (disk_manager_->get_fd2pageno(fd_) < file_hdr_->num_pages_) {
+        fprintf(stderr, "[ix-guard] fd=%d fd2pageno=%d < num_pages=%d, clamp (collision averted)\n",
+                fd_, (int)disk_manager_->get_fd2pageno(fd_), file_hdr_->num_pages_);
+        disk_manager_->set_fd2pageno(fd_, file_hdr_->num_pages_);
+    }
     file_hdr_->num_pages_++;
 
     PageId new_page_id = {.fd = fd_, .page_no = INVALID_PAGE_ID};
@@ -845,6 +933,10 @@ void IxIndexHandle::maintain_parent(IxNodeHandle *node) {
         // Load its parent
         IxNodeHandle *parent = fetch_node(curr->get_parent_page_no());
         int rank = parent->find_child(curr);
+        if (rank < 0) {   // parent 指针陈旧/被踩：get_key(-1) 是越界写，立即止损
+            buffer_pool_manager_->unpin_page(parent->get_page_id(), false);
+            break;
+        }
         char *parent_key = parent->get_key(rank);
         char *child_first_key = curr->get_key(0);
         if (memcmp(parent_key, child_first_key, file_hdr_->col_tot_len_) == 0) {
@@ -1029,4 +1121,162 @@ void IxIndexHandle::bulk_load(long n, const std::function<void(char *key_out, Ri
     disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, pagebuf.data(), file_hdr_->tot_len_);
     disk_manager_->set_fd2pageno(fd_, file_hdr_->num_pages_);
     fdatasync(fd_);
+}
+
+void IxIndexHandle::debug_chain_walk(FILE *out) {
+    std::shared_lock<FairSharedMutex> lock(root_latch_);
+    fprintf(out, "[chainwalk] fd=%d first_leaf=%d last_leaf=%d num_pages=%d\n", fd_,
+            file_hdr_->first_leaf_, file_hdr_->last_leaf_, file_hdr_->num_pages_);
+    std::map<std::pair<int, int>, long> pref_cnt;
+    std::vector<char> prev_last;
+    int pg = file_hdr_->first_leaf_;
+    long leaves = 0, entries = 0, violations = 0;
+    while (pg != IX_LEAF_HEADER_PAGE && pg > IX_NO_PAGE && pg < file_hdr_->num_pages_ &&
+           leaves <= (long)file_hdr_->num_pages_) {
+        IxNodeHandle *n = fetch_node(pg);
+        if (!n->is_leaf_page()) {
+            fprintf(out, "[chainwalk] leaf=%d NOT-LEAF (chain corrupt)\n", pg);
+            buffer_pool_manager_->unpin_page(n->get_page_id(), false);
+            delete n;
+            break;
+        }
+        int sz = n->get_size();
+        for (int i = 0; i < sz; i++) {
+            const char *k = n->get_key(i);
+            if (file_hdr_->col_tot_len_ >= 8) {
+                int a, b;
+                memcpy(&a, k, 4);
+                memcpy(&b, k + 4, 4);
+                pref_cnt[{a, b}]++;
+            }
+        }
+        if (sz > 0 && !prev_last.empty() &&
+            ix_compare(n->get_key(0), prev_last.data(), file_hdr_->col_types_,
+                       file_hdr_->col_lens_) < 0) {
+            violations++;
+            fprintf(out, "[chainwalk] ORDER-VIOLATION at leaf=%d (first key < prev leaf last)\n", pg);
+        }
+        if (sz > 0) prev_last.assign(n->get_key(sz - 1), n->get_key(sz - 1) + file_hdr_->col_tot_len_);
+        leaves++;
+        entries += sz;
+        int next = n->get_next_leaf();
+        buffer_pool_manager_->unpin_page(n->get_page_id(), false);
+        delete n;
+        pg = next;
+    }
+    fprintf(out, "[chainwalk] leaves=%ld entries=%ld violations=%ld end_pg=%d (expect %d)\n",
+            leaves, entries, violations, pg, IX_LEAF_HEADER_PAGE);
+    for (auto &kv : pref_cnt) {
+        fprintf(out, "[chainwalk] pref=(%d,%d) n=%ld\n", kv.first.first, kv.first.second,
+                kv.second);
+    }
+    fflush(out);
+}
+
+void IxIndexHandle::debug_tree_walk(FILE *out) {
+    std::shared_lock<FairSharedMutex> lock(root_latch_);
+    // 先收集链上叶集合
+    std::set<int> on_chain;
+    {
+        int pg = file_hdr_->first_leaf_;
+        long hops = 0;
+        while (pg != IX_LEAF_HEADER_PAGE && pg > IX_NO_PAGE && pg < file_hdr_->num_pages_ &&
+               hops++ <= (long)file_hdr_->num_pages_) {
+            on_chain.insert(pg);
+            IxNodeHandle *n = fetch_node(pg);
+            int next = n->is_leaf_page() ? n->get_next_leaf() : IX_NO_PAGE;
+            buffer_pool_manager_->unpin_page(n->get_page_id(), false);
+            delete n;
+            pg = next;
+        }
+    }
+    // 树 DFS（显式栈）
+    fprintf(out, "[treewalk] root=%d chain_leaves=%zu\n", file_hdr_->root_page_, on_chain.size());
+    std::vector<int> stack{file_hdr_->root_page_};
+    long tree_leaves = 0, orphans = 0, tree_entries = 0;
+    int prev_leaf_seen = -1;
+    while (!stack.empty()) {
+        int pg = stack.back();
+        stack.pop_back();
+        if (pg <= IX_NO_PAGE || pg >= file_hdr_->num_pages_) continue;
+        IxNodeHandle *n = fetch_node(pg);
+        if (n->is_leaf_page()) {
+            tree_leaves++;
+            int sz = n->get_size();
+            tree_entries += sz;
+            bool orphan = on_chain.find(pg) == on_chain.end();
+            if (orphan) orphans++;
+            auto lastint = [&](int i) {
+                int v;
+                memcpy(&v, n->get_key(i) + file_hdr_->col_tot_len_ - 4, 4);
+                return v;
+            };
+            auto prevint = [&](int i) { int v; memcpy(&v, n->get_key(i), 4); return v; };
+            auto dint = [&](int i) { int v; memcpy(&v, n->get_key(i) + 4, 4); return v; };
+            if (orphan) {
+                fprintf(out,
+                        "[treewalk] ORPHAN leaf=%d size=%d prev=%d next=%d "
+                        "first=(%d,%d,%d) last=(%d,%d,%d) after_treeleaf=%d\n",
+                        pg, sz, n->get_prev_leaf(), n->get_next_leaf(),
+                        sz ? prevint(0) : -1, sz ? dint(0) : -1, sz ? lastint(0) : -1,
+                        sz ? prevint(sz - 1) : -1, sz ? dint(sz - 1) : -1,
+                        sz ? lastint(sz - 1) : -1, prev_leaf_seen);
+            }
+            prev_leaf_seen = pg;
+        } else {
+            // 逆序压栈保持树序
+            for (int i = n->get_size() - 1; i >= 0; i--) stack.push_back(n->value_at(i));
+        }
+        buffer_pool_manager_->unpin_page(n->get_page_id(), false);
+        delete n;
+    }
+    fprintf(out, "[treewalk] tree_leaves=%ld orphans=%ld tree_entries=%ld (chain had %zu)\n",
+            tree_leaves, orphans, tree_entries, on_chain.size());
+    fflush(out);
+}
+
+void IxIndexHandle::paranoid_verify(page_id_t leaf_page, const char *op) {
+    // 调用方须持 root_latch_（结构写者排它下调用，树处于静止一致点）
+    if (leaf_page <= IX_NO_PAGE || leaf_page >= file_hdr_->num_pages_) return;
+    IxNodeHandle *cur = fetch_node(leaf_page);
+    // 叶邻接一致性
+    if (cur->is_leaf_page()) {
+        page_id_t nx = cur->get_next_leaf();
+        if (nx > IX_NO_PAGE && nx != IX_LEAF_HEADER_PAGE && nx < file_hdr_->num_pages_) {
+            IxNodeHandle *n = fetch_node(nx);
+            if (n->get_prev_leaf() != leaf_page) {
+                fprintf(stderr, "[ix-paranoid] after %s: leaf=%d next=%d but next.prev=%d\n",
+                        op, leaf_page, nx, n->get_prev_leaf());
+            }
+            buffer_pool_manager_->unpin_page(n->get_page_id(), false);
+            delete n;
+        }
+    }
+    // 父链完整性
+    int depth = 0;
+    while (cur->get_parent_page_no() != IX_NO_PAGE && depth++ < 12) {
+        page_id_t pp = cur->get_parent_page_no();
+        if (pp <= IX_NO_PAGE || pp >= file_hdr_->num_pages_) {
+            fprintf(stderr, "[ix-paranoid] after %s: node=%d parent=%d OUT-OF-RANGE\n", op,
+                    cur->get_page_no(), pp);
+            break;
+        }
+        IxNodeHandle *par = fetch_node(pp);
+        bool found = false;
+        for (int i = 0; i < par->get_size(); i++) {
+            if (par->value_at(i) == cur->get_page_no()) { found = true; break; }
+        }
+        if (!found) {
+            fprintf(stderr, "[ix-paranoid] after %s: node=%d NOT-IN parent=%d (size=%d)\n", op,
+                    cur->get_page_no(), pp, par->get_size());
+            buffer_pool_manager_->unpin_page(par->get_page_id(), false);
+            delete par;
+            break;
+        }
+        buffer_pool_manager_->unpin_page(cur->get_page_id(), false);
+        delete cur;
+        cur = par;
+    }
+    buffer_pool_manager_->unpin_page(cur->get_page_id(), false);
+    delete cur;
 }

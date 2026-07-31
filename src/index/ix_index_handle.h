@@ -156,7 +156,15 @@ class IxNodeHandle {
                 break;
             }
         }
-        assert(rid_idx < page_hdr->num_key);
+        // Release 版 assert 是空操作——child 的 parent 指针陈旧/被踩时这里若返回
+        // num_key，调用方 value_at(idx±1) 会取到【任意页】当兄弟，coalesce 把不相邻
+        // 叶缝合 = 叶链整段摘除（2026-07-31 W=10 实测 2.5 万条目孤儿段，宽扫描漏行
+        // 而点查可见）。返回 -1 让调用方拒绝本次结构调整（欠填叶合法，无正确性代价）。
+        if (rid_idx >= page_hdr->num_key) {
+            fprintf(stderr, "[ix-guard] find_child miss: child=%d not in parent=%d (num_key=%d)\n",
+                    child->get_page_no(), get_page_no(), page_hdr->num_key);
+            return -1;
+        }
         return rid_idx;
     }
 };
@@ -231,6 +239,17 @@ class IxIndexHandle {
     Iid lower_bound_nolock(const char *key) const;
     Iid upper_bound_nolock(const char *key) const;
     const IxFileHdr *get_fhdr() const { return file_hdr_; }
+
+    /* 调试取证（CHAINWALK 命令）：沿叶链走全程，按 key 前 8 字节（两 int 前缀，
+     * 适配 orders/new_orders 的 (w,d) 形态）聚合条目数并报告顺序违例/坏链。
+     * 与逐 (w,d) 树下降点查计数对比，可裁决"叶链跳段"型结构损伤。 */
+    void debug_chain_walk(FILE *out);
+    /* 调试取证（TREEWALK 命令）：从根 DFS 按树序枚举全部叶，打印每叶 page/prev/next/
+     * size/首尾 key 末 int，并与链序对比标记"树内但不在链上"的孤儿叶。 */
+    void debug_tree_walk(FILE *out);
+    /* 偏执校验（RMDB_IX_PARANOID=1）：结构操作后验证 page 的父链（每级 parent 确实
+     * 含 child）与叶邻接（next 的 prev 回指）。violation 处打印 op 上下文。 */
+    void paranoid_verify(page_id_t leaf_page, const char *op);
 
    private:
     // 辅助函数

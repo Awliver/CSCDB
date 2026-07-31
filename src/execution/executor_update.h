@@ -63,6 +63,9 @@ class UpdateExecutor : public AbstractExecutor {
     }
 
     char *get_slot_ptr(const Rid &rid) {
+        // slot 越界硬防线（与 RmFileHandle::check_slot_bounds 同责）：本指针既读又写，
+        // 坏 rid 的越界写会踩 BPM 邻帧 id_（陈旧映射的产生源，07-31 canary 实测）
+        fh_->check_slot_bounds(rid);
         if (rid.page_no != cached_page_no_) {
             release_cached_page();
             RmPageHandle handle = fh_->fetch_page_handle(rid.page_no);

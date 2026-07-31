@@ -120,6 +120,19 @@ class RmFileHandle {
     int sanitize_free_link(int v) const {
         return (v >= RM_FIRST_RECORD_PAGE && v < file_hdr_.num_pages) ? v : RM_NO_PAGE;
     }
+
+    /* slot 越界硬防线：get_slot 是裸指针算术，超界 slot_no（坏索引项/坏 WAL rid 携带）
+     * 的 memcpy 会越过本帧 data_ 末尾——先踩本帧 dirty/mod_ver/pin，再踩 BPM 池中
+     * 【邻帧的 id_】→ 帧身份被改写而映射仍在 = 陈旧映射（fetch 活锁/错页返回的上游，
+     * 2026-07-31 bpm-heal canary 实测两例 id_ 为 ASCII 行数据）。所有按 rid 写堆的
+     * 入口先过这一道，宁可单语句失败也不让越界写发生。 */
+    void check_slot_bounds(const Rid &rid) const {
+        if (rid.slot_no < 0 || rid.slot_no >= file_hdr_.num_records_per_page) {
+            fprintf(stderr, "[rm-slot-guard] reject rid=(%d,%d) nrpp=%d fd=%d\n",
+                    rid.page_no, rid.slot_no, file_hdr_.num_records_per_page, fd_);
+            throw RecordNotFoundError(rid.page_no, rid.slot_no);
+        }
+    }
     int GetFd() { return fd_; }
 
     /* 判断指定位置上是否已经存在一条记录，通过Bitmap来判断 */

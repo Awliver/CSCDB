@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <array>
 #include <atomic>
 #include <unordered_map>
 
@@ -1015,22 +1016,55 @@ static void handle_exec_batch(int fd, const std::string &payload,
         WirePreparedStmt &st = prepared.at(stmt_id);
         std::string sql = wire_substitute_params(st.sql_template, literals);
 
+        // 批内语句级耗时账（RMDB_STMT_STATS=1）：按 stmt_id 聚合 wall/次数/abort 数。
+        // 用途：量化写意向（UPDATE district/stock）之后批内剩余语句的执行时间——
+        // 这段就是 SI no-wait 的 w-w 冲突窗口，NewOrder 放弃率的分母（Docs/Optimize/14 §6.5-1）
+        static const bool stmt_stats_on = std::getenv("RMDB_STMT_STATS") != nullptr;
+        static std::array<std::atomic<uint64_t>, 256> ss_cnt, ss_us, ss_abort;
+        const auto op_t0 = stmt_stats_on ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+
+        ExecOutcome outc;
         if (st.is_query) {
             BufferSink sink;
-            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag, /*batch_retryable=*/true);
-            if (outc != ExecOutcome::OK) {
-                status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
-                failed_op = op;
-                break;
-            }
-            results.push_back(OpResult{op, sink.row_count(), sink.rows_payload()});
+            outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag, /*batch_retryable=*/true);
+            if (outc == ExecOutcome::OK)
+                results.push_back(OpResult{op, sink.row_count(), sink.rows_payload()});
         } else {
-            ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag, /*batch_retryable=*/true);
-            if (outc != ExecOutcome::OK) {
-                status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
-                failed_op = op;
-                break;
+            outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag, /*batch_retryable=*/true);
+        }
+        if (stmt_stats_on) {
+            uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - op_t0).count();
+            ss_cnt[stmt_id & 0xFF].fetch_add(1, std::memory_order_relaxed);
+            ss_us[stmt_id & 0xFF].fetch_add(us, std::memory_order_relaxed);
+            if (outc == ExecOutcome::ABORT)
+                ss_abort[stmt_id & 0xFF].fetch_add(1, std::memory_order_relaxed);
+            // 每 ~60s 由碰上整点的线程打印一次（低频、无锁）
+            static std::atomic<int64_t> ss_next_print{0};
+            int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+            int64_t nxt = ss_next_print.load(std::memory_order_relaxed);
+            if (now_s >= nxt &&
+                ss_next_print.compare_exchange_strong(nxt, now_s + 60, std::memory_order_relaxed)) {
+                std::string line = "[stmt-stats]";
+                for (int i = 0; i < 256; i++) {
+                    uint64_t n = ss_cnt[i].load(std::memory_order_relaxed);
+                    if (!n) continue;
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), " s%d:n=%llu,avg=%lluus,ab=%llu", i,
+                             (unsigned long long)n,
+                             (unsigned long long)(ss_us[i].load(std::memory_order_relaxed) / n),
+                             (unsigned long long)ss_abort[i].load(std::memory_order_relaxed));
+                    line += buf;
+                }
+                fprintf(stderr, "%s\n", line.c_str());
             }
+        }
+        if (outc != ExecOutcome::OK) {
+            status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
+            failed_op = op;
+            break;
         }
         executed++;
     }
@@ -1080,6 +1114,35 @@ static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id,
     }
     if (strncasecmp(sql.c_str(), "RINGDUMP", 8) == 0) {
         ReproRing::dump(stderr, 200000);
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+        return;
+    }
+    if (strncasecmp(sql.c_str(), "TREEWALK ", 9) == 0) {
+        // 调试取证: TREEWALK <索引文件名> —— 树 DFS 全叶枚举,标记链外孤儿叶
+        std::string ixname = sql.substr(9);
+        while (!ixname.empty() && (ixname.back() == ';' || isspace((unsigned char)ixname.back())))
+            ixname.pop_back();
+        auto iit = sm_manager->ihs_.find(ixname);
+        if (iit != sm_manager->ihs_.end()) {
+            iit->second->debug_tree_walk(stderr);
+        } else {
+            fprintf(stderr, "[treewalk] no such index handle: %s\n", ixname.c_str());
+        }
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+        return;
+    }
+    if (strncasecmp(sql.c_str(), "CHAINWALK ", 10) == 0) {
+        // 调试取证: CHAINWALK <索引文件名> —— 叶链全程遍历,按 (int,int) 前缀聚合
+        // 条目数打到 stderr,与逐前缀树下降点查对比可裁决叶链跳段
+        std::string ixname = sql.substr(10);
+        while (!ixname.empty() && (ixname.back() == ';' || isspace((unsigned char)ixname.back())))
+            ixname.pop_back();
+        auto iit = sm_manager->ihs_.find(ixname);
+        if (iit != sm_manager->ihs_.end()) {
+            iit->second->debug_chain_walk(stderr);
+        } else {
+            fprintf(stderr, "[chainwalk] no such index handle: %s\n", ixname.c_str());
+        }
         if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
         return;
     }

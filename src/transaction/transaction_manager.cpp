@@ -626,6 +626,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                             // 否则该行会在快路径删除后永久消失，无法回滚。
                             restore_index_if_missing(sm_manager_, tab, wr->GetRid(), old_data);
                             if (!fh->is_record(wr->GetRid())) {
+                                fh->check_slot_bounds(wr->GetRid());   // 越界写=踩邻帧 id_
                                 RmPageHandle ph = fh->fetch_page_handle(wr->GetRid().page_no);
                                 Bitmap::set(ph.bitmap, wr->GetRid().slot_no);
                                 ph.page_hdr->num_records++;
@@ -1869,6 +1870,7 @@ void TransactionManager::physical_undo_write_record(Transaction *txn, WriteRecor
         if (old_bytes.empty()) return;
         restore_index_if_missing(sm_manager_, tab_name, rid, old_bytes);
         if (!fh->is_record(rid)) {
+            fh->check_slot_bounds(rid);   // 越界写=踩邻帧 id_
             RmPageHandle ph = fh->fetch_page_handle(rid.page_no);
             Bitmap::set(ph.bitmap, rid.slot_no);
             ph.page_hdr->num_records++;

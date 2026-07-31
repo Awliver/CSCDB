@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
  * @return {unique_ptr<RmRecord>} rid对应的记录对象指针
  */
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
+    check_slot_bounds(rid);
     // 拿到页句柄
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 
@@ -184,6 +185,7 @@ void RmFileHandle::cancel_insert_slot(const Rid &rid) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
+    check_slot_bounds(rid);
     std::scoped_lock<std::mutex> op_lock(op_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 
@@ -210,6 +212,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  * @param {Context*} context
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
+    check_slot_bounds(rid);
     std::scoped_lock<std::mutex> op_lock(op_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 
@@ -241,6 +244,7 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @param {Context*} context
  */
 void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
+    check_slot_bounds(rid);
     std::scoped_lock<std::mutex> op_lock(op_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
 

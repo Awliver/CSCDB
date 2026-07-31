@@ -221,7 +221,13 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                         // 此时帧被淘汰方独占（帧内容即将被换入页覆盖），不能借道命中：
                         // 撤销 pin，落入下方 unique 路径按 in-flight 等待后重试。
                         // 持共享分片锁期间摘表（unique）不可能发生，标志与表项状态一致。
-                        if (!frame_io_inflight_[hit_frame].load(std::memory_order_acquire)) {
+                        // id_ 校验：陈旧映射（表项指向已被换走的帧）曾实测存在——W=10 搅动
+                        // 后 (fd3,p15438)→帧21390 而帧实装 (fd2984,p1)。此处若不校验直接
+                        // 返回就是【错页返回】：读到别页数据、写脏更会损坏别页（头页损坏
+                        // 事故的候选来源）。pin>0 且非 in-flight 时帧不可能处于换入中，
+                        // id_ 读取稳定。不符则撤 pin 落 unique 路径摘除陈旧映射自愈。
+                        if (!frame_io_inflight_[hit_frame].load(std::memory_order_acquire) &&
+                            hp.id_ == page_id) {
                             return &hp;
                         }
                         hp.pin_count_.fetch_sub(1, std::memory_order_acq_rel);
@@ -239,7 +245,18 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 if (it == shard.page_table_.end()) continue;
                 hit_frame = it->second;
                 Page &p = pages_[hit_frame];
-                if (!(p.id_ == page_id)) continue;
+                if (!(p.id_ == page_id)) {
+                    // 陈旧映射自愈：淘汰协议下"表项在而帧已改装他页"不是合法瞬态（表项
+                    // 摘除先于 id_ 改写、且都在分片 unique 锁下），走到这里即不变量已破。
+                    // 旧实现裸 continue：冷路径见表项在又拒绝装载 → fetch 原地死循环，
+                    // 32 线程全冻（2026-07-31 W=10 搅动实测，gdb 现场）。摘除表项后本轮
+                    // 重走冷路径按盘装载；帧本身归属现页，不动。canary 告警留取证线索。
+                    fprintf(stderr,
+                            "[bpm-heal] stale mapping fd=%d page=%d -> frame=%d (frame now fd=%d page=%d)\n",
+                            page_id.fd, page_id.page_no, hit_frame, p.id_.fd, p.id_.page_no);
+                    shard.page_table_.erase(it);
+                    continue;
+                }
                 {
                     std::scoped_lock io_lock(io_mutex_);
                     if (frame_io_inflight_[hit_frame]) {
@@ -433,10 +450,32 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    // 锁外刷旧脏页（与 fetch_page 一致的 WAL 顺序：先 flush_log 再写数据页）
+    // 锁外刷旧脏页（与 fetch_page 一致的 WAL 顺序：先 flush_log 再写数据页）。
+    // 异常安全与 fetch_page 的 catch 对齐：flush/write 抛出（磁盘满等）若不清理，
+    // frame_io_inflight_ 永久悬置 + 保留表项永远指向该帧 → 后续 fetch 该旧页的线程
+    // 全部困死在 in-flight 等待/重试环里（与陈旧映射同款全局冻结）。
     if (need_flush_old) {
-        if (g_log_manager) g_log_manager->flush_log_to_disk();
-        disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+        try {
+            if (g_log_manager) g_log_manager->flush_log_to_disk();
+            disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, pages_[frame_id].data_, PAGE_SIZE);
+        } catch (...) {
+            erase_page_mapping(old_page_id, frame_id);
+            Page &victim = pages_[frame_id];
+            victim.id_ = PageId{-1, INVALID_PAGE_ID};
+            victim.pin_count_ = 0;
+            victim.is_dirty_ = false;
+            {
+                BpmShard &fshard = shards_[frame_id % BPM_NSHARDS];
+                std::unique_lock<std::shared_mutex> flock(fshard.latch_);
+                fshard.free_frames_.push_back(frame_id);
+            }
+            {
+                std::scoped_lock io_lock(io_mutex_);
+                frame_io_inflight_[frame_id] = false;
+                io_cv_.notify_all();
+            }
+            throw;
+        }
         erase_page_mapping(old_page_id, frame_id);   // 同 fetch_page：落盘后才摘保留的表项
     }
     {
