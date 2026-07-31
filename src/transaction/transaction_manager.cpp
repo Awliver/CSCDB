@@ -487,6 +487,10 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             ch.hist[0].is_deleted || ch.hist[0].commit_ts > prune_wm) continue;
         auto pit = sd.pending.find(tab);
         if (pit != sd.pending.end() && pit->second.count(rkey)) continue;   // 他人 overlay 持有
+        if (ReproRing::on() && tab == "new_orders") {
+            ReproRing::push(ReproRing::CHAINGONE, 2, (int32_t)ch.hist[0].commit_ts,
+                            ReproRing::rid32(wr->GetRid().page_no, wr->GetRid().slot_no), 0);
+        }
         tit->second.erase(cit);
     }
     if (!touched_tabs.empty()) {
@@ -1395,6 +1399,43 @@ bool TransactionManager::table_is_dirty(const std::string &tab) {
     return mvcc_dirty_.count(tab) != 0;
 }
 
+void TransactionManager::debug_chain_state(const std::string &tab, const Rid &rid) {
+    int64_t rkey = mvcc_key(rid);
+    size_t sh = mvcc_shard_idx(tab, rkey);
+    fprintf(stderr, "[chainstate] %s rid=(%d,%d)", tab.c_str(), rid.page_no, rid.slot_no);
+    {
+        std::scoped_lock<std::mutex> lck(mvcc_shards_[sh]);
+        auto &sd = mvcc_shard_data_[sh];
+        auto tit = sd.store.find(tab);
+        auto pit = sd.pending.find(tab);
+        bool pending = pit != sd.pending.end() && pit->second.count(rkey);
+        if (tit == sd.store.end() || tit->second.find(rkey) == tit->second.end()) {
+            fprintf(stderr, " chain=NONE pending=%d", (int)pending);
+        } else {
+            MvccChain &ch = tit->second.find(rkey)->second;
+            fprintf(stderr, " chain: writer=%ld wdel=%d pending=%d hist[", (long)ch.writer,
+                    (int)ch.writer_del, (int)pending);
+            for (auto &v : ch.hist)
+                fprintf(stderr, "(cts=%ld,%s)", (long)v.commit_ts, v.is_deleted ? "DEL" : "row");
+            fprintf(stderr, "]");
+        }
+    }
+    auto fit = sm_manager_->fhs_.find(tab);
+    if (fit != sm_manager_->fhs_.end()) {
+        fprintf(stderr, " heap_live=%d", (int)fit->second->is_record(rid));
+    }
+    int defer_hits = 0;
+    {
+        std::scoped_lock<std::mutex> dl(deferred_del_latch_);
+        for (auto &d : deferred_dels_)
+            if (d.tab == tab && d.rid.page_no == rid.page_no && d.rid.slot_no == rid.slot_no)
+                defer_hits++;
+    }
+    fprintf(stderr, " deferred=%d wm_pub=%ld\n", defer_hits,
+            (long)last_commit_ts_.load(std::memory_order_acquire));
+    fflush(stderr);
+}
+
 void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const Rid &rid,
                                                  timestamp_t watermark, timestamp_t just_committed_cts) {
     // 调用方已持分片锁。水位以下可剪枝；堆已物化且水位覆盖本次提交时可整链删除。
@@ -1408,6 +1449,11 @@ void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const R
     if (ch.hist.size() <= 1) {
         if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
             just_committed_cts > 0 && watermark >= just_committed_cts) {
+            if (ReproRing::on() && ch.hist.back().is_deleted && tab == "new_orders") {
+                // 金丝雀：摘除墓碑结尾链而物理清理不在本路径——若出现即复活根因
+                ReproRing::push(ReproRing::PRUNEERASE, 0, (int32_t)just_committed_cts,
+                                ReproRing::rid32(rid.page_no, rid.slot_no), (int32_t)watermark);
+            }
             tit->second.erase(cit);
             if (tit->second.empty()) store.erase(tit);
         }
@@ -1423,6 +1469,10 @@ void TransactionManager::prune_mvcc_after_commit(const std::string &tab, const R
     if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         just_committed_cts > 0 && watermark >= just_committed_cts) {
         if (ch.hist.size() == 1) {
+            if (ReproRing::on() && ch.hist.back().is_deleted && tab == "new_orders") {
+                ReproRing::push(ReproRing::PRUNEERASE, 1, (int32_t)just_committed_cts,
+                                ReproRing::rid32(rid.page_no, rid.slot_no), (int32_t)watermark);
+            }
             tit->second.erase(cit);
             if (tit->second.empty()) store.erase(tit);
         } else {
@@ -1471,9 +1521,18 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
         std::scoped_lock<std::mutex> shlk(mvcc_shards_[sh]);
         auto &sd = mvcc_shard_data_[sh];
         auto tit = sd.store.find(d.tab);
-        if (tit == sd.store.end()) continue;               // 链已不在（如表重建），放弃
+        const bool ring_no = ReproRing::on() && d.tab == "new_orders";
+        if (tit == sd.store.end()) {                       // 链已不在（如表重建），放弃
+            if (ring_no) ReproRing::push(ReproRing::DRAINDROP, 1, (int32_t)d.cts,
+                                         ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
+            continue;
+        }
         auto cit = tit->second.find(rkey);
-        if (cit == tit->second.end()) continue;
+        if (cit == tit->second.end()) {
+            if (ring_no) ReproRing::push(ReproRing::DRAINDROP, 1, (int32_t)d.cts,
+                                         ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
+            continue;
+        }
         MvccChain &ch = cit->second;
         if (d.aborted_husk) {
             // 回滚 INSERT 残留：校验仍是空壳（writer 空、无任何版本），否则槽位已被
@@ -1493,6 +1552,8 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
         // 校验链仍是本次登记的已提交墓碑（防表重建/rid 复用等错配）
         if (ch.writer != INVALID_TXN_ID || ch.hist.empty() ||
             !ch.hist.back().is_deleted || ch.hist.back().commit_ts != d.cts) {
+            if (ring_no) ReproRing::push(ReproRing::DRAINDROP, 2, (int32_t)d.cts,
+                                         ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
             continue;
         }
         auto pit = sd.pending.find(d.tab);
@@ -1514,8 +1575,18 @@ void TransactionManager::drain_deferred_deletes(bool force_heap_for_pending) {
         }
         if (!key_src.empty()) {
             remove_index_entries_on_commit(sm_manager_, d.tab, d.rid, key_src);
+        } else if (ring_no) {
+            ReproRing::push(ReproRing::DRAINDROP, 3, (int32_t)d.cts,
+                            ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
         }
-        if (fh->is_record(d.rid)) fh->delete_record(d.rid, nullptr);
+        if (fh->is_record(d.rid)) {
+            fh->delete_record(d.rid, nullptr);
+        } else if (ring_no) {
+            ReproRing::push(ReproRing::DRAINDROP, 4, (int32_t)d.cts,
+                            ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
+        }
+        if (ring_no) ReproRing::push(ReproRing::CHAINGONE, 3, (int32_t)d.cts,
+                                     ReproRing::rid32(d.rid.page_no, d.rid.slot_no), 0);
         tit->second.erase(cit);                            // 整链摘除（等价 prune 的 wm>=cts 分支）
         if (tit->second.empty()) sd.store.erase(tit);
     }
@@ -1585,6 +1656,11 @@ void TransactionManager::sweep_clean_chains() {
                 // 墓碑链不在此摘（归 drain_deferred_deletes：须与索引项/堆槽同步清理）
                 if (ch.hist.size() == 1 && !ch.hist[0].is_deleted &&
                     ch.hist[0].commit_ts <= wm) {
+                    if (ReproRing::on() && tit->first == "new_orders") {
+                        Rid r = mvcc_rid(cit->first);
+                        ReproRing::push(ReproRing::CHAINGONE, 1, (int32_t)ch.hist[0].commit_ts,
+                                        ReproRing::rid32(r.page_no, r.slot_no), (int32_t)wm);
+                    }
                     cit = tit->second.erase(cit);
                 } else {
                     ++cit;

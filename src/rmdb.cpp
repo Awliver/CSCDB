@@ -1079,7 +1079,16 @@ static void handle_exec_stream(int fd, const std::string &sql, txn_id_t *txn_id,
         return;
     }
     if (strncasecmp(sql.c_str(), "RINGDUMP", 8) == 0) {
-        ReproRing::dump(stderr, 6000);
+        ReproRing::dump(stderr, 200000);
+        if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
+        return;
+    }
+    if (strncasecmp(sql.c_str(), "CHAINSTATE ", 11) == 0) {
+        // 调试取证: CHAINSTATE <tab> <page> <slot> —— 链/堆位图/deferred 登记三方现场
+        char tab[64] = {0}; int pg = -1, sl = -1;
+        if (sscanf(sql.c_str() + 11, "%63s %d %d", tab, &pg, &sl) == 3) {
+            txn_manager->debug_chain_state(tab, Rid{pg, sl});
+        }
         if (!wire::send_frame(fd, wire::TAG_COMMAND_OK, "")) throw wire::WireProtocolError("write failed");
         return;
     }

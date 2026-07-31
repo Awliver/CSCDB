@@ -61,6 +61,7 @@ void RmFileHandle::ensure_insert_page_cached() {
     }
 
     // 先试 first_free；若该页剩余空位都被 reserve 占住，则开新页
+    file_hdr_.first_free_page_no = sanitize_free_link(file_hdr_.first_free_page_no);
     if (file_hdr_.first_free_page_no != RM_NO_PAGE) {
         RmPageHandle ph = fetch_page_handle(file_hdr_.first_free_page_no);
         cached_insert_page_ = ph.page;
@@ -107,7 +108,10 @@ Rid RmFileHandle::insert_record(char *buf, Context *context) {
     Rid rid{cached_insert_page_no_, slot_no};
 
     if (cached_insert_hdr_->num_records == file_hdr_.num_records_per_page) {
-        file_hdr_.first_free_page_no = cached_insert_hdr_->next_free_page_no;
+        // 只有本页确为链头才弹链，且弹出值须消毒（见 sanitize_free_link 注释）
+        if (file_hdr_.first_free_page_no == cached_insert_page_no_) {
+            file_hdr_.first_free_page_no = sanitize_free_link(cached_insert_hdr_->next_free_page_no);
+        }
         buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
         cached_insert_page_ = nullptr;
         cached_insert_page_no_ = -1;
@@ -145,7 +149,9 @@ void RmFileHandle::publish_insert_slot(const Rid &rid, char *buf) {
         Bitmap::set(cached_insert_bitmap_, rid.slot_no);
         cached_insert_hdr_->num_records++;
         if (cached_insert_hdr_->num_records == file_hdr_.num_records_per_page) {
-            file_hdr_.first_free_page_no = cached_insert_hdr_->next_free_page_no;
+            if (file_hdr_.first_free_page_no == cached_insert_page_no_) {
+                file_hdr_.first_free_page_no = sanitize_free_link(cached_insert_hdr_->next_free_page_no);
+            }
             buffer_pool_manager_->unpin_page(cached_insert_page_->get_page_id(), true);
             cached_insert_page_ = nullptr;
             cached_insert_page_no_ = -1;
@@ -160,8 +166,9 @@ void RmFileHandle::publish_insert_slot(const Rid &rid, char *buf) {
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
     Bitmap::set(page_handle.bitmap, rid.slot_no);
     page_handle.page_hdr->num_records++;
-    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page) {
-        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page &&
+        file_hdr_.first_free_page_no == rid.page_no) {
+        file_hdr_.first_free_page_no = sanitize_free_link(page_handle.page_hdr->next_free_page_no);
     }
     buffer_pool_manager_->unpin_page({fd_, rid.page_no}, true);
 }
@@ -185,9 +192,13 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
     Bitmap::set(page_handle.bitmap, rid.slot_no);
     page_handle.page_hdr->num_records++;
 
-    // 若页已满，则从空闲链表上删去
-    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page) {
-        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    // 若页已满且确为空闲链头，则从空闲链表上删去。此路径由恢复 redo/undo 走，目标页
+    // 大多从不在链上（redo 在全零盘面重建整页，next_free_page_no 是 0 不是 -1）——
+    // 旧实现无条件弹链头，把 0 弹成 first_free 后所有新插入直写页 0，就是 order_line
+    // 头页损坏事故的根因。
+    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page &&
+        file_hdr_.first_free_page_no == rid.page_no) {
+        file_hdr_.first_free_page_no = sanitize_free_link(page_handle.page_hdr->next_free_page_no);
     }
 
     buffer_pool_manager_->unpin_page({fd_, rid.page_no}, true);
@@ -253,8 +264,10 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
  * @return {RmPageHandle} 指定页面的句柄
  */
 RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
-    // 校验 page_no 合法
-    if (page_no >= file_hdr_.num_pages || page_no < 0) {
+    // 校验 page_no 合法。页 0 是文件头页，任何记录操作触及它都意味着上游 rid/空闲链
+    // 已被污染——曾实测把 order_line 头页当数据页写满，bitmap_size 被踩坏后恢复
+    // SIGSEGV。这里硬拒绝，宁可单语句失败也不让头页二次损坏。
+    if (page_no >= file_hdr_.num_pages || page_no < RM_FIRST_RECORD_PAGE) {
         throw PageNotExistError("", page_no);
     }
 
@@ -304,6 +317,7 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
  */
 RmPageHandle RmFileHandle::create_page_handle() {
     // 若没有空闲页，则创建新页并挂到空闲链表头
+    file_hdr_.first_free_page_no = sanitize_free_link(file_hdr_.first_free_page_no);
     if (file_hdr_.first_free_page_no == RM_NO_PAGE) {
         RmPageHandle page_handle = create_new_page_handle();
         file_hdr_.first_free_page_no = page_handle.page->get_page_id().page_no;

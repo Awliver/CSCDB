@@ -48,6 +48,11 @@ class AbstractExecutor {
 
     virtual ColMeta get_col_offset(const TabCol &target) { return ColMeta();};
 
+    /* 输出行是否保证按 col 升序（序依赖优化的资格询问，如 MIN 索引早停）。
+     * 保守默认否；目前仅 IndexScan 在"col 落在 EQ 前缀内或恰为首个非 EQ 索引列"
+     * 时应答是。 */
+    virtual bool sorted_asc_on(const TabCol &col) const { return false; }
+
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta> &rec_cols, const TabCol &target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta &col) {
             return col.name == target.col_name &&

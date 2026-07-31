@@ -355,20 +355,46 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     BpmShard &shard = shard_for_page(page_id);
     const uint64_t key = page_key(page_id);
+    // 快路径（共享锁 + 原子递减，仅当页仍被他人 pin 住）：树下降对根/内点页的 unpin
+    // 若走写锁，32 线程×每行重定位会在根页分片上排成写者长队——07-31 实测吞吐提高后
+    // 直接活锁塌陷（24s+ 零推进，gdb 见全员卡分片写锁）。pin 不归零则 replacer/淘汰
+    // /cleaner 均不关心此页（它们只处理 pin==0），共享锁下原子减无副作用；脏标与
+    // mod_ver_ 的写者（此处）持共享锁、清除者（cleaner）持排它锁，天然互斥。
+    static const bool fast_off = std::getenv("RMDB_NO_UNPIN_FASTPATH") != nullptr;  // A/B 归因开关
+    if (!fast_off) {
+        std::shared_lock<std::shared_mutex> lock(shard.latch_);
+        auto it = shard.page_table_.find(key);
+        if (it == shard.page_table_.end()) return false;
+        Page& page = pages_[it->second];
+        if (is_dirty) {
+            page.mod_ver_.fetch_add(1, std::memory_order_acq_rel);
+            page.is_dirty_ = true;
+        }
+        int cur = page.pin_count_.load(std::memory_order_relaxed);
+        while (cur > 1) {
+            if (page.pin_count_.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel,
+                                                      std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        if (cur <= 0) return false;
+    }
+    // 慢路径：本次 unpin 可能把 pin 降到 0，须在排它锁下与 replacer 同步
     std::unique_lock<std::shared_mutex> lock(shard.latch_);
     auto it = shard.page_table_.find(key);
     if (it == shard.page_table_.end()) return false;
     frame_id_t frame_id = it->second;
     Page& page = pages_[frame_id];
     if (is_dirty) {
+        // 快路径命中时已置过；此处兜底（fast_off / 快路径落空两条入径），重复置位无害
+        page.mod_ver_.fetch_add(1, std::memory_order_acq_rel);
         page.is_dirty_ = true;
-        page.mod_ver_++;   // cleaner 锁外写盘期间的新修改凭此免于被误清脏标
     }
     if (page.pin_count_ <= 0) {
         return false;
     }
     page.pin_count_--;
-    // page_id 必归属本分片，故在本分片锁下操作本分片 replacer，无全局锁（热路径）
+    // page_id 必归属本分片，故在本分片锁下操作本分片 replacer，无全局锁
     if (page.pin_count_ == 0) shard.replacer_->unpin(frame_id);
     return true;
 }

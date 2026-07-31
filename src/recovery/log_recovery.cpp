@@ -135,7 +135,16 @@ void RecoveryManager::ensure_pages(RmFileHandle* fh, int page_no) {
     }
 }
 
+/* 毒 rid 护栏：历史损坏的 WAL 里可能残留 page_no=0（头页）等非法 rid ——那批记录
+ * 本就是空闲链污染写进头页的产物，重放它们只会把刚自愈的头页再次写坏。跳过并告警。 */
+static bool rid_poisoned(const Rid& rid, const char* what) {
+    if (rid.page_no >= RM_FIRST_RECORD_PAGE && rid.slot_no >= 0) return false;
+    fprintf(stderr, "[recovery] skip %s at poisoned rid (%d,%d)\n", what, rid.page_no, rid.slot_no);
+    return true;
+}
+
 void RecoveryManager::apply_insert(RmFileHandle* fh, const Rid& rid, const char* data) {
+    if (rid_poisoned(rid, "insert")) return;
     ensure_pages(fh, rid.page_no);
     if (fh->is_record(rid)) {
         fh->update_record(rid, const_cast<char*>(data), nullptr);   // 页已落盘过：覆写即可
@@ -145,6 +154,7 @@ void RecoveryManager::apply_insert(RmFileHandle* fh, const Rid& rid, const char*
 }
 
 void RecoveryManager::apply_update(RmFileHandle* fh, const Rid& rid, const char* data) {
+    if (rid_poisoned(rid, "update")) return;
     ensure_pages(fh, rid.page_no);
     if (fh->is_record(rid)) {
         fh->update_record(rid, const_cast<char*>(data), nullptr);
@@ -154,6 +164,7 @@ void RecoveryManager::apply_update(RmFileHandle* fh, const Rid& rid, const char*
 }
 
 void RecoveryManager::apply_delete(RmFileHandle* fh, const Rid& rid) {
+    if (rid_poisoned(rid, "delete")) return;
     ensure_pages(fh, rid.page_no);
     if (fh->is_record(rid)) {
         fh->delete_record(rid, nullptr);
@@ -507,6 +518,7 @@ void RecoveryManager::undo_pass() {
                 }
                 case LogType::DELETE:
                     // 题9 删除为纯逻辑（堆未动）；若曾被物理删且落盘，则重插旧值
+                    if (rid_poisoned(it->rid, "undo-delete")) break;
                     ensure_pages(fh, it->rid.page_no);
                     if (!fh->is_record(it->rid)) {
                         fh->insert_record(it->rid, const_cast<char*>(it->old_data.data()));

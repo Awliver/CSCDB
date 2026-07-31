@@ -551,6 +551,20 @@ class IndexScanExecutor : public AbstractExecutor {
         }
     }
 
+    /* MIN 早停资格（须在 beginTuple 之后询问——eq_match_count_/skip_mode_/ser_on_
+     * 都在那里才定型）：非 skip 模式下输出严格按索引 key 序，EQ 前缀各列是常量、
+     * cols[eq_match_count_] 是范围内第一个自由列，两者皆升序。MVCC key 一致性过滤
+     * 保证每个可见行恰在其快照 key 位置产出，序不被陈旧索引项破坏。SER 下关闭：
+     * SSI 的逐行读跟踪依赖真实触行，提前停读会缩小读集。 */
+    bool sorted_asc_on(const TabCol &col) const override {
+        if (skip_mode_ || ser_on_) return false;
+        if (!col.tab_name.empty() && col.tab_name != tab_name_) return false;
+        for (int i = 0; i <= eq_match_count_ && i < (int)index_meta_.cols.size(); ++i) {
+            if (index_meta_.cols[i].name == col.col_name) return true;
+        }
+        return false;
+    }
+
     void beginTuple() override {
         // 题9：与 SeqScan 相同的 MVCC 开关——表被 MVCC 写过后必须按快照重建可见版本
         mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&

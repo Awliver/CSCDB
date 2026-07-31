@@ -27,6 +27,9 @@ struct ReproRing {
         AGGOUT = 7,     // select_agg MIN 结果发出: a=int值 b=扫描行数
         SKIPVIS = 8,    // index scan 跳过行: a=项key末int b=原因(1=mvcc不可见 2=from_heap复查
                         //   3=key不一致 4=槽死 5=eval不匹配 6=前缀越界停) c=rid
+        DRAINDROP = 9,  // drain 弃单: a=原因(1=链不在 2=状态不符 3=key_src空 4=is_record假) b=cts c=rid
+        PRUNEERASE = 10,// prune 摘除墓碑结尾链（不应发生的金丝雀）: b=cts c=rid d=wm
+        CHAINGONE = 11, // 其余摘链点: a=来源(1=sweep 2=干净链回收 3=drain成功) b=尾版本cts(负=墓碑) c=rid
     };
     struct Ev {
         uint64_t ts;
@@ -65,7 +68,7 @@ struct ReproRing {
     static int32_t rid32(int page, int slot) { return (int32_t)((page << 16) | (slot & 0xFFFF)); }
     /* 汇总全部线程环、按 ts 排序、打印最近 last_n 条 */
     static void dump(FILE *f, uint32_t last_n) {
-        static const char *names[] = {"ACCEPT", "FASTPATH", "TOMBSTONE", "DRAIN", "IXINS", "IXDEL", "HEAPINS", "AGGOUT", "SKIPVIS"};
+        static const char *names[] = {"ACCEPT", "FASTPATH", "TOMBSTONE", "DRAIN", "IXINS", "IXDEL", "HEAPINS", "AGGOUT", "SKIPVIS", "DRAINDROP", "PRUNEERASE", "CHAINGONE"};
         struct Row { uint64_t ts; uint16_t tid; Ev e; };
         std::vector<Row> all;
         {
