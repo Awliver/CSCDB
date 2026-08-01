@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate finals-shaped W=50 TPC-C CSV data for local OJ-style tests."""
+"""Generate TPC-C CSV fixtures for local fast tests and W=50 OJ rehearsal."""
 
 import argparse
 import csv
@@ -15,16 +15,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(_HERE, "../.."))
 BUILD = os.path.join(ROOT, "build")
 
-from tpcc_scale import (  # noqa: E402
-    FULL_CUSTOMERS_PER_DISTRICT,
-    FULL_DISTRICTS,
-    FULL_ITEMS,
-    FULL_NEW_ORDERS_PER_DISTRICT,
-    FULL_ORDERS_PER_DISTRICT,
-    FULL_W,
-    TABLE_ORDER,
-    data_dir_for_scale,
-)
+from tpcc_scale import TABLE_ORDER, data_dir_for_scale, scale_profile  # noqa: E402
 from tpcc_load_verify import TABLE_PK  # noqa: E402
 
 
@@ -78,29 +69,36 @@ def _build_manifest_extras(out_dir):
     return checksums, anchors
 
 
-def generate_full(seed=42):
+def generate_scale(scale="full", seed=42):
     t0 = time.time()
     rng = random.Random(seed)
-    out_dir = data_dir_for_scale("full")
+    profile = scale_profile(scale)
+    warehouses = profile["warehouses"]
+    districts = profile["districts"]
+    items = profile["items"]
+    customers_per_district = profile["customers_per_district"]
+    orders_per_district = profile["orders_per_district"]
+    new_orders_per_district = profile["new_orders_per_district"]
+    out_dir = data_dir_for_scale(scale)
     if not out_dir:
-        raise RuntimeError("full scale data dir not configured")
+        raise RuntimeError("scale=%s data dir not configured" % scale)
     os.makedirs(out_dir, exist_ok=True)
     entry_d = "2023-07-22 20:50:31"
 
-    print("Generating warehouse (%d rows)..." % FULL_W)
+    print("Generating warehouse (%d rows)..." % warehouses)
     _write_csv(
         os.path.join(out_dir, "warehouse.csv"),
         "w_id,w_name,w_street_1,w_street_2,w_city,w_state,w_zip,w_tax,w_ytd",
         (
             (w_id, _rand_str(10, rng), _rand_str(20, rng), _rand_str(20, rng),
              _rand_str(20, rng), "JY", _rand_str(9, rng), 0.125, 300000.0)
-            for w_id in range(1, FULL_W + 1)
+            for w_id in range(1, warehouses + 1)
         ),
     )
 
-    print("Generating item (%d rows)..." % FULL_ITEMS)
+    print("Generating item (%d rows)..." % items)
     def item_rows():
-        for i_id in range(1, FULL_ITEMS + 1):
+        for i_id in range(1, items + 1):
             yield (i_id, rng.randint(1, 10000), _rand_str(24, rng),
                    round(rng.uniform(1.0, 100.0), 2), _rand_str(50, rng))
     _write_csv(
@@ -109,10 +107,10 @@ def generate_full(seed=42):
         item_rows(), progress_every=20000, label="item",
     )
 
-    print("Generating stock (%d rows)..." % (FULL_W * FULL_ITEMS))
+    print("Generating stock (%d rows)..." % (warehouses * items))
     def stock_rows():
-        for w_id in range(1, FULL_W + 1):
-            for s_i_id in range(1, FULL_ITEMS + 1):
+        for w_id in range(1, warehouses + 1):
+            for s_i_id in range(1, items + 1):
                 dists = [_rand_str(24, rng) for _ in range(10)]
                 yield (
                     s_i_id, w_id, rng.randint(10, 100),
@@ -125,14 +123,14 @@ def generate_full(seed=42):
         stock_rows(), progress_every=20000, label="stock",
     )
 
-    print("Generating district (%d rows)..." % (FULL_W * FULL_DISTRICTS))
+    print("Generating district (%d rows)..." % (warehouses * districts))
     def district_rows():
-        for w_id in range(1, FULL_W + 1):
-            for d_id in range(1, FULL_DISTRICTS + 1):
+        for w_id in range(1, warehouses + 1):
+            for d_id in range(1, districts + 1):
                 yield (
                     d_id, w_id, _rand_str(10, rng), _rand_str(20, rng), _rand_str(20, rng),
                     _rand_str(20, rng), "JY", _rand_str(9, rng), 0.125, 30000.0,
-                    FULL_ORDERS_PER_DISTRICT + 1,
+                    orders_per_district + 1,
                 )
     _write_csv(
         os.path.join(out_dir, "district.csv"),
@@ -140,11 +138,11 @@ def generate_full(seed=42):
         district_rows(),
     )
 
-    print("Generating customer (%d rows)..." % (FULL_W * FULL_DISTRICTS * FULL_CUSTOMERS_PER_DISTRICT))
+    print("Generating customer (%d rows)..." % (warehouses * districts * customers_per_district))
     def customer_rows():
-        for w_id in range(1, FULL_W + 1):
-            for d_id in range(1, FULL_DISTRICTS + 1):
-                for c_id in range(1, FULL_CUSTOMERS_PER_DISTRICT + 1):
+        for w_id in range(1, warehouses + 1):
+            for d_id in range(1, districts + 1):
+                for c_id in range(1, customers_per_district + 1):
                     yield (
                         c_id, d_id, w_id, _rand_str(16, rng), "OE", "BARRBARRBARR",
                         _rand_str(20, rng), _rand_str(20, rng), _rand_str(20, rng),
@@ -162,9 +160,9 @@ def generate_full(seed=42):
 
     print("Generating history...")
     def history_rows():
-        for w_id in range(1, FULL_W + 1):
-            for d_id in range(1, FULL_DISTRICTS + 1):
-                for c_id in range(1, FULL_CUSTOMERS_PER_DISTRICT + 1):
+        for w_id in range(1, warehouses + 1):
+            for d_id in range(1, districts + 1):
+                for c_id in range(1, customers_per_district + 1):
                     yield (
                         c_id, d_id, w_id, d_id, w_id, entry_d,
                         round(rng.uniform(10.0, 5000.0), 2), _rand_str(24, rng),
@@ -185,17 +183,17 @@ def generate_full(seed=42):
             "ol_o_id,ol_d_id,ol_w_id,ol_number,ol_i_id,ol_supply_w_id,"
             "ol_delivery_d,ol_quantity,ol_amount,ol_dist_info\n"
         )
-        for w_id in range(1, FULL_W + 1):
-            for d_id in range(1, FULL_DISTRICTS + 1):
-                for o_id in range(1, FULL_ORDERS_PER_DISTRICT + 1):
-                    c_id = rng.randint(1, FULL_CUSTOMERS_PER_DISTRICT)
+        for w_id in range(1, warehouses + 1):
+            for d_id in range(1, districts + 1):
+                for o_id in range(1, orders_per_district + 1):
+                    c_id = rng.randint(1, customers_per_district)
                     ol_cnt = rng.randint(5, 15)
                     fo.write(
                         "%d,%d,%d,%d,'%s',%d,%d,1\n"
                         % (o_id, d_id, w_id, c_id, entry_d, rng.randint(1, 10), ol_cnt)
                     )
                     for ol_no in range(1, ol_cnt + 1):
-                        i_id = rng.randint(1, FULL_ITEMS)
+                        i_id = rng.randint(1, items)
                         qty = rng.randint(1, 10)
                         amount = round(rng.uniform(1.0, 100.0) * qty, 2)
                         fl.write(
@@ -205,14 +203,14 @@ def generate_full(seed=42):
                         ol_count += 1
                 if d_id % 2 == 0:
                     print("  orders/order_line w=%d districts done: %d/%d, ol_rows=%d"
-                          % (w_id, d_id, FULL_DISTRICTS, ol_count))
+                          % (w_id, d_id, districts, ol_count))
 
     print("Generating new_orders...")
     def new_orders_rows():
-        for w_id in range(1, FULL_W + 1):
-            for d_id in range(1, FULL_DISTRICTS + 1):
-                start = FULL_ORDERS_PER_DISTRICT - FULL_NEW_ORDERS_PER_DISTRICT + 1
-                for o_id in range(start, FULL_ORDERS_PER_DISTRICT + 1):
+        for w_id in range(1, warehouses + 1):
+            for d_id in range(1, districts + 1):
+                start = orders_per_district - new_orders_per_district + 1
+                for o_id in range(start, orders_per_district + 1):
                     yield (o_id, d_id, w_id)
     _write_csv(
         os.path.join(out_dir, "new_orders.csv"),
@@ -222,16 +220,16 @@ def generate_full(seed=42):
 
     csv_sha256, anchors = _build_manifest_extras(out_dir)
     manifest = {
-        "scale": "full",
+        "scale": scale,
         "seed": seed,
-        "warehouse": FULL_W,
-        "item": FULL_ITEMS,
-        "stock": FULL_W * FULL_ITEMS,
-        "district": FULL_W * FULL_DISTRICTS,
-        "customer": FULL_W * FULL_DISTRICTS * FULL_CUSTOMERS_PER_DISTRICT,
-        "history": FULL_W * FULL_DISTRICTS * FULL_CUSTOMERS_PER_DISTRICT,
-        "orders": FULL_W * FULL_DISTRICTS * FULL_ORDERS_PER_DISTRICT,
-        "new_orders": FULL_W * FULL_DISTRICTS * FULL_NEW_ORDERS_PER_DISTRICT,
+        "warehouse": warehouses,
+        "item": items,
+        "stock": warehouses * items,
+        "district": warehouses * districts,
+        "customer": warehouses * districts * customers_per_district,
+        "history": warehouses * districts * customers_per_district,
+        "orders": warehouses * districts * orders_per_district,
+        "new_orders": warehouses * districts * new_orders_per_district,
         "order_line": ol_count,
         "csv_sha256": csv_sha256,
         "anchors": anchors,
@@ -243,17 +241,22 @@ def generate_full(seed=42):
     return manifest
 
 
+def generate_full(seed=42):
+    """Compatibility wrapper for existing callers."""
+    return generate_scale("full", seed=seed)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate TPC-C CSV for local perf test")
-    ap.add_argument("--scale", choices=["full"], default="full")
+    ap.add_argument("--scale", choices=["local", "full"], default="full")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--refresh-manifest", action="store_true",
-                    help="recompute csv_sha256+anchors for existing full CSV (no regen)")
+                    help="recompute csv_sha256+anchors for the selected existing CSV (no regen)")
     args = ap.parse_args()
     if args.refresh_manifest:
-        out_dir = data_dir_for_scale("full")
+        out_dir = data_dir_for_scale(args.scale)
         if not out_dir or not os.path.isdir(out_dir):
-            print("Full data dir missing")
+            print("TPC-C data dir missing for scale=%s" % args.scale)
             return 1
         csv_sha256, anchors = _build_manifest_extras(out_dir)
         mp = os.path.join(out_dir, "manifest.json")
@@ -267,8 +270,7 @@ def main():
             json.dump(manifest, f, indent=2)
         print("Refreshed manifest:", mp, "anchors=%d" % len(anchors))
         return 0
-    if args.scale == "full":
-        generate_full(seed=args.seed)
+    generate_scale(args.scale, seed=args.seed)
     return 0
 
 

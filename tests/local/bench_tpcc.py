@@ -10,7 +10,7 @@ Default path aligns with finals ranking clients:
 Tiers:
   --quick     smoke: 3s + 15s x 1
   --mid       trend: 30s + 60s x 3 (BATCH)
-  --finals    OJ-shaped: 30s + 150s x 3, 32 clients (W=5 data still unless scale grows)
+  --finals    OJ-shaped: 30s + 150s x 3, 32 clients (requires --scale full)
   --strict    full checks; window defaults to 150s x 3 when --finals, else 360s x 3 (legacy)
 """
 
@@ -29,11 +29,13 @@ from tpcc_common import (
     RmdbClient,
     benchmark_client_timeout,
     bootstrap_tpcc,
+    db_path_for,
     kill_rmdb,
     parse_count,
+    start_existing_rmdb,
     verify_load_counts,
 )
-from tpcc_scale import ensure_full_data, loads_for_scale, scale_profile, tpcc_runtime_scale
+from tpcc_scale import ensure_scale_data, loads_for_scale, scale_profile, tpcc_runtime_scale
 from tpcc_transactions import (
     TXN_WEIGHTS,
     TXN_WEIGHTS_FINALS,
@@ -513,7 +515,13 @@ def check_measure_elapsed(round_results, measure_sec, min_ratio=0.85):
 
 def main():
     ap = argparse.ArgumentParser(description="Local OJ-style TPC-C performance benchmark")
-    ap.add_argument("--scale", choices=["mini", "full"], default="full")
+    ap.add_argument("--scale", choices=["mini", "local", "full"], default="full")
+    ap.add_argument("--db-name", default="tpcc_perf_db",
+                    help="database directory name relative to build/ (default: tpcc_perf_db)")
+    ap.add_argument("--db-path", default=None,
+                    help="explicit existing database directory; implies an absolute path")
+    ap.add_argument("--reuse-db", action="store_true",
+                    help="start an already-loaded database without deleting, schema creation, LOAD, or indexes")
     ap.add_argument("--strict", action="store_true",
                     help="stricter than OJ: full consistency, abort rate, mix, crash on real DB")
     ap.add_argument("--quick", action="store_true",
@@ -569,6 +577,21 @@ def main():
         print("ERROR: --quick / --mid / --finals are mutually exclusive")
         return 2
 
+    if args.db_path and not os.path.isabs(args.db_path):
+        print("ERROR: --db-path must be absolute so a clone cannot be mistaken for build/ data")
+        return 2
+    if args.db_path and args.db_name != "tpcc_perf_db":
+        print("ERROR: choose only one of --db-name and --db-path")
+        return 2
+    db_name = args.db_path if args.db_path else args.db_name
+    dbpath = db_path_for(db_name)
+    if args.reuse_db and os.path.basename(os.path.normpath(dbpath)).startswith("tpcc_fast_base_"):
+        print("ERROR: a tpcc_fast base is immutable; use tpcc_fast.py run to clone it first")
+        return 2
+    storage_mode = os.environ.get(
+        "RMDB_TEST_STORAGE_MODE", "reused-hdd" if args.reuse_db else "fresh-hdd"
+    )
+
     global MIX_WEIGHTS, MIX_TOTAL, TXN_POPULATION, TXN_NAMES
     active_weights = TXN_WEIGHTS_LEGACY if args.legacy_mix else TXN_WEIGHTS_FINALS
     MIX_WEIGHTS = {name: w for name, w, _ in active_weights}
@@ -578,6 +601,9 @@ def main():
     use_batch = not args.stream
 
     if args.strict:
+        if args.reuse_db or storage_mode != "fresh-hdd":
+            print("ERROR: --strict requires a fresh native-disk load; --reuse-db/fast storage is diagnostic only")
+            return 2
         if args.skip_crash or args.skip_consistency or args.skip_p2 or args.skip_load_content:
             print("ERROR: --strict disallows --skip-crash / --skip-consistency / "
                   "--skip-p2 / --skip-load-content")
@@ -633,12 +659,14 @@ def main():
     profile = scale_profile(args.scale)
     scale = tpcc_runtime_scale(args.scale)
 
-    if args.scale == "full":
-        if not ensure_full_data(generate=not args.no_generate):
-            print("Full data not ready. Run: python3 tests/local/generate_tpcc_data.py --scale full")
+    if args.scale in ("local", "full"):
+        if not ensure_scale_data(args.scale, generate=not args.no_generate):
+            print("TPC-C data not ready. Run: python3 tests/local/generate_tpcc_data.py --scale %s" % args.scale)
             return 1
     loads = loads_for_scale(args.scale)
-    db_name = "tpcc_perf_db"
+    data_source = DATA_SOURCE if args.scale == "full" else (
+        "local W=5 fixture (not OJ scale)" if args.scale == "local" else "official mini fixture"
+    )
 
     mix_desc = (
         "legacy 10/23 NewOrder+Payment"
@@ -650,7 +678,12 @@ def main():
     print("=== TPC-C %sperformance benchmark ===" % ("STRICT " if args.strict else ""))
     print("  tier:", tier, "(finals=150x3×32 | mid=60x3 trend | quick=smoke)")
     print("  scale:", profile["label"])
-    print("  data: ", DATA_SOURCE)
+    print("  data: ", data_source)
+    print("  storage:", storage_mode, "db=", dbpath)
+    if storage_mode == "fast-clone-copy":
+        print("  WARNING: fast clone storage is for iteration only; it is not a WAL durability or OJ tpmC result")
+    elif args.reuse_db:
+        print("  NOTE: reused DB skips fresh LOAD/index timing; use --strict for a submission gate")
     print("  protocol:", proto_desc)
     print("  mix:", mix_desc)
     print("  warmup=%ss measure=%ss rounds=%d threads=%d" % (warmup, measure, rounds, threads))
@@ -701,6 +734,9 @@ def main():
                 "protocol": proto_desc,
                 "mix": mix_desc,
                 "use_batch": use_batch,
+                "storage_mode": storage_mode,
+                "reused_db": args.reuse_db,
+                "base_id": os.environ.get("RMDB_TEST_BASE_ID"),
             },
         )
         if not args.no_save_history:
@@ -724,7 +760,12 @@ def main():
                 persist("FAIL", fail_stage)
                 return 1
 
-        proc, cli = bootstrap_tpcc(db_name, loads=loads, client_timeout=None)
+        if args.reuse_db:
+            print("\n-- reuse validated database (no schema/load/index work) --")
+            proc, _ = start_existing_rmdb(db_name)
+            cli = RmdbClient(timeout=None)
+        else:
+            proc, cli = bootstrap_tpcc(db_name, loads=loads, client_timeout=None)
 
         if args.strict:
             print("\n-- index verify --")
@@ -912,6 +953,7 @@ def main():
             consistency_ok=consistency_ok,
             crash_ok=crash_ok,
             overall_pass=True,
+            data_source=data_source,
             mix_desc=mix_desc,
             protocol=proto_desc,
         )

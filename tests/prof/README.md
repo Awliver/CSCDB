@@ -61,15 +61,22 @@ sudo bpftrace tests/prof/bpftrace_tpcc.bt -c \
 sudo bpftrace tests/prof/bpftrace_tpcc.bt -p $(pgrep -f 'bin/rmdb')
 ```
 
-## 与 OJ 正式测试对齐
+## 与决赛正式测试对齐
 
-正式性能测试请直接跑（详见 [`tests/README.md` →「OJ 性能测试对齐」](../tests/README.md)）：
+决赛形本地门禁请优先跑（详见 [`tests/finals/README.md`](../finals/README.md)）：
+
+```bash
+# W=50 形数据、Wire v3、SI、32 客户端与 3×150s
+python3 tests/finals/performance_test.py
+```
+
+以下命令是开发期 W=5 性能剖析与趋势对比，不能替代决赛 W=50 官方成绩：
 
 ```bash
 # 首次需生成 W=5 全量数据（约数分钟）
 python3 tests/local/generate_tpcc_data.py --scale full
 
-# 最接近线上 OJ 的本地验收
+# 初赛 / 开发期 strict 验收
 python3 tests/local/run_oj_perf_test.py --strict
 
 # 快速验证（mini 数据，15s，不能代表排名 tpmC）

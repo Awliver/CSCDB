@@ -1,0 +1,26 @@
+# Adapted from DuckDB benchmark/micro/order/orderby.benchmark.
+# Scale is reduced and LIMIT bounds Wire output while retaining a full-table sort.
+name Order By (Two Integers)
+group micro
+subgroup order
+
+load
+CREATE TABLE integers (i INT, j INT);
+
+generate
+integers 20000 row*37%20000 row*7%100
+
+run
+SELECT i, j FROM integers ORDER BY i LIMIT 10;
+
+result II
+0	0
+1	11
+2	22
+3	33
+4	44
+5	55
+6	66
+7	77
+8	88
+9	99

@@ -1,0 +1,20 @@
+# Adapted from DuckDB benchmark/micro/index/point/point_query_with_art.benchmark.
+# INT128 permutation and ART-specific syntax are replaced by RMDB-compatible data/DDL.
+name Point Query (Index)
+group art
+subgroup point
+
+load
+CREATE TABLE integers (i INT, j INT);
+
+generate
+integers 100000 row row+2
+
+postload
+CREATE INDEX integers (i);
+
+run
+SELECT i FROM integers WHERE i = 50000 LIMIT 1;
+
+result I
+50000

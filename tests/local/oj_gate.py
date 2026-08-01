@@ -22,6 +22,7 @@
   OJ_GATE_SKIP_LOAD=1     复用已装载库（省 ~6min;正式验收前必须跑一次全新装载）
   OJ_GATE_SLOPE_MB=40     VmSize 斜率上限
   OJ_GATE_AS_MB=2048      服务器 RLIMIT_AS 帽（MB）
+  OJ_GATE_LOAD_TIMEOUT=1800  本地 bootstrap 外层超时（秒；门禁仍要求 <900s）
   OJ_GATE_MIDCRASH=0      跳过第 7/8 步（默认开启）
 用法： python3 tests/local/oj_gate.py
 """
@@ -51,6 +52,7 @@ LOG = os.path.join(BUILD, DB + '.server.log')
 DATA = os.path.join(BUILD, 'tpccbench_data', f'full_w{W}_seed42')
 STRESS = os.path.join(HERE, 'debug', 'wire_tpcc_stress2.py')
 LOAD_BUDGET_S = 900          # OJ 装载 SQL 预算
+LOAD_TIMEOUT_S = int(os.environ.get('OJ_GATE_LOAD_TIMEOUT', '1800'))
 ERROR_ABORT_MAX_PER_WIN = 200  # 降级中止的每窗阈值：偶发可容忍，大量=有实际缺陷
 
 TABLES = ('warehouse', 'district', 'customer', 'history', 'new_orders',
@@ -71,12 +73,40 @@ AGG_SQLS = [
 ]
 
 failures = []
+_active_server_proc = None
 
 
 def check(name, ok, detail=''):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name} {detail}", flush=True)
     if not ok:
         failures.append(f'{name} {detail}')
+
+
+def stop_active_server():
+    """终止本次门禁启动的独立 RMDB 会话，避免异常路径遗留服务端。"""
+    global _active_server_proc
+    proc = _active_server_proc
+    _active_server_proc = None
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        # start_server 的 preexec_fn 调用 setsid()，因此只影响本次测试的服务端进程组。
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def finish():
+    """统一报告并清理，保证 timeout/异常路径不遗留 rmdb 占用端口。"""
+    stop_active_server()
+    print('\n== RESULT:', 'PASS' if not failures else f'FAIL ({len(failures)})', '==')
+    for failure in failures:
+        print('  FAIL:', failure)
+    sys.exit(0 if not failures else 1)
 
 
 def proc_status_mb(pid, key):
@@ -135,6 +165,7 @@ class PeakSampler:
 
 
 def start_server(fresh):
+    global _active_server_proc
     subprocess.run(['pkill', '-x', 'rmdb'], check=False)
     time.sleep(1)
     if fresh:
@@ -154,6 +185,7 @@ def start_server(fresh):
     proc = subprocess.Popen([os.path.join(BUILD, 'bin', 'rmdb'), DB], cwd=BUILD,
                             stdout=logf, stderr=subprocess.STDOUT, env=env,
                             stdin=subprocess.DEVNULL, preexec_fn=limits)
+    _active_server_proc = proc
     # 就绪探测：端口可连 + show tables 成功（OJ 的就绪定义）
     t0 = time.time()
     while time.time() - t0 < 600:
@@ -344,10 +376,24 @@ def main():
     if fresh:
         t0 = time.time()
         env = dict(os.environ, TPCC_DATA=DATA, TPCC_W=str(W))
-        r = subprocess.run([sys.executable, '-c',
-                            f"import sys; sys.path.insert(0, r'{os.path.join(HERE, 'debug')}');"
-                            "import wire_tpcc_stress2 as s; s.bootstrap()"],
-                           env=env, capture_output=True, text=True, timeout=1800)
+        try:
+            r = subprocess.run([sys.executable, '-c',
+                                f"import sys; sys.path.insert(0, r'{os.path.join(HERE, 'debug')}');"
+                                "import wire_tpcc_stress2 as s; s.bootstrap()"],
+                               env=env, capture_output=True, text=True,
+                               timeout=LOAD_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            load_s = time.time() - t0
+            output = exc.stdout or ''
+            if isinstance(output, bytes):
+                output = output.decode('utf-8', 'replace')
+            if output:
+                print(output.strip()[-200:])
+            check('phase2 load ok', False,
+                  f'(timeout after {LOAD_TIMEOUT_S}s; elapsed={load_s:.0f}s)')
+            check(f'phase2 load < {LOAD_BUDGET_S}s', False,
+                  f'(timeout; elapsed={load_s:.0f}s)')
+            finish()
         print(r.stdout.strip()[-200:])
         load_s = time.time() - t0
         check('phase2 load ok', r.returncode == 0, f'({load_s:.0f}s)')
@@ -471,12 +517,12 @@ def main():
         compare_snapshots(pre2, agg_snapshot(c), 'second-crash')
         c.close()
 
-    subprocess.run(['pkill', '-x', 'rmdb'], check=False)
-    print('\n== RESULT:', 'PASS' if not failures else f'FAIL ({len(failures)})', '==')
-    for f in failures:
-        print('  FAIL:', f)
-    sys.exit(0 if not failures else 1)
+    finish()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        # 除 load timeout 外，其余未捕获异常（例如断言、恢复启动失败）也必须清理服务端。
+        stop_active_server()

@@ -1,7 +1,7 @@
 # ProjectAnalysis（代码位置索引）
 
-> **阶段（2026-07-27）**：10 题功能 ✅ · **决赛**（初赛已结束）  
-> 性能落地分类 → [`Docs/Optimize/5`](../../Optimize/5.已完成优化摘要.md) · 初赛锚点 → [`12`](../../Optimize/12.初赛冻结备忘.md) · 决赛 → [`FinalCompetition/决赛准备`](../../FinalCompetition/决赛准备Todo.md) · 入口 → [`Docs/README`](../../README.md)
+> **阶段（2026-08-01）**：10 题功能 ✅ · **决赛**（官方全流程 PASS）
+> 最新官方结果 → [`08-01 OJ 报告摘要`](../../FinalCompetition/0801-OJ性能测评报告摘要.md) · 性能落地分类 → [`Docs/Optimize/5`](../../Optimize/5.已完成优化摘要.md) · 初赛锚点 → [`12`](../../Optimize/12.初赛冻结备忘.md) · 决赛 → [`FinalCompetition/决赛准备`](../../FinalCompetition/决赛准备Todo.md) · 入口 → [`Docs/README`](../../README.md)
 
 本目录是**代码定位与契约备忘**，不是待填空清单。文中残留的 `📝` 多为功能填充阶段历史标记，**现均已实现**。
 

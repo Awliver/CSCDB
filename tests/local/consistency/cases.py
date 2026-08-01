@@ -405,13 +405,104 @@ def case_h4_ser_gc_stress() -> CaseResult:
 
 
 # ---------------------------------------------------------------------------
-# H3 — INLJ under SER (join + concurrent write smoke)
+# H3 — INLJ under SER must track the instantiated inner predicate / hit RID
 # ---------------------------------------------------------------------------
 
 
-def case_h3_ser_inlj_smoke() -> CaseResult:
+def case_h3_ser_inlj_dangerous_structure() -> CaseResult:
+    """Build T1 ->rw T2 ->rw T3 with T3 committed first.
+
+    T1 reads g(1), then T2 writes it (T1 ->rw T2).  T3 moves the indexed inner
+    row from s.id=1 to s.id=2 after T2's snapshot and commits.  T2's subsequent
+    INLJ probe still sees the old-key version.  The instantiated s.id=1 predicate
+    deliberately does not match T3's new value, so the actual hit RID tracking
+    must discover T2 ->rw T3 and abort that SELECT immediately.
+    """
+    db = "cons_h3_ser_inlj_danger"
+    proc, _ = fresh_db(db)
+    setup = new_client()
+    for stmt in (
+        "create table r (id int, v int);",
+        "create table s (id int, v int);",
+        "create table g (id int, v int);",
+        "create index s (id);",
+        "insert into r values (1, 100);",
+        "insert into s values (1, 200);",
+        "insert into g values (1, 10);",
+    ):
+        ok, reply = sql_ok(setup, stmt)
+        if not ok:
+            setup.close()
+            stop_server(proc)
+            return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", False,
+                              "setup failed for %r: %s" % (stmt, reply[:120]))
+
+    join_sql = "select r.id, s.v from r, s where r.id = s.id and r.id = 1;"
+    setup.close()
+
+    t1 = new_client()
+    t2 = new_client()
+    t3 = new_client()
+    for cli in (t1, t2, t3):
+        sql(cli, "set transaction isolation level serializable;")
+
+    sql(t1, "begin;")
+    if not parse_table_rows(sql(t1, "select v from g where id = 1;")):
+        for cli in (t1, t2, t3):
+            cli.close()
+        stop_server(proc)
+        return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", False,
+                          "T1 failed to establish the g(1) read dependency")
+
+    sql(t2, "begin;")                       # T2 snapshot precedes T3's write
+    sql(t3, "begin;")
+    t3_write = sql(t3, "update s set id = 2 where id = 1;")
+    t3_commit = sql(t3, "commit;")           # Tout must commit before Tin
+    if "abort" in (t3_write + t3_commit).lower() or "error" in (t3_write + t3_commit).lower():
+        sql(t1, "rollback;")
+        sql(t2, "rollback;")
+        for cli in (t1, t2, t3):
+            cli.close()
+        stop_server(proc)
+        return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", False,
+                          "T3 setup write/commit failed: %r / %r" % (t3_write[:80], t3_commit[:80]))
+
+    t2_write = sql(t2, "update g set v = 11 where id = 1;")  # establishes T1 ->rw T2
+    if "abort" in t2_write.lower() or "error" in t2_write.lower():
+        sql(t1, "rollback;")
+        sql(t2, "rollback;")
+        for cli in (t1, t2, t3):
+            cli.close()
+        stop_server(proc)
+        return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", False,
+                          "T2 could not establish inbound rw edge: %r" % t2_write[:120])
+
+    join_reply = sql(t2, join_sql)
+    immediate_abort = "abort" in join_reply.lower()
+    sql(t1, "rollback;")
+    sql(t2, "rollback;")
+    for cli in (t1, t2, t3):
+        cli.close()
+
+    verify = new_client()
+    guard_rows = parse_table_rows(sql(verify, "select v from g where id = 1;"))
+    verify.close()
+    stop_server(proc)
+    guard_v = guard_rows[0][0].strip() if guard_rows else None
+
+    if not immediate_abort:
+        return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", False,
+                          "BUG: dangerous INLJ SELECT did not immediately abort: %r" % join_reply[:160])
+    if guard_v != "10":
+        return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", False,
+                          "aborted T2 write was not rolled back: g.v=%r" % guard_v)
+    return CaseResult("H3", "SER INLJ immediate dangerous-structure abort", True,
+                      "INLJ SELECT returned TRANSACTION_ABORT; T2 write rolled back")
+
+
+def case_h3s_ser_inlj_smoke() -> CaseResult:
     """SER join via INLJ with concurrent inner updates — server stays up, no torn reads."""
-    db = "cons_h3_ser_inlj"
+    db = "cons_h3s_ser_inlj"
     proc, cli = setup_si_table(db, indexed=False)
     sql_ok(cli, "create table r (id int, v int);")
     sql_ok(cli, "create table s (id int, v int);")
@@ -458,10 +549,10 @@ def case_h3_ser_inlj_smoke() -> CaseResult:
     alive = proc.poll() is None
     stop_server(proc)
     if not alive:
-        return CaseResult("H3", "SER INLJ concurrent join", False, "server crashed", flaky=True)
+        return CaseResult("H3S", "SER INLJ concurrent join", False, "server crashed", flaky=True)
     if errors:
-        return CaseResult("H3", "SER INLJ concurrent join", False, errors[0], flaky=True)
-    return CaseResult("H3", "SER INLJ concurrent join", True, "join+update smoke OK")
+        return CaseResult("H3S", "SER INLJ concurrent join", False, errors[0], flaky=True)
+    return CaseResult("H3S", "SER INLJ concurrent join", True, "join+update smoke OK")
 
 
 # ---------------------------------------------------------------------------
@@ -1318,7 +1409,10 @@ ALL_CASES: List[CaseSpec] = [
              case_c8_delete_reinsert_abort_restores_visibility, ("mvcc", "index", "finals")),
     CaseSpec("H1", "maintain_parent deep index", case_h1_maintain_parent_deep, ("index",), quick=False),
     CaseSpec("H2", "coalesce rightmost leaf", case_h2_coalesce_rightmost, ("index",)),
-    CaseSpec("H3", "SER INLJ concurrent join", case_h3_ser_inlj_smoke, ("ssi",), flaky=True),
+    CaseSpec("H3", "SER INLJ immediate dangerous-structure abort",
+             case_h3_ser_inlj_dangerous_structure, ("ssi", "finals")),
+    CaseSpec("H3S", "SER INLJ concurrent join", case_h3s_ser_inlj_smoke,
+             ("ssi",), flaky=True, quick=False),
     CaseSpec("H4", "ser_finish GC concurrency", case_h4_ser_gc_stress, ("ssi",), flaky=True, quick=False),
     CaseSpec("H5", "cached mvcc_on scan phantom", case_h5_scan_mvcc_on_cache, ("mvcc",)),
     CaseSpec("M1", "double BEGIN versioning", case_m1_double_begin, ("meta",)),

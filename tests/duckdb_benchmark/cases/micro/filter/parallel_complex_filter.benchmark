@@ -1,0 +1,17 @@
+# Adapted from DuckDB benchmark/micro/filter/parallel_complex_filter.benchmark.
+# The unsupported IN-subquery is narrowed to an equivalent range-filter microbenchmark.
+name Integer Range Filter
+group micro
+subgroup filter
+
+load
+CREATE TABLE integers (i INT);
+
+generate
+integers 100000 row
+
+run
+SELECT COUNT(*) FROM integers WHERE i >= 337 AND i <= 17797;
+
+result I
+17461

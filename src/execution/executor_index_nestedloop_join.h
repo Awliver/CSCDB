@@ -31,6 +31,56 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     size_t hit_idx_ = 0;
     bool isend_ = true;
     bool mvcc_on_ = false;      // 题9：内表脏态时按快照重建可见版本
+    bool ser_on_ = false;       // 决赛 H3：SER 下跟踪内表的实例化谓词与实际命中 RID
+
+    static CompOp swap_comp_op(CompOp op) {
+        switch (op) {
+            case OP_EQ: return OP_EQ;
+            case OP_NE: return OP_NE;
+            case OP_LT: return OP_GT;
+            case OP_GT: return OP_LT;
+            case OP_LE: return OP_GE;
+            case OP_GE: return OP_LE;
+        }
+        return op;
+    }
+
+    // 把依赖当前外表行的 join 条件实例化为纯右表谓词。
+    // 例如 r.id = s.id 在 r.id=7 时登记为 s.id = 7，不能用整表读替代，
+    // 否则会把 INLJ 的点查冲突集无谓扩大。
+    void build_right_ser_pred(std::vector<Condition> &pred) {
+        pred = right_conds_;
+        pred.reserve(right_conds_.size() + join_conds_.size());
+        for (const auto &cond : join_conds_) {
+            if (cond.is_rhs_val) continue;
+
+            TabCol right_col;
+            TabCol left_col;
+            CompOp op;
+            if (cond.lhs_col.tab_name == right_table_ && cond.rhs_col.tab_name != right_table_) {
+                right_col = cond.lhs_col;
+                left_col = cond.rhs_col;
+                op = cond.op;
+            } else if (cond.rhs_col.tab_name == right_table_ && cond.lhs_col.tab_name != right_table_) {
+                right_col = cond.rhs_col;
+                left_col = cond.lhs_col;
+                op = swap_comp_op(cond.op);
+            } else {
+                continue;
+            }
+
+            auto left_it = get_col(left_->cols(), left_col);
+            auto right_it = get_col(right_cols_, right_col);
+            Condition instantiated;
+            instantiated.lhs_col = right_col;
+            instantiated.op = op;
+            instantiated.is_rhs_val = true;
+            instantiated.rhs_val.type = right_it->type;
+            instantiated.rhs_val.raw = std::make_shared<RmRecord>(right_it->len);
+            memcpy(instantiated.rhs_val.raw->data, left_rec_->data + left_it->offset, right_it->len);
+            pred.push_back(std::move(instantiated));
+        }
+    }
 
     bool build_lookup_key(std::vector<char> &key) {
         key.assign(index_meta_.col_tot_len, 0);
@@ -108,6 +158,15 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         hit_idx_ = 0;
         std::vector<char> key;
         if (!build_lookup_key(key)) return;
+        if (ser_on_) {
+            std::vector<Condition> pred;
+            build_right_ser_pred(pred);
+            context_->txn_mgr_->ser_record_pred(context_->txn_, right_table_, pred);
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, right_table_, pred)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
         auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(right_table_, index_meta_.cols)).get();
         ih->get_value(key.data(), &right_hits_, context_ ? context_->txn_ : nullptr);
     }
@@ -167,6 +226,14 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             while (hit_idx_ < right_hits_.size()) {
                 if (read_right_visible(right_hits_[hit_idx_], right_rec) &&
                     eval_joined_conds(&right_rec)) {
+                    if (ser_on_) {
+                        const Rid &rid = right_hits_[hit_idx_];
+                        context_->txn_mgr_->ser_record_read(context_->txn_, right_table_, rid);
+                        if (context_->txn_mgr_->ser_read_check(context_->txn_, right_table_, rid)) {
+                            throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                            AbortReason::DEADLOCK_PREVENTION);
+                        }
+                    }
                     isend_ = false;
                     return;
                 }
@@ -204,6 +271,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         // 题9：内表进入 MVCC 脏态后必须按快照重建可见版本
         mvcc_on_ = context_ && context_->txn_mgr_ && context_->txn_ &&
                    context_->txn_mgr_->table_is_dirty(right_table_);
+        ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
+                  context_->txn_mgr_->is_ser(context_->txn_);
         left_->beginTuple();
         left_rec_.reset();
         isend_ = left_->is_end();

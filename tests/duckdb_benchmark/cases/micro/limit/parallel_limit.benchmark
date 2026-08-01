@@ -1,0 +1,20 @@
+# Adapted from DuckDB benchmark/micro/limit/parallel_limit.benchmark.
+# The unsupported IN-subquery is replaced by a bounded range with identical four-row output.
+name Ordered Filter Limit
+group micro
+subgroup limit
+
+load
+CREATE TABLE integers (i INT);
+
+generate
+integers 100000 row
+
+run
+SELECT i FROM integers WHERE i >= 337 AND i <= 340 ORDER BY i LIMIT 4;
+
+result I
+337
+338
+339
+340

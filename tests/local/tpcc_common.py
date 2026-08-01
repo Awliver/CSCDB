@@ -150,14 +150,28 @@ def kill_rmdb():
     time.sleep(0.5)
 
 
-def start_rmdb(db_name, log_path=None):
+def db_path_for(db_name):
+    """Resolve a test database name while allowing an explicit absolute path."""
+    return db_name if os.path.isabs(db_name) else os.path.join(BUILD, db_name)
+
+
+def start_rmdb(db_name, log_path=None, fresh=True):
+    """Start RMDB for ``db_name``.
+
+    ``fresh=False`` is intentionally explicit: it is only for a database that
+    has already been loaded and validated by the harness.  Keeping this logic
+    here prevents a fast benchmark path from accidentally deleting its base.
+    """
     if not os.path.isfile(RMDB):
         raise FileNotFoundError(RMDB + " not found; run: cd build && make rmdb -j4")
     kill_rmdb()
-    dbpath = os.path.join(BUILD, db_name)
-    if os.path.isdir(dbpath):
-        shutil.rmtree(dbpath)
-    os.makedirs(dbpath, exist_ok=True)
+    dbpath = db_path_for(db_name)
+    if fresh:
+        if os.path.isdir(dbpath):
+            shutil.rmtree(dbpath)
+        os.makedirs(dbpath, exist_ok=True)
+    elif not os.path.isdir(dbpath):
+        raise FileNotFoundError("reusable database directory not found: " + dbpath)
     # 默认保留服务器输出（[sql-error]/[sql-slow]/mvcc-stats 是 ERROR 归因的唯一线索）
     if log_path is None:
         log_path = dbpath + ".server.log"
@@ -177,6 +191,11 @@ def start_rmdb(db_name, log_path=None):
                             preexec_fn=preexec)
     wait_ready(timeout=60.0)
     return proc, dbpath
+
+
+def start_existing_rmdb(db_name, log_path=None):
+    """Start an already-loaded database without deleting or loading anything."""
+    return start_rmdb(db_name, log_path=log_path, fresh=False)
 
 
 def bootstrap_tpcc(db_name="tpcc_bench_db", with_indexes=True, loads=None, client_timeout=None):

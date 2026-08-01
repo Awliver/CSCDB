@@ -1,8 +1,8 @@
 # 一致性回归测试集
 
-> **待办归档**：[Docs/FinalCompetition/一致性审计与回归用例.md](../../Docs/FinalCompetition/一致性审计与回归用例.md) · 目录 [Docs/FinalCompetition/README.md](../../Docs/FinalCompetition/README.md)
+> **待办归档**：[Docs/FinalCompetition/一致性审计与回归用例.md](../../../Docs/FinalCompetition/一致性审计与回归用例.md) · **官方基线**：[08-01 OJ 报告摘要](../../../Docs/FinalCompetition/0801-OJ性能测评报告摘要.md) · 目录 [Docs/FinalCompetition/README.md](../../../Docs/FinalCompetition/README.md)
 
-针对 [一致性审计](../../Docs/Analysis/ProjectAnalysis/5.陷阱清单与编程契约.md) 中 **C1–M8** 类漏洞设计的本地复现/回归用例。与 `tests/local/debug/`（gitignore、临时脚本）不同，本目录**可提交**，作为修复前后的门禁。
+针对 [一致性审计](../../../Docs/Analysis/ProjectAnalysis/5.陷阱清单与编程契约.md) 中 **C1–M8** 类漏洞设计的本地复现/回归用例。与 `tests/local/debug/`（gitignore、临时脚本）不同，本目录**可提交**，作为修复前后的门禁。
 
 ## 快速开始
 
@@ -40,7 +40,8 @@ python3 tests/local/consistency/run_consistency_regress.py
 | **C4** | C4 log-after-dirty | flaky | 200 次 commit 后 SIGKILL 重启 | 重启后 `v` 与 kill 前一致 |
 | **H1** | H1 `maintain_parent` | 慢 | 2500 次索引 insert/delete | 无 crash，索引 probe 成功 |
 | **H2** | H2 `coalesce` IX_NO_PAGE | 确定性 | 30 轮 40 行删空 | 无 crash，每轮 count=0 |
-| **H3** | H3 INLJ 缺 SSI | flaky | SER join + 4 路 inner UPDATE | 无 crash，join 行数稳定 |
+| **H3** | H3 INLJ 缺 SSI | 确定性 | 三事务构造 `T1→rw T2→rw T3`，T3 先提交，T2 最后执行 INLJ | INLJ SELECT 当前语句立即 abort，T2 写回滚 |
+| **H3S** | H3 INLJ 并发回归 | flaky | SER join + 4 路 inner UPDATE | 无 crash，join 行数稳定 |
 | **H4** | H4 `ser_finish` 无锁 | flaky | 16×40 SER 事务 | 无 crash / server error |
 | **H5** | H5 `mvcc_on_` 缓存 | 确定性 | `BEGIN` → 外连 autocommit UPDATE → `SELECT` | 不得见 post-snapshot 值 |
 | **M1** | M1 双 BEGIN | 确定性 | 4 线程 `begin;begin;` 双表插入 | 两表各 4 行 |
@@ -53,14 +54,14 @@ python3 tests/local/consistency/run_consistency_regress.py
 - `mvcc` — C1/C1b/C2/H5
 - `wal` / `bpm` — C3/C4
 - `index` — H1/H2
-- `ssi` — H3/H4
+- `ssi` — H3/H3S/H4
 - `meta` — M1/M6（非数据一致性，工具/元数据）
 - `tpcc` / `integration` — M7/INT
 
 ## 设计原则
 
 1. **确定性优先**：C1/C2/H5/H2/C1b 不依赖调度运气，适合 CI / 修 bug 前后对比。
-2. **flaky 用 `--repeat`**：C3/C4/H3/H4/M7/INT 标注 `flaky=True`。
+2. **flaky 用 `--repeat`**：C3/C4/H3S/H4/M7/INT 标注 `flaky=True`；H3 为确定性危险结构门禁。
 3. **失败语义**：
    - **数据 bug**：C/H 系列 FAIL → 应修代码。
    - **已知缺口**：M6 FAIL 表示 `set output_file off` 未实现（文档/测试不一致），修 server 或改测试预期。
@@ -95,7 +96,7 @@ tests/local/consistency/
   README.md                  # 本文件
 ```
 
-## 当前预期（2026-07-14）
+## 历史修复预期（2026-07-14；当前官方基线见上方链接）
 
 | 用例 | 结果 | 说明 |
 |------|------|------|
@@ -111,4 +112,4 @@ tests/local/consistency/
 
 **注意**：`--stability N` 统计的是**漏洞检出率**（修前应为 100% detected）。修后请用普通跑法验 PASS。
 
-**2026-07-14 完整复验**：功能 11/11 + C1/C2/H5 PASS + `--mid` median **3943.73**（NewOrder 0 abort）→ 见 Docs/FinalCompetition/决赛准备Todo §1。
+**历史记录（2026-07-14）**：功能 11/11 + C1/C2/H5 PASS + `--mid` median **3943.73**（NewOrder 0 abort）。当前需以 `--quick` / 定点用例做本地回归，并以 2026-08-01 官方 W=50 全流程 PASS 为交付基线。

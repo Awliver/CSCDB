@@ -1,0 +1,16 @@
+# Adapted from DuckDB benchmark/micro/aggregate/simple_aggregate.benchmark.
+# CTAS/range(10M) is replaced by a generated 100K-row CSV.
+name Integer Sum (Ungrouped)
+group aggregate
+
+load
+CREATE TABLE integers (i INT);
+
+generate
+integers 100000 row%5
+
+run
+SELECT SUM(i) FROM integers;
+
+result I
+200000

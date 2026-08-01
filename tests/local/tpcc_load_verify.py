@@ -45,6 +45,22 @@ def resolve_csv(load_relpath, db_name="tpcc_perf_db"):
     return os.path.normpath(os.path.join(BUILD, db_name, load_relpath))
 
 
+def resolve_source_csv(load_relpath, db_name, data_dir=None):
+    """Locate a source CSV even when a reusable DB lives outside ``build``.
+
+    A cloned fast-run database has no ``../tpcc_data`` sibling.  The load
+    fixture, however, is immutable and known from its scale profile, so content
+    verification must resolve it directly instead of from the clone path.
+    """
+    if data_dir:
+        return os.path.join(data_dir, os.path.basename(load_relpath))
+    if os.path.isabs(db_name):
+        # Mini's historical load paths are relative to any direct child of
+        # build/.  An external reusable clone has no such parent relation.
+        return os.path.normpath(os.path.join(BUILD, "_csv_fixture_", load_relpath))
+    return resolve_csv(load_relpath, db_name)
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -196,7 +212,9 @@ def verify_load_content(cli, scale_name, loads, strict=False, db_name="tpcc_perf
         print("LOAD CONTENT:", "PASS" if ok else "FAIL")
         return ok
 
-    data_dir = data_dir_for_scale("full")
+    data_dir = data_dir_for_scale(scale_name)
+    if not data_dir:
+        return _fail("no CSV data directory configured for scale=" + scale_name)
     manifest_path = os.path.join(data_dir, "manifest.json")
     manifest = {}
     if os.path.isfile(manifest_path):
@@ -210,7 +228,7 @@ def verify_load_content(cli, scale_name, loads, strict=False, db_name="tpcc_perf
     # Sample-based compare for large tables (stricter than OJ count-only)
     sample_n = 10 if strict else 3
     for table in TABLE_ORDER:
-        path = resolve_csv(load_map[table], db_name)
+        path = resolve_source_csv(load_map[table], db_name, data_dir=data_dir)
         if not os.path.isfile(path):
             ok = _fail("csv missing: " + path) and ok
             continue

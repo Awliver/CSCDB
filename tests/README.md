@@ -1,7 +1,8 @@
 # RMDB 本地测试（`tests/`）
 
 > 决赛主入口见 [`finals/README.md`](finals/README.md)：25 组 Wire-v3 功能门禁、
-> W=50 Load Data、W=50×32 性能测试，以及非计分 TPC-C I/O Diagnostics。
+> W=50 Load Data、W=50×32 性能测试，以及非计分 TPC-C I/O Diagnostics；最新官方全流程
+> **PASS**（37,248.4 NewOrder/min）见 [`Docs/FinalCompetition/0801-OJ性能测评报告摘要.md`](../Docs/FinalCompetition/0801-OJ性能测评报告摘要.md)。
 > 下文保留初赛/开发期脚本说明，供单模块调试使用，不应替代决赛门禁。
 
 本目录统一存放**功能回归、TPC-C 压测与性能剖析**（不上传远程）。
@@ -32,14 +33,17 @@ ps aux | grep "[r]mdb" | awk '{print $2}' | xargs -r kill -9
 # P2 功能回归（11 个测试点，OJ 前置条件）
 python3 tests/run_tests.py
 
-# ★ 最接近线上 OJ 的本地验收（见下文「OJ 性能测试对齐」）
+# 决赛形本地验收（W=50 形数据 / Wire v3 / SI / 32 客户端）
+python3 tests/finals/performance_test.py
+
+# 开发期 W=5 strict 趋势（不是当前线上规格）
 python3 tests/local/run_oj_perf_test.py --strict
 
 # TPC-C 快速冒烟（日常迭代，不能代表排名 tpmC）
 python3 tests/local/bench_tpcc_neworder.py --quick
 ```
 
-## OJ 性能测试对齐（题意模拟）
+## 初赛 / 开发期性能测试对齐（历史题意模拟）
 
 ### 本地回归配置（2026-07-10）
 
@@ -49,9 +53,9 @@ python3 tests/local/bench_tpcc_neworder.py --quick
 | 并发线程 | **16** | `bench_tpcc.py` / `run_oj_perf_test.py` |
 | 数据 | `build/tpcc_data/full/` | `python3 tests/local/generate_tpcc_data.py --scale full` |
 
-最新 strict 实测（Release，360s×3）：median **3535.48** tpmC，NewOrder **0 abort**，一致性 + 崩溃恢复 **PASS**（详见 `Docs/Optimize/3.md` §17）。
+历史 strict 实测（Release，360s×3）：median **3535.48** tpmC，NewOrder **0 abort**，一致性 + 崩溃恢复 **PASS**（详见 [`Docs/Optimize/3.方案A-C优化记录与tpmC评估.md`](../Docs/Optimize/3.方案A-C优化记录与tpmC评估.md) §17）。这不是决赛 W=50×32 的可比排名结果。
 
-依据 [`Docs/Analysis/TaskAnalysis/性能测试_TPC-C性能优化.md`](../Docs/Analysis/TaskAnalysis/性能测试_TPC-C性能优化.md)。
+依据 [`Docs/Analysis/OriginalQuestion/性能测试_TPC-C性能优化.md`](../Docs/Analysis/OriginalQuestion/性能测试_TPC-C性能优化.md)。
 
 ### 题目规定的完整流程
 
@@ -116,8 +120,8 @@ python3 tests/local/bench_tpcc.py \
 
 | 命令 | 题意符合度 | 适用场景 |
 |------|-----------|----------|
-| `run_oj_perf_test.py --strict` | ★★★★★ | **提交前最终验收**，最接近线上 |
-| `bench_tpcc.py --scale full --strict` | ★★★★★ | 同上，参数可手动微调 |
+| `run_oj_perf_test.py --strict` | ★★★☆☆ | 初赛 / 开发期 W=5 strict 趋势，不替代决赛最终验收 |
+| `bench_tpcc.py --scale full --strict` | ★★★☆☆ | 同上，参数可手动微调 |
 | `bench_tpcc.py --scale full`（无 strict） | ★★★★☆ | 只看 tpmC，跳过 P2 / 崩溃恢复 |
 | `bench_tpcc_neworder.py --quick` | ★★☆☆☆ | 仅 NewOrder，无五类事务混合 |
 | `bench_tpcc.py --scale mini --quick` | ★★☆☆☆ | 数据规模不对（Phase2 小 CSV） |
@@ -184,6 +188,31 @@ python3 tests/local/run_oj_perf_test.py --mid
 # 提交 OJ 前（默认 16 线程）
 bash tests/local/pre_oj_submit.sh
 ```
+
+### 机械盘上的快速迭代
+
+`full` 现在只表示决赛 W=50 数据。日常性能修改请使用显式的
+`local`（W=5）档位；它不会被标成 OJ 结果。首次创建并恢复核验一个
+基线库，之后每次测试只复制该基线，不再重复建表、LOAD 和建索引：
+
+```bash
+# 一次性：生成 W=5 CSV、LOAD、建索引，并做 SIGKILL→恢复→行数核验
+python3 tests/local/tpcc_fast.py prepare --scale local
+
+# 日常：优先把 work-root 指向可写 tmpfs 或 NVMe；默认会尝试 /dev/shm
+python3 tests/local/tpcc_fast.py run --scale local -- \
+  --finals --warmup 5 --measure 20 --rounds 1 --threads 32
+
+# 只复用 HDD 上已装载的工作库（首次不带 --reuse-db 建库；不要写 fast base）
+python3 tests/local/bench_tpcc.py --scale local --db-name tpcc_hdd_work_local --quick
+python3 tests/local/bench_tpcc.py --scale local --reuse-db --db-name tpcc_hdd_work_local \
+  --quick
+```
+
+快速克隆结果会在历史 JSON 中标为 `storage_mode=fast-clone-copy`，只能用于
+CPU/锁/索引方向判断；它不能替代 COMMIT `fdatasync`、崩溃恢复或提交前的
+fresh W=50 门禁。WAL、BPM、恢复或 LOAD 改动后，仍须在原生磁盘执行一致性
+用例和正式 `--strict` / `oj_gate`。
 
 ### 分层测试策略（旧表）
 
