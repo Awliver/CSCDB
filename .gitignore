@@ -106,10 +106,20 @@ __pycache__/
 *.pyo
 
 # ============================================
-# Local only (do not upload to remote)
+# Local tests, benchmarks, and documentation
 # ============================================
+# Local-only test, benchmark, and profiling helpers.
+tests/local/
+tests/bench/
+tests/prof/
+
+# Project notes and working documentation.
 Docs/
 docs/
+
+# ============================================
+# Local only (do not upload to remote)
+# ============================================
 题目一/
 scratch/
 notes/personal/
