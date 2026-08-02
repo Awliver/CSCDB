@@ -381,7 +381,7 @@ def case_h4_ser_gc_stress() -> CaseResult:
         rng = random.Random(seed)
         cli = new_client()
         sql(cli, "set transaction isolation level serializable;")
-        for _ in range(40):
+        for _ in range(200):
             sql(cli, "begin;")
             sql(cli, "select * from t where id = %d;" % rng.randint(1, 2))
             if rng.random() < 0.5:
@@ -401,7 +401,7 @@ def case_h4_ser_gc_stress() -> CaseResult:
         return CaseResult("H4", "ser_finish GC concurrency", False, "server crashed", flaky=True)
     if errors:
         return CaseResult("H4", "ser_finish GC concurrency", False, errors[0], flaky=True)
-    return CaseResult("H4", "ser_finish GC concurrency", True, "16x40 SER txns completed")
+    return CaseResult("H4", "ser_finish GC concurrency", True, "16x200 SER txns completed")
 
 
 # ---------------------------------------------------------------------------

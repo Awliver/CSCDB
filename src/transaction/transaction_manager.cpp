@@ -349,7 +349,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
     if (is_ser(txn)) {
         std::scoped_lock<std::mutex> lck(ser_latch_);
-        ser_finish(txn->get_transaction_id(), true, cts);
+        ser_finish(txn->get_transaction_id(), true, cts, phys_wm);
     }
     struct HeapFlush {
         std::string tab;
@@ -675,14 +675,19 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
     for (auto *wr : *write_set) delete wr;
     write_set->clear();
+    timestamp_t gc_watermark = 0;
     {
         std::scoped_lock<std::mutex> lck(rts_latch_);
         auto wit = active_rts_.find(txn->get_read_ts());
         if (wit != active_rts_.end()) active_rts_.erase(wit);
+        timestamp_t published = last_commit_ts_.load(std::memory_order_acquire);
+        gc_watermark = active_rts_.empty()
+                           ? published
+                           : std::min(*active_rts_.begin(), published);
     }
     if (is_ser(txn)) {
         std::scoped_lock<std::mutex> lck(ser_latch_);
-        ser_finish(txn->get_transaction_id(), false, 0);
+        ser_finish(txn->get_transaction_id(), false, 0, gc_watermark);
     }
 
     if (log_manager != nullptr && had_writes) {
@@ -1181,7 +1186,8 @@ void TransactionManager::ser_unindex(txn_id_t id, const SerInfo &info) {
     }
 }
 
-void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts) {
+void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts,
+                                    timestamp_t gc_watermark) {
     auto it = ser_.find(id);
     if (it == ser_.end()) return;
     if (committed) {
@@ -1197,9 +1203,8 @@ void TransactionManager::ser_finish(txn_id_t id, bool committed, timestamp_t com
     // 现役/未来事务重叠（ser_overlap: committed && cts <= rts → 不重叠），可安全清除。
     // 不清则 ser_ 随事务数无界增长——ser_write_check 每次写遍历全表 → 长跑衰减。
     if (ser_.size() > 512) {
-        timestamp_t wm = active_rts_.empty() ? last_commit_ts_.load() : *active_rts_.begin();
         for (auto sit = ser_.begin(); sit != ser_.end();) {
-            if (sit->second.committed && sit->second.commit_ts <= wm) {
+            if (sit->second.committed && sit->second.commit_ts <= gc_watermark) {
                 txn_id_t gone = sit->first;
                 for (txn_id_t o : sit->second.in_rw)  { auto p = ser_.find(o); if (p != ser_.end()) p->second.out_rw.erase(gone); }
                 for (txn_id_t o : sit->second.out_rw) { auto p = ser_.find(o); if (p != ser_.end()) p->second.in_rw.erase(gone); }

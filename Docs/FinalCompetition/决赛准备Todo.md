@@ -1,7 +1,7 @@
 # 决赛准备 Todo
 
-> **⚡ 状态速览（2026-08-01）**：OJ **全 PASS**；最新有效排名 **37,248.4 NewOrder/min**（W=50、32 客户端、3×150s 中位数）。
-> 正确性、COMMIT 持久化、恢复、W=50 装载与 I/O 诊断均已通过；装载 **830.06s**（9 表、25,050,594 行，满足 <900s 预算）。详见 [`08-01 OJ 性能测评报告摘要`](./0801-OJ性能测评报告摘要.md)。
+> **⚡ 状态速览（2026-08-01）**：最新提交 `bc2c208` OJ **全 PASS**，排名中位 **34,592 NewOrder/min**；H3 INLJ SSI 已冻结。
+> 正确性、COMMIT 持久化、恢复、W=50 装载与 I/O 诊断均已通过；最新装载 **711.11s**（9 表、25,050,197 行）。性能回退锚点继续使用 `c524ff8` 的 **37,248.4**，不以单次较低样本覆盖。详见 [`08-01 OJ 性能测评报告摘要`](./0801-OJ性能测评报告摘要.md)。
 > 07-30 首个有效成绩 **10,402 NewOrder/min** 及当日六份报告的根因链保留在 [`0730-OJ战役复盘`](./0730-OJ战役复盘.md)。当前主线为在完整门禁不退化的前提下继续排名优化，优先降低异常放弃率与尾延迟。
 > 本文以下内容保留作检查清单；已被官方结果覆盖的条目已更新。
 
@@ -26,9 +26,10 @@
 ### 当前阶段（08-01 官方 PASS 后）
 
 ```
-正确性 / 持久化 / 恢复 / 装载门禁   已通过
-W=50×32 三窗排名基线               37,248.4 NewOrder/min
-后续工作                            H3/H4 正确性 → abort 归因 → 单变量排名优化
+正确性 / 持久化 / 恢复 / 装载门禁   最新 bc2c208 已通过
+最新 W=50×32 三窗中位               34,592 NewOrder/min
+性能回退锚点                         c524ff8 · 37,248.4 NewOrder/min
+后续工作                             H4 正确性 → abort 归因 → 单变量排名优化
 本地 W=5                           仅作趋势和定向定位
 ```
 
@@ -94,7 +95,8 @@ python3 tests/run_tests.py
 | 同日对照 | STREAM mid（改造前） | ~2141（EXEC_STREAM 文本往返，不可与 BATCH 比） |
 | 日志/JSON | — | `build/full_local_gate_20260727_173123.log` · `build/oj_mid_batch_20260727_173123.json` |
 | **07-27 晚** | 官方评测门禁 FAIL → 修复 SI 陈旧写 abort + FLOAT NaN/Inf 拒绝 | `run_tests` **11/11** · 一致性 **15/15**（quick）+ **C3/M7/H1/H4** 单独复验全过 · 新增 **SI1/F2** 用例 PASS · mid median **3772.23**（NewOrder ok=11322 fail=702，无回归） |
-| **08-01** | **官方全流程评测** | **PASS**；25 功能 + 5 恢复用例、COMMIT 持久化 32/32；W=50 9 表 **25,050,594** 行装载 **830.06s**；32 客户端 3×150s 中位 **37,248.4 NewOrder/min**；崩后 44 聚合 + 5,974 关系检查及 I/O 诊断均 PASS |
+| **08-01 13:34** | **性能回退锚点评测 `c524ff8`** | **PASS**；W=50 9 表 **25,050,594** 行装载 **830.06s**；三轮 37,166.4 / 37,248.4 / 38,150.0，中位 **37,248.4 NewOrder/min** |
+| **08-01 20:29** | **H3 冻结评测 `bc2c208`** | **PASS**；25 功能 + 5 恢复、COMMIT 32/32、崩后 44 聚合 + 5,974 关系检查及 I/O 诊断全过；装载 **711.11s**；三轮 37,135.2 / 33,200.8 / 34,592.0，中位 **34,592**。H3 仅启用在 SER SELECT，无证据归因跨次约 7.13% 下降；冻结 H3，保留 37,248.4 为性能锚点 |
 
 > mid 仍为 **W=5 / 16 线程 / 60s×3** 趋势窗；`--finals` 为 150s×3 / 32 客户端（本地仍 W=5 CSV，非 OJ W=50）。
 
@@ -104,10 +106,10 @@ python3 tests/run_tests.py
 
 | 序 | 项 | 状态 | 来源 |
 |:--:|----|:----:|------|
-| 1 | H3 INLJ 缺 SSI · H4 `ser_finish` 无锁读 | 🟡 | H3 ✅（08-01）；H4 ⬜；一致性 §三 |
+| 1 | H3 INLJ 缺 SSI · H4 `ser_finish` 无锁读 | 🟡 | H3 🧊（`d39fcdb`/`bc2c208` 官方 PASS 后冻结）；H4 ⬜；一致性 §三 |
 | 2 | C3 Cleaner TOCTOU · C4 脏页/日志序 · C5 `page_lsn` | ⬜ | 一致性 §三 |
 | 3 | H1/H2 索引边角 | ⬜ | 一致性 §三 |
-| 4 | 装载 900s 预算 + 动态 `order_line` | ✅ | 官方 08-01：W=50、9 表 25,050,594 行，**830.06s**；`order_line` 已通过全量装载与恢复检查 |
+| 4 | 装载 900s 预算 + 动态 `order_line` | ✅ | 最新官方：W=50、9 表 25,050,197 行，**711.11s**；`order_line` 已通过全量装载与恢复检查 |
 | 5 | 同步陷阱文档过时条目 | ✅ | §四 + ProjectAnalysis/5（部分） |
 | 6 | 本地 TPC-C Payment 绝对写回（legacy 文本） | ✅ | **BATCH 路径已改相对更新**（`w_ytd`/`d_ytd`/`c_balance`/`c_ytd_payment`/`s_ytd` 等）；`--stream` 旧路径仍可能绝对写，日常勿用 |
 
@@ -121,7 +123,7 @@ python3 tests/run_tests.py
 
 | 序 | 项 | 状态 | 备注 |
 |:--:|----|:----:|------|
-| 1 | H3 INLJ 补 SSI 内表谓词/RID 跟踪 | ✅ | 确定性三事务 H3：危险 INLJ SELECT 当前语句 abort；H3S 并发 PASS |
+| 1 | H3 INLJ 补 SSI 内表谓词/RID 跟踪 | 🧊 | `d39fcdb` 实现，`bc2c208` 官方全 PASS 后冻结；仅新 SER 反例才解冻 |
 | 2 | H4 `ser_finish` 使用锁内 watermark | 🔴 | 消除对 `active_rts_` 的无锁读取，补高重复/TSan |
 | 3 | abort 事务族×语句×原因归因 | 🟠 | 两次 W=50 形；Top-3 原因覆盖 ≥80% |
 | 4 | district/stock 冲突窗口收缩 | 🧪 | 仅当相关冲突占 abort ≥30% 或贡献 p99 ≥25% |
@@ -170,8 +172,8 @@ python3 tests/local/run_oj_perf_test.py --finals
 - [x] 五事务正确；在线一致性 + 恢复后一致性（本地 W=5 已覆盖）
 - [x] 本地排名路径 `PREPARE_SET + EXEC_BATCH`（`tpcc_batch.py`；附件 A §7 批次边界；相对 FLOAT 更新）
 - [x] 本地 mid 完整门禁 PASS（2026-07-27：11/11 + C1/C2/H5 + mid median **3578.46**，NewOrder 0 fail）
-- [x] 装载正式数据在 900s 内完成（官方 2026-08-01：W=50、**830.06s**）
-- [x] （排名）W=50×32 / SI / 3×150s 可跑通且仓库覆盖门禁过（官方 2026-08-01：3/3 窗、32 客户端、50/50 覆盖）
+- [x] 装载正式数据在 900s 内完成（最新官方：W=50、**711.11s**；性能锚点轮 830.06s）
+- [x] （排名）W=50×32 / SI / 3×150s 可跑通且仓库覆盖门禁过（最新 `bc2c208`：3/3 窗、32 客户端、50/50 覆盖）
 - [x] 无表名/SQL 硬编码旁路；未改 CMake；ACID 未降级
 - [ ] 推送目标确认（本机 `gitlab`；正式交卷按赛方要求）
 
@@ -190,3 +192,4 @@ python3 tests/local/run_oj_perf_test.py --finals
 | **2026-07-27** | **本地 TPC-C 对齐 OJ**：`tpcc_batch.py`（PREPARE/BATCH + §7 批次边界 + 相对更新）；默认混合比 45/43/4/4/4；新增 `--finals`（150s×3 / 32）；`--stream` / `--legacy-mix` 作对照。完整门禁 PASS：功能 11/11 · C1/C2/H5 · mid BATCH median **3578.46**（NewOrder 0 fail；other_fail 42 多为 Delivery wait-die） |
 | **2026-07-27 晚** | **官方评测门禁 FAIL 修复**：官方性能测评报告 3 项功能失败——`Float Precision`（Server ERROR）、`Transaction Commit Index`（typed 结果不匹配/幻行）、`Snapshot Isolation Model`（陈旧快照写未按 SI 规范 abort，观测到 COMMAND_OK）。根因定位：①`transaction_manager.cpp` 的 `mvcc_write`/`mvcc_write_col_delta`/`mvcc_write_col_patch` 在检测到 `ch.hist.back().commit_ts > txn->get_read_ts()`（快照之后已有新提交版本）时，此前会调用 `rebase_write_delta`/`apply_col_patch_rebase` 把本次写变基合并到最新版本继续放行，违反决赛赛题整理 §5.3"SI 陈旧写必须 TRANSACTION_ABORT"；②`rmdb.cpp` 的 `wire_param_literal` 用 `%.9g` 序列化 FLOAT32 时未防护 NaN/±Inf，生成的 `"nan"/"inf"` 文本无法被词法分析器识别，回填 SQL 后触发不可控 Server ERROR。**修复**：三个 `mvcc_write*` 函数陈旧写分支改为无条件 `return false`（触发 `TransactionAbortException`），移除已死的 `rebase_write_delta`/`apply_col_patch_rebase`；`wire_param_literal` 增加 `std::isfinite` 检查，非 finite 值主动抛 `WireProtocolError`（受控 `BATCH_STATUS_ERROR`，不落入 lexer 崩溃路径）。新增本地回归 `SI1`（陈旧写必 abort）、`F2`（inf/nan 参数拒绝）纳入 `tests/local/consistency/cases.py`。验证：`run_tests.py` 11/11、一致性 quick 15/15 + C3/M7/H1/H4 单独复验全过、mid 门禁 median **3772.23**（较修复前 3578.46 无回归，NewOrder ok=11322 fail=702，一致性检查全 PASS） |
 | **2026-08-01** | **官方全流程 PASS**：功能 25 项、恢复 5 项、COMMIT 持久化 32/32 均通过；W=50 九表 25,050,594 行装载 **830.06s**（<900s）；32 客户端 3×150s 三轮 **37,166.4 / 37,248.4 / 38,150.0**，排名中位 **37,248.4 NewOrder/min**；崩后 44 项聚合、5,974 项关系检查与非排名 I/O 诊断均 PASS。完整数字见 [`08-01 OJ 性能测评报告摘要`](./0801-OJ性能测评报告摘要.md)。 |
+| **2026-08-01 晚** | **H3 冻结**：`d39fcdb` 补 INLJ 右表实例化谓词/RID SSI 跟踪，`bc2c208` 官方 25 功能、5 恢复、COMMIT 32/32、恢复与 I/O 全 PASS；最新三窗中位 **34,592**。因排名固定 SI、R1 与锚点仅差 0.08%、abort 仅 +0.19pp，无证据将跨次下降归因 H3；源码冻结，性能锚点仍为 **37,248.4**。 |

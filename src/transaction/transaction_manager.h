@@ -459,7 +459,8 @@ private:
     static bool ser_compiled_match(const char *data, const std::vector<SerCompiledCond> &cs);
 
     void ser_begin(txn_id_t id, timestamp_t read_ts);
-    void ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts);
+    void ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts,
+                    timestamp_t gc_watermark);
     bool ser_add_edge(txn_id_t reader, txn_id_t writer);    // 加 rw 边 + 查危险结构(true=危险)
     bool ser_overlap(txn_id_t a, txn_id_t b);
     bool ser_dangerous(txn_id_t tin, txn_id_t tpiv, txn_id_t tout);
