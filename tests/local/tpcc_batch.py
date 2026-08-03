@@ -6,6 +6,8 @@ AUTO_ABORT 失败后服务端已回滚，客户端不再发 ABORT。
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import re
 from typing import List, Optional, Sequence, Tuple
 
 from tpcc_common import ENTRY_D, W_ID
@@ -56,6 +58,64 @@ S_STOCK_LEVEL = 40
 S_SEL_CUST_NO = 41
 S_SEL_CUST_WH_JOIN = 42  # 决赛 PDF NewOrder 首语句：customer × warehouse 逗号连接
 S_SEL_OL_DEL_DETAILS = 43  # 决赛 Delivery：逐行金额账本（与 SUM 做 0 ULP 对照）
+
+ABORT_REASON_TOKENS = {
+    "ACTIVE_WRITE_CONFLICT",
+    "STALE_SNAPSHOT_WRITE",
+    "SSI_DANGEROUS_STRUCTURE",
+    "WFG_DEADLOCK",
+    "BUFFER_POOL_PRESSURE",
+    "OTHER",
+}
+
+STMT_NAMES = {
+    value: name
+    for name, value in list(globals().items())
+    if name.startswith("S_") and isinstance(value, int)
+}
+
+
+def stmt_name(stmt_id: int) -> str:
+    return STMT_NAMES.get(stmt_id, "S_UNKNOWN_%d" % stmt_id)
+
+
+@dataclass
+class TxnRunResult:
+    ok: bool
+    error: str = ""
+    outcome: str = "committed"
+    reason: str = "NONE"
+    stmt_id: int = 0
+    failed_op: int = 0xFFFF
+    batch: str = ""
+    hotspot: str = ""
+    failed_params: tuple = ()
+
+    # 保持旧调用方的 ``ok, err = run_txn_batch(...)`` 解包兼容。
+    def __iter__(self):
+        yield self.ok
+        yield self.error
+
+
+def _abort_reason(diag: str) -> str:
+    match = re.search(r"(?:^|\s)reason=([A-Z0-9_]+)(?:\s|$)", diag or "")
+    token = match.group(1) if match else "OTHER"
+    return token if token in ABORT_REASON_TOKENS else "OTHER"
+
+
+def _hotspot(stmt_id: int, params, home_w: int) -> str:
+    if stmt_id in (S_UPD_D_NEXT, S_UPD_D_YTD):
+        return "district"
+    if stmt_id == S_UPD_STOCK or 14 <= stmt_id <= 23:
+        supply_w = params[3] if stmt_id == S_UPD_STOCK and len(params) > 3 else (
+            params[0] if params else home_w
+        )
+        return "stock_remote" if int(supply_w) != int(home_w) else "stock_home"
+    if stmt_id in (S_UPD_W_YTD,):
+        return "warehouse"
+    if stmt_id in (S_UPD_CUST_PAY, S_UPD_CUST_DEL):
+        return "customer"
+    return "other"
 
 
 def _stock_sel_id(d_id: int) -> int:
@@ -268,9 +328,18 @@ def install_prepare(cli: WireClient) -> None:
     cli.prepare_set(build_prepare_stmts())
 
 
-def _fail(br: BatchResult, prefix: str) -> Tuple[bool, str]:
+def _fail(br: BatchResult, prefix: str, batch: str = "") -> TxnRunResult:
     kind = "abort" if br.aborted else "error"
-    return False, "%s%s: %s" % (prefix, kind, (br.diagnostic or "")[:80])
+    return TxnRunResult(
+        ok=False,
+        error="%s%s: %s" % (prefix, kind, (br.diagnostic or "")[:80]),
+        outcome="abnormal_abort" if br.aborted else "error",
+        reason=_abort_reason(br.diagnostic) if br.aborted else "OTHER",
+        stmt_id=br.failed_stmt_id,
+        failed_op=br.failed_op,
+        batch=batch,
+        failed_params=br.failed_params,
+    )
 
 
 def _cell_int(rows, op_idx: int, col: int = 0) -> Optional[int]:
@@ -344,7 +413,7 @@ def run_neworder_batch(cli: WireClient, rng, scale, d_id=None, c_id=None, ol_cnt
 
     br1 = cli.exec_batch(ops1)
     if not br1.ok:
-        return _fail(br1, "neworder b1 ")
+        return _fail(br1, "neworder b1 ", "b1")
 
     if not br1.results.get(1):
         return False, "neworder: customer×warehouse join missing"
@@ -369,8 +438,16 @@ def run_neworder_batch(cli: WireClient, rng, scale, d_id=None, c_id=None, ol_cnt
             # 业务预期回滚：发 ABORT（单独 batch）
             br_ab = cli.exec_batch([(S_ABORT, [])])
             if not br_ab.ok and not br_ab.aborted:
-                return _fail(br_ab, "neworder abort ")
-            return False, "neworder: invalid item (expected rollback)"
+                return _fail(br_ab, "neworder abort ", "business_abort")
+            return TxnRunResult(
+                ok=False,
+                error="neworder: invalid item (expected rollback)",
+                outcome="business_rollback",
+                stmt_id=S_SEL_ITEM,
+                failed_op=idx,
+                batch="b1",
+                hotspot="item",
+            )
         prices.append(float(rows[0][0]))
 
     # ---- batch2: 写入明细 / COMMIT ----
@@ -414,7 +491,7 @@ def run_neworder_batch(cli: WireClient, rng, scale, d_id=None, c_id=None, ol_cnt
 
     br2 = cli.exec_batch(ops2)
     if not br2.ok:
-        return _fail(br2, "neworder b2 ")
+        return _fail(br2, "neworder b2 ", "b2")
     return True, ""
 
 
@@ -442,7 +519,7 @@ def run_payment_batch(cli: WireClient, rng, scale, d_id=None, c_id=None):
         ]
     )
     if not br1.ok:
-        return _fail(br1, "payment b1 ")
+        return _fail(br1, "payment b1 ", "b1")
     if not br1.results.get(1):
         return False, "payment: warehouse missing"
     if not br1.results.get(3):
@@ -462,7 +539,7 @@ def run_payment_batch(cli: WireClient, rng, scale, d_id=None, c_id=None):
         ]
     )
     if not br2.ok:
-        return _fail(br2, "payment b2 ")
+        return _fail(br2, "payment b2 ", "b2")
     return True, ""
 
 
@@ -473,18 +550,18 @@ def run_order_status_batch(cli: WireClient, rng, scale, d_id=None, c_id=None):
 
     br1 = cli.exec_batch([(S_BEGIN, []), (S_SEL_CUST_OS, [w_id, d_id, c_id])])
     if not br1.ok:
-        return _fail(br1, "orderstatus b1 ")
+        return _fail(br1, "orderstatus b1 ", "b1")
     if not br1.results.get(1):
         return False, "orderstatus: customer missing"
 
     br2 = cli.exec_batch([(S_SEL_ORDERS_LATEST, [w_id, d_id, c_id])])
     if not br2.ok:
-        return _fail(br2, "orderstatus b2 ")
+        return _fail(br2, "orderstatus b2 ", "b2")
     orows = br2.results.get(0)
     if not orows:
         br3 = cli.exec_batch([(S_COMMIT, [])])
         if not br3.ok:
-            return _fail(br3, "orderstatus commit ")
+            return _fail(br3, "orderstatus commit ", "b3")
         return True, ""
 
     o_id = int(float(orows[0][0]))
@@ -492,7 +569,7 @@ def run_order_status_batch(cli: WireClient, rng, scale, d_id=None, c_id=None):
         [(S_SEL_OL_OS, [w_id, d_id, o_id]), (S_COMMIT, [])]
     )
     if not br3.ok:
-        return _fail(br3, "orderstatus b3 ")
+        return _fail(br3, "orderstatus b3 ", "b3")
     return True, ""
 
 
@@ -505,7 +582,7 @@ def run_delivery_batch(cli: WireClient, rng, scale):
         ops1.append((S_SEL_NO_MIN, [w_id, d_id]))
     br1 = cli.exec_batch(ops1)
     if not br1.ok:
-        return _fail(br1, "delivery b1 ")
+        return _fail(br1, "delivery b1 ", "b1")
 
     claimed = []
     for d_id in range(1, nd + 1):
@@ -516,7 +593,7 @@ def run_delivery_batch(cli: WireClient, rng, scale):
     if not claimed:
         br2 = cli.exec_batch([(S_COMMIT, [])])
         if not br2.ok:
-            return _fail(br2, "delivery empty-commit ")
+            return _fail(br2, "delivery empty-commit ", "b2")
         return True, ""
 
     # batch2: 领取 + 读 SUM / o_c_id / customer（仍依赖后续更新）
@@ -535,7 +612,7 @@ def run_delivery_batch(cli: WireClient, rng, scale):
 
     br2 = cli.exec_batch(ops2)
     if not br2.ok:
-        return _fail(br2, "delivery b2 ")
+        return _fail(br2, "delivery b2 ", "b2")
 
     # batch3: 用 SUM 相对更新客户 + COMMIT
     ops3 = []
@@ -552,7 +629,7 @@ def run_delivery_batch(cli: WireClient, rng, scale):
 
     br3 = cli.exec_batch(ops3)
     if not br3.ok:
-        return _fail(br3, "delivery b3 ")
+        return _fail(br3, "delivery b3 ", "b3")
     return True, ""
 
 
@@ -565,7 +642,7 @@ def run_stock_level_batch(cli: WireClient, rng, scale, d_id=None):
         [(S_BEGIN, []), (S_SEL_D_NEXT, [w_id, d_id])]
     )
     if not br1.ok:
-        return _fail(br1, "stocklevel b1 ")
+        return _fail(br1, "stocklevel b1 ", "b1")
     d_next = _cell_int(br1.results, 1)
     if d_next is None:
         return False, "stocklevel: district missing"
@@ -582,7 +659,7 @@ def run_stock_level_batch(cli: WireClient, rng, scale, d_id=None):
         ]
     )
     if not br2.ok:
-        return _fail(br2, "stocklevel b2 ")
+        return _fail(br2, "stocklevel b2 ", "b2")
     return True, ""
 
 
@@ -598,5 +675,15 @@ BATCH_RUNNERS = {
 def run_txn_batch(cli: WireClient, rng, scale, txn_name: str):
     fn = BATCH_RUNNERS.get(txn_name)
     if fn is None:
-        return False, "unknown txn " + txn_name
-    return fn(cli, rng, scale)
+        return TxnRunResult(False, "unknown txn " + txn_name, outcome="error")
+    raw = fn(cli, rng, scale)
+    if isinstance(raw, TxnRunResult):
+        result = raw
+    else:
+        ok, err = raw
+        result = TxnRunResult(ok=ok, error=err, outcome="committed" if ok else "error")
+    if result.hotspot == "" and result.stmt_id:
+        result.hotspot = _hotspot(
+            result.stmt_id, result.failed_params, scale.get("w_id", W_ID)
+        )
+    return result

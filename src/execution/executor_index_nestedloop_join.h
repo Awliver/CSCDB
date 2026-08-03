@@ -164,7 +164,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             context_->txn_mgr_->ser_record_pred(context_->txn_, right_table_, pred);
             if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, right_table_, pred)) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                AbortReason::DEADLOCK_PREVENTION);
+                                                AbortReason::SSI_DANGEROUS_STRUCTURE);
             }
         }
         auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(right_table_, index_meta_.cols)).get();
@@ -231,7 +231,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
                         context_->txn_mgr_->ser_record_read(context_->txn_, right_table_, rid);
                         if (context_->txn_mgr_->ser_read_check(context_->txn_, right_table_, rid)) {
                             throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                            AbortReason::DEADLOCK_PREVENTION);
+                                                            AbortReason::SSI_DANGEROUS_STRUCTURE);
                         }
                     }
                     isend_ = false;

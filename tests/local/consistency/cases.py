@@ -15,6 +15,8 @@ if _LOCAL not in sys.path:
     sys.path.insert(0, _LOCAL)
 
 from tpcc_common import BUILD, kill_rmdb, parse_count, parse_table_rows  # noqa: E402
+from tpcc_batch import TxnRunResult, _abort_reason  # noqa: E402
+from wire_client import SQLTYPE_INT32  # noqa: E402
 
 from consistency.harness import (  # noqa: E402
     Barrier,
@@ -1391,7 +1393,125 @@ def case_c8_delete_reinsert_abort_restores_visibility() -> CaseResult:
 # Registry
 # ---------------------------------------------------------------------------
 
+
+def case_pa1_abort_attribution() -> CaseResult:
+    """P-A1: stable tokens + failed_op + AUTO_ABORT cleanup + server window stats."""
+    db = "cons_pa1_attribution"
+    log_path = os.path.join(BUILD, db + ".server.log")
+    old_stats = os.environ.get("RMDB_STMT_STATS")
+    os.environ["RMDB_STMT_STATS"] = "1"
+    try:
+        proc, _ = fresh_db(db, log_path=log_path)
+    finally:
+        if old_stats is None:
+            os.environ.pop("RMDB_STMT_STATS", None)
+        else:
+            os.environ["RMDB_STMT_STATS"] = old_stats
+
+    setup = new_client()
+    sql(setup, "create table t (id int, v int);")
+    sql(setup, "insert into t values (1, 1);")
+    setup.close()
+
+    # IDs deliberately exceed 255: P-A1 must not alias stmt_id through an 8-bit mask.
+    s_begin, s_update, s_select, s_commit = 501, 502, 503, 504
+    prepared = [
+        (s_begin, False, [], "begin"),
+        (s_update, False, [SQLTYPE_INT32, SQLTYPE_INT32],
+         "update t set v=$1 where id=$2"),
+        (s_select, True, [SQLTYPE_INT32], "select v from t where id=$1"),
+        (s_commit, False, [], "commit"),
+    ]
+    a = new_client()
+    b = new_client()
+    for cli in (a, b):
+        sql(cli, "set transaction isolation level snapshot isolation;")
+        cli.prepare_set(prepared)
+
+    failures = []
+    if not a.exec_batch([(s_begin, []), (s_update, [2, 1])]).ok:
+        failures.append("active-conflict setup transaction failed")
+    active = b.exec_batch([(s_begin, []), (s_update, [3, 1])])
+    if not active.aborted or active.failed_op != 1 or active.failed_stmt_id != s_update:
+        failures.append("active failed_op/stmt mismatch: %r" % active)
+    if _abort_reason(active.diagnostic) != "ACTIVE_WRITE_CONFLICT":
+        failures.append("active reason mismatch: %r" % active.diagnostic)
+
+    # AUTO_ABORT must have fully cleaned B before the next BEGIN on the same connection.
+    cleanup = b.exec_batch([(s_begin, []), (s_select, [1]), (s_commit, [])])
+    if not cleanup.ok:
+        failures.append("AUTO_ABORT left B active: %r" % cleanup.diagnostic)
+    sql(a, "rollback;")
+
+    # A fixes its snapshot first; B commits a newer version; A's write is stale.
+    if not a.exec_batch([(s_begin, []), (s_select, [1])]).ok:
+        failures.append("stale setup A failed")
+    newer = b.exec_batch([(s_begin, []), (s_update, [4, 1]), (s_commit, [])])
+    if not newer.ok:
+        failures.append("stale setup B failed: %r" % newer.diagnostic)
+    stale = a.exec_batch([(s_update, [5, 1])])
+    if not stale.aborted or stale.failed_op != 0 or stale.failed_stmt_id != s_update:
+        failures.append("stale failed_op/stmt mismatch: %r" % stale)
+    if _abort_reason(stale.diagnostic) != "STALE_SNAPSHOT_WRITE":
+        failures.append("stale reason mismatch: %r" % stale.diagnostic)
+    if not a.exec_batch([(s_begin, []), (s_select, [1]), (s_commit, [])]).ok:
+        failures.append("AUTO_ABORT left A active after stale write")
+
+    # The client-side four-way classification must reconcile without folding business rollback
+    # into abnormal abort. This is the same TxnRunResult consumed by bench_tpcc.TxnStats.
+    samples = [
+        TxnRunResult(True, outcome="committed"),
+        TxnRunResult(False, outcome="business_rollback"),
+        TxnRunResult(False, outcome="abnormal_abort", reason="OTHER"),
+        TxnRunResult(False, outcome="error"),
+    ]
+    attempted = len(samples)
+    counts = {name: sum(r.outcome == name for r in samples) for name in (
+        "committed", "business_rollback", "abnormal_abort", "error"
+    )}
+    if attempted != sum(counts.values()) or counts["business_rollback"] != 1:
+        failures.append("client outcome reconciliation failed: %r" % counts)
+
+    # Cross the 5s boundary and execute once more so the lazy server reporter flushes a window.
+    time.sleep(5.1)
+    a.exec_batch([(s_begin, []), (s_select, [1]), (s_commit, [])])
+    a.close()
+    b.close()
+    stop_server(proc)
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            server_log = f.read()
+    except OSError as exc:
+        server_log = ""
+        failures.append("cannot read server stats log: %s" % exc)
+    for needle in (
+        "RMDB_STMT_STATS window_ms=",
+        "stmt_id=502",
+        "reason=ACTIVE_WRITE_CONFLICT",
+        "reason=STALE_SNAPSHOT_WRITE",
+    ):
+        if needle not in server_log:
+            failures.append("server stats missing %r" % needle)
+    server_aborts = 0
+    for line in server_log.splitlines():
+        if not line.startswith("RMDB_STMT_STATS "):
+            continue
+        for field in line.split():
+            if field.startswith("aborted="):
+                server_aborts += int(field.split("=", 1)[1])
+    if server_aborts != 2:
+        failures.append("server/client abort reconciliation: server=%d client=2" % server_aborts)
+
+    if failures:
+        return CaseResult("PA1", "abort attribution closure", False, "; ".join(failures[:4]))
+    return CaseResult(
+        "PA1", "abort attribution closure", True,
+        "active/stale tokens, failed_op, AUTO_ABORT, 5s stats and four-way reconciliation passed",
+    )
+
 ALL_CASES: List[CaseSpec] = [
+    CaseSpec("PA1", "abort attribution closure", case_pa1_abort_attribution,
+             ("observability", "mvcc", "finals")),
     CaseSpec("C1", "insert heap/MVCC micro-window", case_c1_insert_heap_race, ("mvcc",)),
     CaseSpec("C1b", "uncommitted insert invisible", case_c1_uncommitted_not_visible, ("mvcc",)),
     CaseSpec("C2", "pending overlay same-key insert", case_c2_pending_same_key_insert, ("mvcc",)),

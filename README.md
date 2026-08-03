@@ -11,7 +11,7 @@
 | **学校** | 华中科技大学 |
 | **队员** | 王圣翊、李正文、甘可欣 |
 
-## 项目状态（2026-08-01）
+## 项目状态（2026-08-02）
 
 | 项 | 状态 |
 |----|------|
@@ -19,7 +19,7 @@
 | 初赛性能锚点 | `5a5527f` · 3615.5 tpmC（历史） |
 | **当前阶段** | **决赛** |
 | 决赛成绩结构 | 正确性门禁 100/0 + NewOrder/min 排名（SI） |
-| **最新决赛 OJ** | `bc2c208` **全 PASS · 34,592 NewOrder/min**；性能回退锚点仍为 `c524ff8` **37,248.4** |
+| **最新决赛 OJ** | `5ae93e4` **全 PASS · 33,862.8 NewOrder/min**；H3/H4 已冻结，性能回退锚点仍为 `c524ff8` **37,248.4** |
 | 本机 Git 远端 | 仅 `gitlab`（教育平台） |
 
 主线文档：[`Docs/FinalCompetition/决赛赛题整理.md`](Docs/FinalCompetition/决赛赛题整理.md) · [`Docs/FinalCompetition/决赛准备Todo.md`](Docs/FinalCompetition/决赛准备Todo.md)

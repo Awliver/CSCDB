@@ -62,10 +62,11 @@ class InsertExecutor : public AbstractExecutor {
         if (context_ && context_->txn_mgr_ && context_->txn_ && context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_) &&
             !tab_.cols.empty()) {
             auto &kcol = tab_.cols[0];
-            if (context_->txn_mgr_->mvcc_insert_key_conflict(context_->txn_, tab_name_,
-                                                             rec.data, kcol.offset, kcol.len)) {
+            MvccWriteResult conflict = context_->txn_mgr_->mvcc_insert_key_conflict(
+                context_->txn_, tab_name_, rec.data, kcol.offset, kcol.len);
+            if (conflict != MvccWriteResult::OK) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                AbortReason::DEADLOCK_PREVENTION);
+                                                abort_reason_from(conflict));
             }
         }
 
@@ -116,7 +117,7 @@ class InsertExecutor : public AbstractExecutor {
                     }
                     if (!conflict && other_writer) {
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                        AbortReason::DEADLOCK_PREVENTION);
+                                                        AbortReason::ACTIVE_WRITE_CONFLICT);
                     }
                 }
                 if (conflict) {
@@ -148,7 +149,7 @@ class InsertExecutor : public AbstractExecutor {
                 if (context_->txn_mgr_->is_ser(context_->txn_) &&
                     context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid_, rec.data)) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    AbortReason::SSI_DANGEROUS_STRUCTURE);
                 }
             } catch (...) {
                 if (reserved) fh_->cancel_insert_slot(rid_);

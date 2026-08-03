@@ -807,9 +807,9 @@ void TransactionManager::mvcc_insert(Transaction *txn, const std::string &tab, c
     txn->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab, rid));
 }
 
-bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
-                                    const char *old_data, const char *new_data, int len, bool is_delete,
-                                    std::string *effective_out) {
+MvccWriteResult TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
+                                               const char *old_data, const char *new_data, int len, bool is_delete,
+                                               std::string *effective_out) {
     note_table_write(txn, tab);        // 先计数后写存储：读者门不得漏看在飞写者
     int64_t rkey = mvcc_key(rid);
     recent_writes_add(tab, rkey);      // 先登记后写链：幻影检测扫描范围不得漏看在飞写
@@ -824,15 +824,17 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
     MvccChain *chp = &mvcc_shard_data_[sh].store[tab][rkey];
     MvccChain &ch = *chp;
     auto pit = pending[tab].find(rkey);
-    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id())
+        return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())
+        return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
     // 决赛 SI 铁律：快照之后若已有其它事务提交了新版本，本次写基于的是过期快照，
     // 必须直接 abort，不允许把本次写变基（rebase）合并到最新已提交版本上——
     // 否则会拼出一行任何单个事务都未真正提交过的"缝合"数据，且违反
     // "SI 陈旧写必须 TRANSACTION_ABORT" 的赛题规范（决赛赛题整理 §5.3）。
     if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         ch.hist.back().commit_ts > txn->get_read_ts()) {
-        return false;
+        return MvccWriteResult::STALE_SNAPSHOT_WRITE;
     }
     const char *write_ptr = new_data;
     bool first_touch = (ch.writer != txn->get_transaction_id()) &&
@@ -882,13 +884,13 @@ bool TransactionManager::mvcc_write(Transaction *txn, const std::string &tab, co
             is_delete ? WType::DELETE_TUPLE : WType::UPDATE_TUPLE, tab, rid, undo_old));
     }
     if (effective_out != nullptr) *effective_out = ch.writer_data;
-    return true;
+    return MvccWriteResult::OK;
 }
 
-bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
-                                              const char *visible_data, int len, int col_off,
-                                              ColType col_type, float delta_f, int delta_i,
-                                              std::string *effective_out) {
+MvccWriteResult TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
+                                                         const char *visible_data, int len, int col_off,
+                                                         ColType col_type, float delta_f, int delta_i,
+                                                         std::string *effective_out) {
     note_table_write(txn, tab);
     int64_t rkey = mvcc_key(rid);
     recent_writes_add(tab, rkey);
@@ -902,8 +904,10 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
     auto &pending = mvcc_shard_data_[sh].pending;
     MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
     auto pit = pending[tab].find(rkey);
-    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id())
+        return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())
+        return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
     const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
     // first_touch 须先于伪造基版本判定算出：write_set 内若已有本事务对同一 (tab,rid) 的
@@ -929,14 +933,14 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
     // 决赛 SI 铁律：同 mvcc_write——快照之后已有新提交版本，本次(增量)写也必须 abort，
     // 不得把 delta 变基叠加到最新版本上（哪怕是同列的交换律累加）。
     if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
-        return false;
+        return MvccWriteResult::STALE_SNAPSHOT_WRITE;
     }
     const char *base_rec = visible_data;
     ch.writer = txn->get_transaction_id();
     ch.writer_del = false;
     ch.hold_writer_to_commit = true;
     if (col_type == TYPE_FLOAT) {
-        if (col_off + (int)sizeof(float) > len) return false;
+        if (col_off + (int)sizeof(float) > len) return MvccWriteResult::INVALID;
         if (reuse_writer && !ch.writer_data.empty()) {
             *reinterpret_cast<float *>(ch.writer_data.data() + col_off) += delta_f;
         } else {
@@ -945,7 +949,7 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
                 *reinterpret_cast<const float *>(base_rec + col_off) + delta_f;
         }
     } else if (col_type == TYPE_INT) {
-        if (col_off + (int)sizeof(int) > len) return false;
+        if (col_off + (int)sizeof(int) > len) return MvccWriteResult::INVALID;
         if (reuse_writer && !ch.writer_data.empty()) {
             *reinterpret_cast<int *>(ch.writer_data.data() + col_off) += delta_i;
         } else {
@@ -954,7 +958,7 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
                 *reinterpret_cast<const int *>(base_rec + col_off) + delta_i;
         }
     } else {
-        return false;
+        return MvccWriteResult::INVALID;
     }
     if (first_touch) {
         RmRecord undo_old(len);
@@ -962,14 +966,14 @@ bool TransactionManager::mvcc_write_col_delta(Transaction *txn, const std::strin
         txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab, rid, undo_old));
     }
     if (effective_out != nullptr) *effective_out = ch.writer_data;
-    return true;
+    return MvccWriteResult::OK;
 }
 
-bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
-                                              const char *visible_data, int len,
-                                              const std::vector<MvccColPatch> &patches,
-                                              std::string *effective_out) {
-    if (patches.empty()) return false;
+MvccWriteResult TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
+                                                         const char *visible_data, int len,
+                                                         const std::vector<MvccColPatch> &patches,
+                                                         std::string *effective_out) {
+    if (patches.empty()) return MvccWriteResult::INVALID;
     note_table_write(txn, tab);
     int64_t rkey = mvcc_key(rid);
     recent_writes_add(tab, rkey);
@@ -983,8 +987,10 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
     auto &pending = mvcc_shard_data_[sh].pending;
     MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
     auto pit = pending[tab].find(rkey);
-    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) return false;
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) return false;
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id())
+        return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())
+        return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
 
     const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
@@ -1010,7 +1016,7 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
     // 决赛 SI 铁律：同 mvcc_write——快照之后已有新提交版本，本次写必须 abort，
     // 不得把 patch 变基合并到最新版本上。
     if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
-        return false;
+        return MvccWriteResult::STALE_SNAPSHOT_WRITE;
     }
     const char *base_rec = visible_data;
     if (reuse_writer && !ch.writer_data.empty()) {
@@ -1024,7 +1030,8 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
         ch.writer_data.assign(base_rec, len);
     }
     for (const auto &p : patches) {
-        if (!apply_col_patch_from_visible(p, visible_data, ch.writer_data.data(), len, tmeta)) return false;
+        if (!apply_col_patch_from_visible(p, visible_data, ch.writer_data.data(), len, tmeta))
+            return MvccWriteResult::INVALID;
     }
     if (first_touch) {
         RmRecord undo_old(len);
@@ -1032,24 +1039,26 @@ bool TransactionManager::mvcc_write_col_patch(Transaction *txn, const std::strin
         txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab, rid, undo_old));
     }
     if (effective_out != nullptr) *effective_out = ch.writer_data;
-    return true;
+    return MvccWriteResult::OK;
 }
 
-bool TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
-                                                  const char *rec_data, int key_off, int key_len) {
+MvccWriteResult TransactionManager::mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
+                                                             const char *rec_data, int key_off, int key_len) {
     // 被删键索引 O(1) 点查（原实现持全部分片锁全表扫版本链，占 87% CPU）。
     // 略保守：不再验证被删旧版本对本快照是否可见，误报仅多一次 abort。
     std::scoped_lock<std::mutex> lck(del_meta_latch_);
     auto tit = del_keys_.find(tab);
-    if (tit == del_keys_.end()) return false;
+    if (tit == del_keys_.end()) return MvccWriteResult::OK;
     auto kit = tit->second.find(std::string(rec_data + key_off, key_len));
-    if (kit == tit->second.end()) return false;
+    if (kit == tit->second.end()) return MvccWriteResult::OK;
     const DelKeyState &st = kit->second;
     txn_id_t me = txn->get_transaction_id();
     for (txn_id_t w : st.writers) {
-        if (w != me) return true;                       // 他人未提交删除同键 → 冲突
+        if (w != me) return MvccWriteResult::ACTIVE_WRITE_CONFLICT;  // 他人未提交删除同键
     }
-    return st.last_del_cts > txn->get_read_ts();        // 快照之后已提交的删除 → 冲突
+    return st.last_del_cts > txn->get_read_ts()
+               ? MvccWriteResult::STALE_SNAPSHOT_WRITE
+               : MvccWriteResult::OK;
 }
 
 /* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------

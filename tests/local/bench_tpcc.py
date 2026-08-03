@@ -15,6 +15,7 @@ Tiers:
 """
 
 import argparse
+from collections import defaultdict
 import os
 import random
 import statistics
@@ -44,7 +45,7 @@ from tpcc_transactions import (
     run_neworder,
     run_txn,
 )
-from tpcc_batch import install_prepare, run_txn_batch
+from tpcc_batch import TxnRunResult, install_prepare, run_txn_batch, stmt_name
 from tpcc_consistency import run_consistency_checks, snapshot_bench_start_o_ids, snapshot_ytd_baseline
 from tpcc_load_verify import verify_load_content
 from p2_gate import run_p2_functional_tests
@@ -76,9 +77,33 @@ class TxnStats:
         self.last_err = ""
         self.by_type = {name: {"ok": 0, "fail": 0} for name in TXN_NAMES}
         self.new_order_latencies = []
+        self.outcomes = {
+            name: {
+                "attempted": 0,
+                "committed": 0,
+                "business_rollback": 0,
+                "abnormal_abort": 0,
+                "error": 0,
+            }
+            for name in TXN_NAMES
+        }
+        self.abort_attribution = defaultdict(int)
+        self.window_outcomes = defaultdict(lambda: defaultdict(int))
+        self.window_abort_attribution = defaultdict(int)
+        self.window_started = time.monotonic()
 
-    def record(self, txn_type, ok, err="", latency=0.0):
+    def record(self, txn_type, result, err="", latency=0.0):
+        if isinstance(result, TxnRunResult):
+            rr = result
+        else:
+            rr = TxnRunResult(
+                ok=bool(result),
+                error=err,
+                outcome="committed" if result else "error",
+            )
         with self.lock:
+            ok = rr.ok
+            err = rr.error
             bucket = self.by_type.setdefault(txn_type, {"ok": 0, "fail": 0})
             if ok:
                 bucket["ok"] += 1
@@ -97,6 +122,51 @@ class TxnStats:
                     self.other_fail += 1
             if not ok and err:
                 self.last_err = err
+            outcome = rr.outcome if rr.outcome in (
+                "committed", "business_rollback", "abnormal_abort", "error"
+            ) else "error"
+            ob = self.outcomes.setdefault(txn_type, {
+                "attempted": 0, "committed": 0, "business_rollback": 0,
+                "abnormal_abort": 0, "error": 0,
+            })
+            ob["attempted"] += 1
+            ob[outcome] += 1
+            self.window_outcomes[txn_type]["attempted"] += 1
+            self.window_outcomes[txn_type][outcome] += 1
+            if outcome == "abnormal_abort":
+                key = (txn_type, rr.stmt_id, rr.failed_op, rr.reason, rr.hotspot or "other")
+                self.abort_attribution[key] += 1
+                self.window_abort_attribution[key] += 1
+            self._emit_window_if_due_locked(time.monotonic())
+
+    def _emit_window_if_due_locked(self, now):
+        elapsed = now - self.window_started
+        if elapsed < 5.0:
+            return
+        for txn_type in sorted(self.window_outcomes):
+            b = self.window_outcomes[txn_type]
+            print(
+                "P_A1_CLIENT window_sec=%.3f txn=%s attempted=%d committed=%d "
+                "business_rollback=%d abnormal_abort=%d error=%d"
+                % (
+                    elapsed, txn_type, b.get("attempted", 0), b.get("committed", 0),
+                    b.get("business_rollback", 0), b.get("abnormal_abort", 0),
+                    b.get("error", 0),
+                ),
+                flush=True,
+            )
+        for key, count in sorted(self.window_abort_attribution.items()):
+            txn_type, stmt_id, failed_op, reason, hotspot = key
+            print(
+                "P_A1_ABORT window_sec=%.3f txn=%s stmt_id=%d stmt=%s failed_op=%d "
+                "reason=%s hotspot=%s count=%d"
+                % (elapsed, txn_type, stmt_id, stmt_name(stmt_id), failed_op,
+                   reason, hotspot, count),
+                flush=True,
+            )
+        self.window_outcomes.clear()
+        self.window_abort_attribution.clear()
+        self.window_started = now
 
     def snapshot(self):
         with self.lock:
@@ -108,6 +178,8 @@ class TxnStats:
                 self.last_err,
                 {k: dict(v) for k, v in self.by_type.items()},
                 list(self.new_order_latencies),
+                {k: dict(v) for k, v in self.outcomes.items()},
+                dict(self.abort_attribution),
             )
 
 
@@ -142,15 +214,17 @@ def worker_loop(
             t0 = time.perf_counter()
             try:
                 if use_batch:
-                    ok, err = run_txn_batch(cli, rng, worker_scale, txn_name)
+                    result = run_txn_batch(cli, rng, worker_scale, txn_name)
                 elif txn_name == "new_order":
                     ok, err = run_neworder(cli, rng, worker_scale)
+                    result = TxnRunResult(ok, err, "committed" if ok else "error")
                 else:
                     ok, err = run_txn(cli, rng, worker_scale, txn_name)
+                    result = TxnRunResult(ok, err, "committed" if ok else "error")
             except (RuntimeError, ConnectionRefusedError, OSError) as e:
-                ok, err = False, str(e)
+                result = TxnRunResult(False, str(e), outcome="error")
             dt = time.perf_counter() - t0
-            stats.record(txn_name, ok, err, dt)
+            stats.record(txn_name, result, latency=dt)
     finally:
         cli.close()
 
@@ -190,7 +264,7 @@ def bench_round(
     for t in workers:
         t.join()
     elapsed = time.perf_counter() - start
-    no_ok, no_fail, o_ok, o_fail, last_err, by_type, lats = stats.snapshot()
+    no_ok, no_fail, o_ok, o_fail, last_err, by_type, lats, outcomes, attribution = stats.snapshot()
     tpm = (no_ok / elapsed * 60.0) if elapsed > 0 else 0.0
     print(
         "  [%s] elapsed=%.1fs threads=%d new_order ok=%d fail=%d other ok=%d fail=%d tpmC=%.2f"
@@ -198,6 +272,26 @@ def bench_round(
     )
     if no_fail or o_fail:
         print("    last error:", last_err[:120])
+    reconcile_ok = True
+    for txn_type in sorted(outcomes):
+        b = outcomes[txn_type]
+        rhs = (b["committed"] + b["business_rollback"] +
+               b["abnormal_abort"] + b["error"])
+        balanced = b["attempted"] == rhs
+        reconcile_ok = reconcile_ok and balanced
+        print(
+            "  P_A1_TOTAL txn=%s attempted=%d committed=%d business_rollback=%d "
+            "abnormal_abort=%d error=%d reconcile=%s"
+            % (txn_type, b["attempted"], b["committed"], b["business_rollback"],
+               b["abnormal_abort"], b["error"], "PASS" if balanced else "FAIL")
+        )
+    for key, count in sorted(attribution.items()):
+        txn_type, stmt_id, failed_op, reason, hotspot = key
+        print(
+            "  P_A1_ABORT_TOTAL txn=%s stmt_id=%d stmt=%s failed_op=%d reason=%s "
+            "hotspot=%s count=%d"
+            % (txn_type, stmt_id, stmt_name(stmt_id), failed_op, reason, hotspot, count)
+        )
     return {
         "tpm": tpm,
         "elapsed": elapsed,
@@ -207,6 +301,15 @@ def bench_round(
         "other_fail": o_fail,
         "by_type": by_type,
         "new_order_latencies": lats,
+        "p_a1_outcomes": outcomes,
+        "p_a1_abort_attribution": [
+            {
+                "txn": key[0], "stmt_id": key[1], "stmt": stmt_name(key[1]),
+                "failed_op": key[2], "reason": key[3], "hotspot": key[4], "count": count,
+            }
+            for key, count in sorted(attribution.items())
+        ],
+        "p_a1_reconcile": reconcile_ok,
     }
 
 

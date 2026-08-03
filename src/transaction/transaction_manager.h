@@ -245,8 +245,8 @@ public:
     /* 题9 删-插写写冲突: 插入键 K(首列)时,若本事务快照内可见同键旧版本,且该记录正被其他活跃
        事务未提交删除、或在快照之后被提交删除 → 本插入与该删除基于同一旧版本 → 冲突(调用方 abort)。
        新键插入(无可见旧版本)、自删重插(writer==me)、早已提交的重复键 均不冲突。 */
-    bool mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
-                                  const char *rec_data, int key_off, int key_len);
+    MvccWriteResult mvcc_insert_key_conflict(Transaction *txn, const std::string &tab,
+                                             const char *rec_data, int key_off, int key_len);
     /* heap_live=false 表示调用方已确认该 rid 的堆槽位不存活（bitmap 未置位，典型来源是
        陈旧索引项指向已物理删除的记录）：此时"无版本链 → 回退堆数据"的路径必须判为不可见，
        且不得解引用 heap_data（允许传 nullptr）。 */
@@ -260,18 +260,18 @@ public:
     void mvcc_insert(Transaction *txn, const std::string &tab, const Rid &rid,
                      const char *data, int len);
     /* 写(update/delete)：写写冲突检测 + 登记未提交版本；冲突返回 false（调用方应 abort 该事务） */
-    bool mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
-                    const char *old_data, const char *new_data, int len, bool is_delete,
-                    std::string *effective_new = nullptr);
-    /* 单列 col=col±字面量（int/float）；配合 hold_writer_to_commit，跨语句累加增量 */
-    bool mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
-                              const char *visible_data, int len, int col_off, ColType col_type,
-                              float delta_f, int delta_i, std::string *effective_new = nullptr);
-    /* 多列 UPDATE：基底版本上按 patches 改列；快照之后若已有新提交版本则 abort（SI 陈旧写规则） */
-    bool mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
-                              const char *visible_data, int len,
-                              const std::vector<MvccColPatch> &patches,
+    MvccWriteResult mvcc_write(Transaction *txn, const std::string &tab, const Rid &rid,
+                              const char *old_data, const char *new_data, int len, bool is_delete,
                               std::string *effective_new = nullptr);
+    /* 单列 col=col±字面量（int/float）；配合 hold_writer_to_commit，跨语句累加增量 */
+    MvccWriteResult mvcc_write_col_delta(Transaction *txn, const std::string &tab, const Rid &rid,
+                                         const char *visible_data, int len, int col_off, ColType col_type,
+                                         float delta_f, int delta_i, std::string *effective_new = nullptr);
+    /* 多列 UPDATE：基底版本上按 patches 改列；快照之后若已有新提交版本则 abort（SI 陈旧写规则） */
+    MvccWriteResult mvcc_write_col_patch(Transaction *txn, const std::string &tab, const Rid &rid,
+                                         const char *visible_data, int len,
+                                         const std::vector<MvccColPatch> &patches,
+                                         std::string *effective_new = nullptr);
 
     /* ------------------------ 题9：SER（SSI 风格可串行化） ------------------------ */
     bool is_ser(Transaction *txn);

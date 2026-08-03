@@ -181,6 +181,8 @@ class BatchResult:
     diagnostic: str = ""
     executed: int = 0
     failed_op: int = 0xFFFF
+    failed_stmt_id: int = 0
+    failed_params: tuple = field(default_factory=tuple)
     # op_index -> rows (only query ops)
     results: dict = field(default_factory=dict)
 
@@ -296,6 +298,9 @@ class WireClient:
             failed_op=failed_op,
         )
         if status != BATCH_STATUS_OK:
+            if failed_op < len(ops):
+                out.failed_stmt_id = int(ops[failed_op][0])
+                out.failed_params = tuple(ops[failed_op][1])
             return out
         (result_count,) = struct.unpack_from(">H", body, off)
         off += 2

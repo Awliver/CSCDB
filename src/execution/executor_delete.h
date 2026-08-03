@@ -94,21 +94,24 @@ class DeleteExecutor : public AbstractExecutor {
             if (versioning) {
                 // 显式事务：行锁持有到 commit/abort（与 update 对称，语句尾不 unlock）
                 if (context_->lock_mgr_ && context_->txn_->get_txn_mode()) {
-                    if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
+                    LockAcquireResult lock_result = context_->lock_mgr_->lock_exclusive_on_record(
+                        context_->txn_, rid, fh_->GetFd());
+                    if (lock_result != LockAcquireResult::GRANTED) {
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                        AbortReason::DEADLOCK_PREVENTION);
+                                                        abort_reason_from(lock_result));
                     }
                 }
-                if (!context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
-                                                    slot, nullptr, record_size_, true)) {
+                MvccWriteResult write_result = context_->txn_mgr_->mvcc_write(
+                    context_->txn_, tab_name_, rid, slot, nullptr, record_size_, true);
+                if (write_result != MvccWriteResult::OK) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    abort_reason_from(write_result));
                 }
                 // 题9 SER：被删旧记录 vs 其他事务读 → rw 反依赖；成 SSI 危险结构则 abort
                 if (context_->txn_mgr_->is_ser(context_->txn_) &&
                     context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, slot)) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    AbortReason::SSI_DANGEROUS_STRUCTURE);
                 }
                 // 题10 WAL：逻辑删除也记删除日志（redo 时物化删除）
                 if (context_->log_mgr_) {

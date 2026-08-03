@@ -140,6 +140,18 @@ def print_oj_summary(
     print("  median tpmC:   %.2f  (OJ metric)" % median_tpm)
     print("  new_order:     ok=%d fail=%d" % (total_no_ok, total_no_fail))
     print("  other_fail:    %d" % total_other_fail)
+    pa1_attempted = 0
+    pa1_rhs = 0
+    for r in round_results:
+        for counts in r.get("p_a1_outcomes", {}).values():
+            pa1_attempted += counts.get("attempted", 0)
+            pa1_rhs += sum(counts.get(k, 0) for k in (
+                "committed", "business_rollback", "abnormal_abort", "error"
+            ))
+    if pa1_attempted:
+        print("  P-A1 reconcile: %s (%d=%d)" % (
+            "PASS" if pa1_attempted == pa1_rhs else "FAIL", pa1_attempted, pa1_rhs
+        ))
     for i, r in enumerate(round_results, 1):
         elapsed = r.get("elapsed", 0)
         expected = measure
@@ -235,6 +247,36 @@ def build_result_payload(
     """Assemble one bench record (PASS or FAIL)."""
     build = detect_build_info()
     g = git_info()
+    pa1_outcomes = {}
+    pa1_abort_rows = {}
+    for result in round_results or []:
+        for txn, counts in result.get("p_a1_outcomes", {}).items():
+            dst = pa1_outcomes.setdefault(txn, {
+                "attempted": 0, "committed": 0, "business_rollback": 0,
+                "abnormal_abort": 0, "error": 0,
+            })
+            for key in dst:
+                dst[key] += counts.get(key, 0)
+        for row in result.get("p_a1_abort_attribution", []):
+            key = (row.get("txn"), row.get("stmt_id"), row.get("failed_op"),
+                   row.get("reason"), row.get("hotspot"))
+            if key not in pa1_abort_rows:
+                pa1_abort_rows[key] = dict(row)
+                pa1_abort_rows[key]["count"] = 0
+            pa1_abort_rows[key]["count"] += row.get("count", 0)
+    total_abnormal = sum(v.get("abnormal_abort", 0) for v in pa1_outcomes.values())
+    reason_counts = {}
+    for row in pa1_abort_rows.values():
+        reason = row.get("reason", "OTHER")
+        reason_counts[reason] = reason_counts.get(reason, 0) + row.get("count", 0)
+    top3 = sum(sorted(reason_counts.values(), reverse=True)[:3])
+    pa1_reconcile = all(
+        counts.get("attempted", 0) == sum(counts.get(k, 0) for k in (
+            "committed", "business_rollback", "abnormal_abort", "error"
+        ))
+        for counts in pa1_outcomes.values()
+    )
+
     payload = {
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "tier": tier,
@@ -252,6 +294,14 @@ def build_result_payload(
         "new_order_fail": sum(r.get("new_order_fail", 0) for r in (round_results or [])),
         "other_fail": sum(r.get("other_fail", 0) for r in (round_results or [])),
         "round_elapsed_sec": [r.get("elapsed", 0) for r in (round_results or [])],
+        "p_a1_outcomes": pa1_outcomes,
+        "p_a1_abort_attribution": sorted(
+            pa1_abort_rows.values(),
+            key=lambda row: (-row.get("count", 0), row.get("txn", ""), row.get("stmt_id", 0)),
+        ),
+        "p_a1_reason_counts": reason_counts,
+        "p_a1_top3_abort_coverage": (top3 / total_abnormal) if total_abnormal else 1.0,
+        "p_a1_reconcile": pa1_reconcile,
         "consistency": (
             None if consistency_ok is None else ("PASS" if consistency_ok else "FAIL")
         ),

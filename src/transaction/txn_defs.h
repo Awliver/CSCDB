@@ -116,8 +116,60 @@ struct std::hash<LockDataId> {
     size_t operator()(const LockDataId &obj) const { return std::hash<int64_t>()(obj.Get()); }
 };
 
-/* 事务回滚原因 */
-enum class AbortReason { LOCK_ON_SHIRINKING = 0, UPGRADE_CONFLICT, DEADLOCK_PREVENTION };
+/*
+ * 稳定的事务异常归因。枚举值和 token 是 Wire diagnostic / P-A1 统计契约，
+ * 不得用异常英文文本反推原因。旧的锁异常保留在末尾，避免改变既有控制流。
+ */
+enum class AbortReason : uint8_t {
+    NONE = 0,
+    ACTIVE_WRITE_CONFLICT,
+    STALE_SNAPSHOT_WRITE,
+    SSI_DANGEROUS_STRUCTURE,
+    WFG_DEADLOCK,
+    BUFFER_POOL_PRESSURE,
+    OTHER,
+    LOCK_ON_SHIRINKING,
+    UPGRADE_CONFLICT,
+    DEADLOCK_PREVENTION,
+};
+
+inline const char *abort_reason_token(AbortReason reason) {
+    switch (reason) {
+        case AbortReason::NONE: return "NONE";
+        case AbortReason::ACTIVE_WRITE_CONFLICT: return "ACTIVE_WRITE_CONFLICT";
+        case AbortReason::STALE_SNAPSHOT_WRITE: return "STALE_SNAPSHOT_WRITE";
+        case AbortReason::SSI_DANGEROUS_STRUCTURE: return "SSI_DANGEROUS_STRUCTURE";
+        case AbortReason::WFG_DEADLOCK: return "WFG_DEADLOCK";
+        case AbortReason::BUFFER_POOL_PRESSURE: return "BUFFER_POOL_PRESSURE";
+        default: return "OTHER";
+    }
+}
+
+enum class MvccWriteResult : uint8_t {
+    OK = 0,
+    ACTIVE_WRITE_CONFLICT,
+    STALE_SNAPSHOT_WRITE,
+    INVALID,
+};
+
+enum class LockAcquireResult : uint8_t {
+    GRANTED = 0,
+    ACTIVE_WRITE_CONFLICT,
+    WFG_DEADLOCK,
+    INVALID,
+};
+
+inline AbortReason abort_reason_from(MvccWriteResult result) {
+    if (result == MvccWriteResult::ACTIVE_WRITE_CONFLICT) return AbortReason::ACTIVE_WRITE_CONFLICT;
+    if (result == MvccWriteResult::STALE_SNAPSHOT_WRITE) return AbortReason::STALE_SNAPSHOT_WRITE;
+    return AbortReason::OTHER;
+}
+
+inline AbortReason abort_reason_from(LockAcquireResult result) {
+    if (result == LockAcquireResult::ACTIVE_WRITE_CONFLICT) return AbortReason::ACTIVE_WRITE_CONFLICT;
+    if (result == LockAcquireResult::WFG_DEADLOCK) return AbortReason::WFG_DEADLOCK;
+    return AbortReason::OTHER;
+}
 
 /* 事务回滚异常，在rmdb.cpp中进行处理 */
 class TransactionAbortException : public std::exception {
@@ -128,9 +180,9 @@ class TransactionAbortException : public std::exception {
     explicit TransactionAbortException(txn_id_t txn_id, AbortReason abort_reason)
         : txn_id_(txn_id), abort_reason_(abort_reason) {}
 
-    txn_id_t get_transaction_id() { return txn_id_; }
-    AbortReason GetAbortReason() { return abort_reason_; }
-    std::string GetInfo() {
+    txn_id_t get_transaction_id() const { return txn_id_; }
+    AbortReason GetAbortReason() const { return abort_reason_; }
+    std::string GetInfo() const {
         switch (abort_reason_) {
             case AbortReason::LOCK_ON_SHIRINKING: {
                 return "Transaction " + std::to_string(txn_id_) +
@@ -144,6 +196,15 @@ class TransactionAbortException : public std::exception {
 
             case AbortReason::DEADLOCK_PREVENTION: {
                 return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention\n";
+            } break;
+
+            case AbortReason::ACTIVE_WRITE_CONFLICT:
+            case AbortReason::STALE_SNAPSHOT_WRITE:
+            case AbortReason::SSI_DANGEROUS_STRUCTURE:
+            case AbortReason::WFG_DEADLOCK:
+            case AbortReason::BUFFER_POOL_PRESSURE:
+            case AbortReason::OTHER: {
+                return "RMDB_ABORT reason=" + std::string(abort_reason_token(abort_reason_));
             } break;
 
             default: {

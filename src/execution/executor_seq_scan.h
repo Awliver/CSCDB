@@ -149,7 +149,7 @@ class SeqScanExecutor : public AbstractExecutor {
                     // 读侧：本次读到的记录若有他事务不可见写 → rw 反依赖；成 SSI 危险结构则 abort
                     if (context_->txn_mgr_->ser_read_check(context_->txn_, tab_name_, rid_))
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                        AbortReason::DEADLOCK_PREVENTION);
+                                                        AbortReason::SSI_DANGEROUS_STRUCTURE);
                 }
                 return;
             }
@@ -228,7 +228,7 @@ class SeqScanExecutor : public AbstractExecutor {
             // 读侧(谓词)：检测匹配本谓词但快照不可见的他事务写(幻影插入)→ rw 反依赖；成 SSI 危险结构则 abort
             if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                AbortReason::DEADLOCK_PREVENTION);
+                                                AbortReason::SSI_DANGEROUS_STRUCTURE);
         }
         scan_ = std::make_unique<RmScan>(fh_);
         position_to_next_match();

@@ -89,7 +89,7 @@ void LockManager::clear_wfg_state(txn_id_t txn) {
  * @param {Rid&} rid 加锁的目标记录ID 记录所在的表的fd
  * @param {int} tab_fd
  */
-bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
+LockAcquireResult LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
     return lock_exclusive_on_record(txn, rid, tab_fd);
 }
 
@@ -100,11 +100,11 @@ bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int ta
  * @param {Rid&} rid 加锁的目标记录ID
  * @param {int} tab_fd 记录所在的表的fd
  */
-bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
-    if (txn == nullptr) return false;
+LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
+    if (txn == nullptr) return LockAcquireResult::INVALID;
     LockDataId lock_id(tab_fd, rid, LockDataType::RECORD);
     auto lock_set = txn->get_lock_set();
-    if (lock_set->count(lock_id)) return true;
+    if (lock_set->count(lock_id)) return LockAcquireResult::GRANTED;
 
     txn->clear_lock_abort();
     {
@@ -126,13 +126,13 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         entry.owner != INVALID_TXN_ID && entry.owner != me) {
         clear_wfg_state(me);
         txn->clear_lock_abort();
-        return false;
+        return LockAcquireResult::ACTIVE_WRITE_CONFLICT;
     }
     while (entry.owner != INVALID_TXN_ID && entry.owner != me) {
         if (txn->lock_abort_requested()) {
             clear_wfg_state(me);
             txn->clear_lock_abort();
-            return false;
+            return LockAcquireResult::WFG_DEADLOCK;
         }
 
         txn_id_t wake_victim = INVALID_TXN_ID;
@@ -148,7 +148,7 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
                     wait_for_.erase(me);
                     waiting_on_entry_.erase(me);
                     txn->clear_lock_abort();
-                    return false;
+                    return LockAcquireResult::WFG_DEADLOCK;
                 }
                 wake_victim = victim;
             }
@@ -160,7 +160,7 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         if (txn->lock_abort_requested()) {
             clear_wfg_state(me);
             txn->clear_lock_abort();
-            return false;
+            return LockAcquireResult::WFG_DEADLOCK;
         }
 
         // 阻塞等待：unlock / WFG notify 唤醒；lock_abort_ 在谓词入口检查（无需 1ms 轮询）
@@ -176,14 +176,14 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         if (txn->lock_abort_requested()) {
             clear_wfg_state(me);
             txn->clear_lock_abort();
-            return false;
+            return LockAcquireResult::WFG_DEADLOCK;
         }
     }
     clear_wfg_state(me);
     txn->clear_lock_abort();
     entry.owner = me;
     lock_set->insert(lock_id);
-    return true;
+    return LockAcquireResult::GRANTED;
 }
 
 /**

@@ -1,11 +1,11 @@
 # 决赛准备 Todo
 
-> **⚡ 状态速览（2026-08-01）**：最新提交 `bc2c208` OJ **全 PASS**，排名中位 **34,592 NewOrder/min**；H3 INLJ SSI 已冻结。
-> 正确性、COMMIT 持久化、恢复、W=50 装载与 I/O 诊断均已通过；最新装载 **711.11s**（9 表、25,050,197 行）。性能回退锚点继续使用 `c524ff8` 的 **37,248.4**，不以单次较低样本覆盖。详见 [`08-01 OJ 性能测评报告摘要`](./0801-OJ性能测评报告摘要.md)。
+> **⚡ 状态速览（2026-08-02）**：最新提交 `5ae93e4` OJ **全 PASS**，排名中位 **33,862.8 NewOrder/min**；H3/H4 已冻结。
+> 正确性、COMMIT 持久化、恢复、W=50 装载与 I/O 诊断均已通过；最新装载 **700.54s**（9 表、25,050,905 行）。性能回退锚点继续使用 `c524ff8` 的 **37,248.4**，不以单次较低样本覆盖。详见 [`08-02 OJ 性能测评报告摘要`](./0802-OJ性能测评报告摘要.md)。
 > 07-30 首个有效成绩 **10,402 NewOrder/min** 及当日六份报告的根因链保留在 [`0730-OJ战役复盘`](./0730-OJ战役复盘.md)。当前主线为在完整门禁不退化的前提下继续排名优化，优先降低异常放弃率与尾延迟。
 > 本文以下内容保留作检查清单；已被官方结果覆盖的条目已更新。
 
-> **末次修订**：2026-08-01（最新官方全流程 PASS）
+> **末次修订**：2026-08-02（H4 冻结版本官方全流程 PASS）
 > **成绩结构**：必通过正确性门禁（过=Score **100**，不过=**0**）+ TPC-C 饱和负载 **NewOrder/min 中位数**排名（固定 **SI**）  
 > **规范**：[`决赛赛题整理.md`](./决赛赛题整理.md) · PDF 原文见 `Docs/` 根目录  
 > **初赛锚点**：OJ **3615.5** @ `5a5527f`（[`Optimize/12`](../Optimize/12.初赛冻结备忘.md)）· 已落地：[§5](../Optimize/5.已完成优化摘要.md)  
@@ -23,13 +23,13 @@
 | 合规 | 禁止表名 / SQL 硬编码旁路；ACID 不得为性能降级；禁改 `CMakeLists.txt` |
 | 初赛成绩 | 仅作历史锚点；勿再向初赛 OJ 镜像刷榜；本机仅 `gitlab` |
 
-### 当前阶段（08-01 官方 PASS 后）
+### 当前阶段（08-02 H4 冻结后）
 
 ```
-正确性 / 持久化 / 恢复 / 装载门禁   最新 bc2c208 已通过
-最新 W=50×32 三窗中位               34,592 NewOrder/min
+正确性 / 持久化 / 恢复 / 装载门禁   最新 5ae93e4 已通过
+最新 W=50×32 三窗中位               33,862.8 NewOrder/min
 性能回退锚点                         c524ff8 · 37,248.4 NewOrder/min
-后续工作                             H4 正确性 → abort 归因 → 单变量排名优化
+后续工作                             abort 归因 → 由证据触发的单变量排名优化
 本地 W=5                           仅作趋势和定向定位
 ```
 
@@ -97,8 +97,9 @@ python3 tests/run_tests.py
 | **07-27 晚** | 官方评测门禁 FAIL → 修复 SI 陈旧写 abort + FLOAT NaN/Inf 拒绝 | `run_tests` **11/11** · 一致性 **15/15**（quick）+ **C3/M7/H1/H4** 单独复验全过 · 新增 **SI1/F2** 用例 PASS · mid median **3772.23**（NewOrder ok=11322 fail=702，无回归） |
 | **08-01 13:34** | **性能回退锚点评测 `c524ff8`** | **PASS**；W=50 9 表 **25,050,594** 行装载 **830.06s**；三轮 37,166.4 / 37,248.4 / 38,150.0，中位 **37,248.4 NewOrder/min** |
 | **08-01 20:29** | **H3 冻结评测 `bc2c208`** | **PASS**；25 功能 + 5 恢复、COMMIT 32/32、崩后 44 聚合 + 5,974 关系检查及 I/O 诊断全过；装载 **711.11s**；三轮 37,135.2 / 33,200.8 / 34,592.0，中位 **34,592**。H3 仅启用在 SER SELECT，无证据归因跨次约 7.13% 下降；冻结 H3，保留 37,248.4 为性能锚点 |
+| **08-02 21:14** | **H4 冻结评测 `5ae93e4`** | **PASS**；25 功能 + 5 恢复、COMMIT 32/32、三窗 50/50、崩溃恢复及 I/O 诊断全过；装载 **700.54s**；三轮 35,174 / 32,885.2 / 33,862.8，中位 **33,862.8**。本地同提交 SI A/B **+0.0285%**，冻结 H4；性能锚点仍为 37,248.4 |
 
-> mid 仍为 **W=5 / 16 线程 / 60s×3** 趋势窗；`--finals` 为 150s×3 / 32 客户端（本地仍 W=5 CSV，非 OJ W=50）。
+> 当前 `full` 已表示 W=50；W=5 趋势须显式使用 `--scale local`。本地可比 H4 A/B 为 `--mid --scale local`（16 线程 / 60s×3）。
 
 ---
 
@@ -106,10 +107,10 @@ python3 tests/run_tests.py
 
 | 序 | 项 | 状态 | 来源 |
 |:--:|----|:----:|------|
-| 1 | H3 INLJ 缺 SSI · H4 `ser_finish` 无锁读 | 🟡 | H3 🧊（`d39fcdb`/`bc2c208` 官方 PASS 后冻结）；H4 ⬜；一致性 §三 |
+| — | H3 INLJ 缺 SSI · H4 `ser_finish` 无锁读 | 🧊 | H3 `bc2c208`、H4 `5ae93e4` 均在官方 PASS 后冻结；一致性 §三 |
 | 2 | C3 Cleaner TOCTOU · C4 脏页/日志序 · C5 `page_lsn` | ⬜ | 一致性 §三 |
 | 3 | H1/H2 索引边角 | ⬜ | 一致性 §三 |
-| 4 | 装载 900s 预算 + 动态 `order_line` | ✅ | 最新官方：W=50、9 表 25,050,197 行，**711.11s**；`order_line` 已通过全量装载与恢复检查 |
+| 4 | 装载 900s 预算 + 动态 `order_line` | ✅ | 最新官方：W=50、9 表 25,050,905 行，**700.54s**；`order_line` 已通过全量装载与恢复检查 |
 | 5 | 同步陷阱文档过时条目 | ✅ | §四 + ProjectAnalysis/5（部分） |
 | 6 | 本地 TPC-C Payment 绝对写回（legacy 文本） | ✅ | **BATCH 路径已改相对更新**（`w_ytd`/`d_ytd`/`c_balance`/`c_ytd_payment`/`s_ytd` 等）；`--stream` 旧路径仍可能绝对写，日常勿用 |
 
@@ -117,20 +118,20 @@ python3 tests/run_tests.py
 
 ## 3. P2 — 优化活动队列（官方基线后 · W=50×32）
 
-> 08-01 官方全流程已通过；后续仅可在保持该基线的前提下启动。裁决、实现和量化门槛 → [`Optimize/14`](../Optimize/14.决赛优化状态与实施计划.md)；队列 → [`Optimize/2`](../Optimize/2.待落地优化Todo.md)。
+> 08-02 `5ae93e4` 官方全流程已通过；后续仅可在保持该基线的前提下启动。裁决、实现和量化门槛 → [`Optimize/14`](../Optimize/14.决赛优化状态与实施计划.md)；队列 → [`Optimize/2`](../Optimize/2.待落地优化Todo.md)。
 > 正式规格：**50 仓 × 32 客户端** · 预热 30s · **3×150s** · 隔离 **SI**  
 > 本地 W=5 脚本仅作趋势，**不能替代**决赛自检。
 
 | 序 | 项 | 状态 | 备注 |
 |:--:|----|:----:|------|
-| 1 | H3 INLJ 补 SSI 内表谓词/RID 跟踪 | 🧊 | `d39fcdb` 实现，`bc2c208` 官方全 PASS 后冻结；仅新 SER 反例才解冻 |
-| 2 | H4 `ser_finish` 使用锁内 watermark | 🔴 | 消除对 `active_rts_` 的无锁读取，补高重复/TSan |
-| 3 | abort 事务族×语句×原因归因 | 🟠 | 两次 W=50 形；Top-3 原因覆盖 ≥80% |
-| 4 | district/stock 冲突窗口收缩 | 🧪 | 仅当相关冲突占 abort ≥30% 或贡献 p99 ≥25% |
-| 5 | PREPARE_SET 分析/元数据缓存 | 🧪 | 先证明持锁后解析/计划开销显著；一次缓存一种语句形态 |
-| 6 | P3 字节/等待者阈值组提交 | 🧪 | 仅当三窗 `commit_waits/fsync≤2` 且 commit p95 占比 ≥20%；禁固定 sleep |
-| 7 | P2 `UPDATE_DELTA` / SER 谓词预编译 | 🧊 已集成 | 当前 HEAD 已包含，不再列为待上线项 |
-| 8 | 本地 TPC-C 走 OJ BATCH 热路径 | ✅ | `tpcc_batch.py` + 默认 `PREPARE_SET+EXEC_BATCH`；`--stream` 仅 A/B |
+| — | H3 INLJ 补 SSI 内表谓词/RID 跟踪 | 🧊 | `d39fcdb` 实现，`bc2c208` 官方全 PASS 后冻结；仅新 SER 反例才解冻 |
+| — | H4 `ser_finish` 使用锁内 watermark | 🧊 | `5ae93e4` 官方全 PASS；16×200×20、TSan、SI A/B +0.0285%；仅新 SER/race/锁序反例解冻 |
+| 1 | abort 事务族×语句×原因归因 | 🟠 | 两次 W=50 形；Top-3 原因覆盖 ≥80% |
+| 2 | district/stock 冲突窗口收缩 | 🧪 | 仅当相关冲突占 abort ≥30% 或贡献 p99 ≥25% |
+| 3 | PREPARE_SET 分析/元数据缓存 | 🧪 | 先证明持锁后解析/计划开销显著；一次缓存一种语句形态 |
+| 4 | P3 字节/等待者阈值组提交 | 🧪 | 仅当三窗 `commit_waits/fsync≤2` 且 commit p95 占比 ≥20%；禁固定 sleep |
+| — | P2 `UPDATE_DELTA` / SER 谓词预编译 | 🧊 已集成 | 当前 HEAD 已包含，不再列为待上线项 |
+| — | 本地 TPC-C 走 OJ BATCH 热路径 | ✅ | `tpcc_batch.py` + 默认 `PREPARE_SET+EXEC_BATCH`；`--stream` 仅 A/B |
 
 **每项上线前**：
 
@@ -172,8 +173,8 @@ python3 tests/local/run_oj_perf_test.py --finals
 - [x] 五事务正确；在线一致性 + 恢复后一致性（本地 W=5 已覆盖）
 - [x] 本地排名路径 `PREPARE_SET + EXEC_BATCH`（`tpcc_batch.py`；附件 A §7 批次边界；相对 FLOAT 更新）
 - [x] 本地 mid 完整门禁 PASS（2026-07-27：11/11 + C1/C2/H5 + mid median **3578.46**，NewOrder 0 fail）
-- [x] 装载正式数据在 900s 内完成（最新官方：W=50、**711.11s**；性能锚点轮 830.06s）
-- [x] （排名）W=50×32 / SI / 3×150s 可跑通且仓库覆盖门禁过（最新 `bc2c208`：3/3 窗、32 客户端、50/50 覆盖）
+- [x] 装载正式数据在 900s 内完成（最新官方：W=50、**700.54s**；性能锚点轮 830.06s）
+- [x] （排名）W=50×32 / SI / 3×150s 可跑通且仓库覆盖门禁过（最新 `5ae93e4`：3/3 窗、32 客户端、50/50 覆盖）
 - [x] 无表名/SQL 硬编码旁路；未改 CMake；ACID 未降级
 - [ ] 推送目标确认（本机 `gitlab`；正式交卷按赛方要求）
 
@@ -193,3 +194,4 @@ python3 tests/local/run_oj_perf_test.py --finals
 | **2026-07-27 晚** | **官方评测门禁 FAIL 修复**：官方性能测评报告 3 项功能失败——`Float Precision`（Server ERROR）、`Transaction Commit Index`（typed 结果不匹配/幻行）、`Snapshot Isolation Model`（陈旧快照写未按 SI 规范 abort，观测到 COMMAND_OK）。根因定位：①`transaction_manager.cpp` 的 `mvcc_write`/`mvcc_write_col_delta`/`mvcc_write_col_patch` 在检测到 `ch.hist.back().commit_ts > txn->get_read_ts()`（快照之后已有新提交版本）时，此前会调用 `rebase_write_delta`/`apply_col_patch_rebase` 把本次写变基合并到最新版本继续放行，违反决赛赛题整理 §5.3"SI 陈旧写必须 TRANSACTION_ABORT"；②`rmdb.cpp` 的 `wire_param_literal` 用 `%.9g` 序列化 FLOAT32 时未防护 NaN/±Inf，生成的 `"nan"/"inf"` 文本无法被词法分析器识别，回填 SQL 后触发不可控 Server ERROR。**修复**：三个 `mvcc_write*` 函数陈旧写分支改为无条件 `return false`（触发 `TransactionAbortException`），移除已死的 `rebase_write_delta`/`apply_col_patch_rebase`；`wire_param_literal` 增加 `std::isfinite` 检查，非 finite 值主动抛 `WireProtocolError`（受控 `BATCH_STATUS_ERROR`，不落入 lexer 崩溃路径）。新增本地回归 `SI1`（陈旧写必 abort）、`F2`（inf/nan 参数拒绝）纳入 `tests/local/consistency/cases.py`。验证：`run_tests.py` 11/11、一致性 quick 15/15 + C3/M7/H1/H4 单独复验全过、mid 门禁 median **3772.23**（较修复前 3578.46 无回归，NewOrder ok=11322 fail=702，一致性检查全 PASS） |
 | **2026-08-01** | **官方全流程 PASS**：功能 25 项、恢复 5 项、COMMIT 持久化 32/32 均通过；W=50 九表 25,050,594 行装载 **830.06s**（<900s）；32 客户端 3×150s 三轮 **37,166.4 / 37,248.4 / 38,150.0**，排名中位 **37,248.4 NewOrder/min**；崩后 44 项聚合、5,974 项关系检查与非排名 I/O 诊断均 PASS。完整数字见 [`08-01 OJ 性能测评报告摘要`](./0801-OJ性能测评报告摘要.md)。 |
 | **2026-08-01 晚** | **H3 冻结**：`d39fcdb` 补 INLJ 右表实例化谓词/RID SSI 跟踪，`bc2c208` 官方 25 功能、5 恢复、COMMIT 32/32、恢复与 I/O 全 PASS；最新三窗中位 **34,592**。因排名固定 SI、R1 与锚点仅差 0.08%、abort 仅 +0.19pp，无证据将跨次下降归因 H3；源码冻结，性能锚点仍为 **37,248.4**。 |
+| **2026-08-02** | **H4 冻结**：`5ae93e4` 将 `gc_watermark` 从 `rts_latch_` 锁内显式传入 `ser_finish`，commit/abort 与 `ser_latch_` 无嵌套；H4 16×200×20、TSan、功能 11/11、C1/C2/H3/H4/H5 通过，同提交 SI mid A/B **+0.0285%**；官方 25 功能、5 恢复、COMMIT 32/32、W=50 三窗、崩溃恢复与 I/O 全 PASS，中位 **33,862.8**。H4 冻结，性能锚点仍为 **37,248.4**。 |

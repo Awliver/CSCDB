@@ -68,9 +68,9 @@ public:
 
     ~LockManager() {}
 
-    bool lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd);
+    LockAcquireResult lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
-    bool lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
+    LockAcquireResult lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
 

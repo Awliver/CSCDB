@@ -448,7 +448,7 @@ class IndexScanExecutor : public AbstractExecutor {
                 context_->txn_mgr_->ser_record_read(context_->txn_, tab_name_, rid_);
                 if (context_->txn_mgr_->ser_read_check(context_->txn_, tab_name_, rid_))
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    AbortReason::SSI_DANGEROUS_STRUCTURE);
             }
             if (ring_on) {
                 int32_t payload = -1;
@@ -577,7 +577,7 @@ class IndexScanExecutor : public AbstractExecutor {
             // 读侧(谓词)：匹配本谓词但快照不可见的他事务写(幻影插入) → rw 反依赖；危险结构则 abort
             if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                AbortReason::DEADLOCK_PREVENTION);
+                                                AbortReason::SSI_DANGEROUS_STRUCTURE);
         }
         auto ih = sm_manager_->ihs_.at(
             sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();

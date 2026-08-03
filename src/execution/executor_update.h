@@ -192,9 +192,11 @@ class UpdateExecutor : public AbstractExecutor {
             // 显式事务 MVCC 写：行锁与 delete 对称，持有到 commit/abort
             if (context_ && context_->lock_mgr_ && context_->txn_ && context_->txn_->get_txn_mode() &&
                 mvcc_path) {
-                if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
+                LockAcquireResult lock_result = context_->lock_mgr_->lock_exclusive_on_record(
+                    context_->txn_, rid, fh_->GetFd());
+                if (lock_result != LockAcquireResult::GRANTED) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    abort_reason_from(lock_result));
                 }
             }
 
@@ -203,12 +205,12 @@ class UpdateExecutor : public AbstractExecutor {
                 if (!context_->txn_mgr_->mvcc_read(context_->txn_, tab_name_, rid,
                                                      slot, record_size_, visible)) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    AbortReason::OTHER);
                 }
                 ColArithDelta col_delta = detect_col_arith_delta();
-                bool write_ok = false;
+                MvccWriteResult write_result = MvccWriteResult::INVALID;
                 if (col_delta.hit) {
-                    write_ok = context_->txn_mgr_->mvcc_write_col_delta(
+                    write_result = context_->txn_mgr_->mvcc_write_col_delta(
                         context_->txn_, tab_name_, rid, visible.data(), record_size_,
                         col_delta.col_off, col_delta.col_type, col_delta.delta_f, col_delta.delta_i,
                         &mvcc_effective);
@@ -222,23 +224,24 @@ class UpdateExecutor : public AbstractExecutor {
                             (int)p.abs_value.size() >= p.len) {
                             int o = *reinterpret_cast<const int *>(visible.data() + p.offset);
                             int n = *reinterpret_cast<const int *>(p.abs_value.data());
-                            write_ok = context_->txn_mgr_->mvcc_write_col_delta(
+                            write_result = context_->txn_mgr_->mvcc_write_col_delta(
                                 context_->txn_, tab_name_, rid, visible.data(), record_size_,
                                 p.offset, TYPE_INT, 0.f, n - o, &mvcc_effective);
                         } else if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float) &&
                                    (int)p.abs_value.size() >= p.len) {
                             float o = *reinterpret_cast<const float *>(visible.data() + p.offset);
                             float n = *reinterpret_cast<const float *>(p.abs_value.data());
-                            write_ok = context_->txn_mgr_->mvcc_write_col_delta(
+                            write_result = context_->txn_mgr_->mvcc_write_col_delta(
                                 context_->txn_, tab_name_, rid, visible.data(), record_size_,
                                 p.offset, TYPE_FLOAT, n - o, 0, &mvcc_effective);
                         }
                     }
-                    if (!write_ok && set_clauses_.size() > 1 && !patches.empty()) {
-                        write_ok = context_->txn_mgr_->mvcc_write_col_patch(
+                    if (write_result == MvccWriteResult::INVALID &&
+                        set_clauses_.size() > 1 && !patches.empty()) {
+                        write_result = context_->txn_mgr_->mvcc_write_col_patch(
                             context_->txn_, tab_name_, rid, visible.data(), record_size_, patches,
                             &mvcc_effective);
-                    } else if (!write_ok) {
+                    } else if (write_result == MvccWriteResult::INVALID) {
                         std::vector<char> mv_old(record_size_);
                         memcpy(mv_old.data(), visible.data(), record_size_);
                         std::vector<char> mv_new = mv_old;
@@ -248,14 +251,14 @@ class UpdateExecutor : public AbstractExecutor {
                             if (col_it == tab_.cols.end()) continue;
                             apply_set_value(mv_old.data(), mv_new.data() + col_it->offset, set, *col_it);
                         }
-                        write_ok = context_->txn_mgr_->mvcc_write(context_->txn_, tab_name_, rid,
-                                                                  mv_old.data(), mv_new.data(), record_size_, false,
-                                                                  &mvcc_effective);
+                        write_result = context_->txn_mgr_->mvcc_write(
+                            context_->txn_, tab_name_, rid, mv_old.data(), mv_new.data(),
+                            record_size_, false, &mvcc_effective);
                     }
                 }
-                if (!write_ok) {
+                if (write_result != MvccWriteResult::OK) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                    AbortReason::DEADLOCK_PREVENTION);
+                                                    abort_reason_from(write_result));
                 }
                 // 未提交版本仅存 MVCC 链/overlay；堆在 commit 时物化，避免 overlay 释放后脏堆暴露
                 if (context_->txn_mgr_->is_ser(context_->txn_)) {
@@ -263,7 +266,7 @@ class UpdateExecutor : public AbstractExecutor {
                     bool d2 = context_->txn_mgr_->ser_write_check(context_->txn_, tab_name_, rid, mvcc_effective.data());
                     if (d1 || d2)
                         throw TransactionAbortException(context_->txn_->get_transaction_id(),
-                                                        AbortReason::DEADLOCK_PREVENTION);
+                                                        AbortReason::SSI_DANGEROUS_STRUCTURE);
                 }
             }
 

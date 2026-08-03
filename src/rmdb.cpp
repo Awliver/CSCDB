@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <unordered_map>
 
 #include "errors.h"
@@ -499,6 +500,177 @@ static bool try_parse_load(const char *s, std::string &file_path, std::string &t
 
 enum class ExecOutcome { OK, ABORT, ERROR };
 
+namespace {
+
+constexpr size_t P_A1_REASON_COUNT = static_cast<size_t>(AbortReason::OTHER) + 1;
+
+size_t pa1_reason_index(AbortReason reason) {
+    size_t idx = static_cast<size_t>(reason);
+    return idx < P_A1_REASON_COUNT ? idx : static_cast<size_t>(AbortReason::OTHER);
+}
+
+struct Pa1StmtCounters {
+    std::atomic<uint64_t> attempted{0};
+    std::atomic<uint64_t> aborted{0};
+    std::atomic<uint64_t> total_us{0};
+    uint64_t reported_attempted = 0;
+    uint64_t reported_aborted = 0;
+    uint64_t reported_total_us = 0;
+};
+
+// EXEC_BATCH 每连接由单一 client_handler 线程串行执行；socket fd 在活动连接间唯一。
+// 以 fd 分片后写侧是 single-writer，可用原子 load/store 代替昂贵的 cache-line RMW。
+constexpr size_t P_A1_COUNTER_SHARDS = 1024;
+
+struct Pa1ShardedCounters {
+    std::array<Pa1StmtCounters, P_A1_COUNTER_SHARDS> shards;
+};
+
+struct Pa1StmtTable {
+    Pa1StmtTable() {
+        for (auto &by_reason : by_op)
+            for (auto &p : by_reason) p.store(nullptr, std::memory_order_relaxed);
+    }
+    std::array<std::array<std::atomic<Pa1ShardedCounters *>, P_A1_REASON_COUNT>, 256> by_op;
+};
+
+class Pa1StmtStats {
+public:
+    Pa1StmtStats() {
+        for (auto &p : by_stmt_) p.store(nullptr, std::memory_order_relaxed);
+        int64_t now = now_ms();
+        last_print_ms_ = now;
+        next_print_ms_.store(now + 5000, std::memory_order_relaxed);
+    }
+
+    Pa1StmtTable *table(uint16_t stmt_id) {
+        Pa1StmtTable *p = by_stmt_[stmt_id].load(std::memory_order_acquire);
+        if (p != nullptr) return p;
+        auto *fresh = new Pa1StmtTable();
+        if (!by_stmt_[stmt_id].compare_exchange_strong(
+                p, fresh, std::memory_order_release, std::memory_order_acquire)) {
+            delete fresh;
+        } else {
+            p = fresh;
+        }
+        return p;
+    }
+
+    void record(int connection_fd, uint16_t stmt_id, uint16_t op_index, AbortReason reason,
+                bool aborted, uint64_t elapsed_us) {
+        Pa1StmtTable *t = table(stmt_id);
+        auto &slot = t->by_op[op_index][pa1_reason_index(reason)];
+        Pa1ShardedCounters *group = slot.load(std::memory_order_acquire);
+        if (group == nullptr) {
+            auto *fresh = new Pa1ShardedCounters();
+            if (!slot.compare_exchange_strong(
+                    group, fresh, std::memory_order_release, std::memory_order_acquire)) {
+                delete fresh;
+            } else {
+                group = fresh;
+            }
+        }
+        size_t shard = static_cast<size_t>(connection_fd) % P_A1_COUNTER_SHARDS;
+        auto &c = group->shards[shard];
+        c.attempted.store(c.attempted.load(std::memory_order_relaxed) + 1,
+                          std::memory_order_relaxed);
+        c.total_us.store(c.total_us.load(std::memory_order_relaxed) + elapsed_us,
+                         std::memory_order_relaxed);
+        if (aborted) {
+            c.aborted.store(c.aborted.load(std::memory_order_relaxed) + 1,
+                            std::memory_order_relaxed);
+        }
+        maybe_print();
+    }
+
+    void flush_partial() {
+        int64_t now = now_ms();
+        next_print_ms_.store(now + 5000, std::memory_order_relaxed);
+        print_window(now, true);
+    }
+
+private:
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void maybe_print() {
+        int64_t now = now_ms();
+        int64_t expected = next_print_ms_.load(std::memory_order_relaxed);
+        if (now < expected || !next_print_ms_.compare_exchange_strong(
+                                  expected, now + 5000, std::memory_order_relaxed)) return;
+        print_window(now, false);
+    }
+
+    void print_window(int64_t now, bool final_partial) {
+        std::lock_guard<std::mutex> print_guard(print_mutex_);
+        uint64_t window_ms = static_cast<uint64_t>(std::max<int64_t>(1, now - last_print_ms_));
+        last_print_ms_ = now;
+        for (size_t stmt = 0; stmt < by_stmt_.size(); ++stmt) {
+            Pa1StmtTable *table = by_stmt_[stmt].load(std::memory_order_acquire);
+            if (table == nullptr) continue;
+            for (size_t op = 0; op < table->by_op.size(); ++op) {
+                for (size_t ri = 0; ri < P_A1_REASON_COUNT; ++ri) {
+                    Pa1ShardedCounters *group =
+                        table->by_op[op][ri].load(std::memory_order_acquire);
+                    if (group == nullptr) continue;
+                    uint64_t attempted = 0;
+                    uint64_t aborted = 0;
+                    uint64_t total_us = 0;
+                    for (auto &c : group->shards) {
+                        uint64_t cur_attempted = c.attempted.load(std::memory_order_relaxed);
+                        uint64_t cur_aborted = c.aborted.load(std::memory_order_relaxed);
+                        uint64_t cur_total_us = c.total_us.load(std::memory_order_relaxed);
+                        attempted += cur_attempted - c.reported_attempted;
+                        aborted += cur_aborted - c.reported_aborted;
+                        total_us += cur_total_us - c.reported_total_us;
+                        c.reported_attempted = cur_attempted;
+                        c.reported_aborted = cur_aborted;
+                        c.reported_total_us = cur_total_us;
+                    }
+                    if (attempted == 0) continue;
+                    AbortReason reason = static_cast<AbortReason>(ri);
+                    fprintf(stderr,
+                            "RMDB_STMT_STATS window_ms=%llu final=%d stmt_id=%zu op_index=%zu reason=%s "
+                            "attempted=%llu aborted=%llu total_us=%llu avg_us=%llu\n",
+                            (unsigned long long)window_ms, final_partial ? 1 : 0,
+                            stmt, op, abort_reason_token(reason),
+                            (unsigned long long)attempted, (unsigned long long)aborted,
+                            (unsigned long long)total_us,
+                            (unsigned long long)(total_us / attempted));
+                }
+            }
+        }
+    }
+
+    std::array<std::atomic<Pa1StmtTable *>, 65536> by_stmt_;
+    std::atomic<int64_t> next_print_ms_{0};
+    std::mutex print_mutex_;
+    int64_t last_print_ms_ = 0;
+};
+
+Pa1StmtStats *pa1_stmt_stats() {
+    static const bool enabled = [] {
+        const char *v = std::getenv("RMDB_STMT_STATS");
+        return v != nullptr && strcmp(v, "0") != 0 && strcmp(v, "off") != 0;
+    }();
+    static Pa1StmtStats *stats = enabled ? new Pa1StmtStats() : nullptr;
+    return stats;
+}
+
+std::string pa1_abort_diag(AbortReason reason, const char *detail = nullptr) {
+    std::string diag = "RMDB_ABORT reason=";
+    diag += abort_reason_token(reason);
+    if (detail != nullptr && *detail != '\0') {
+        diag += " detail=";
+        diag += detail;
+    }
+    return diag;
+}
+
+}  // namespace
+
 // 把 sink 的一个 cell 编码为 wire 字节，追加到 buf（present=1：引擎不产生 SQL NULL）
 static void wire_put_cell(std::string &buf, const WireCell &c) {
     if (c.is_null) {           // 空集聚合等：present=0，无值字节
@@ -587,7 +759,8 @@ static bool sql_is_commit_stmt(const char *s) {
 // 功能测试依赖非法 SQL 返回 ERROR 的语义。
 static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, IsolationLevel &sess_iso,
                                       WireResultSink *sink, std::string &diag,
-                                      bool batch_retryable = false) {
+                                      bool batch_retryable = false,
+                                      AbortReason *reason_out = nullptr) {
     const auto stmt_start = std::chrono::steady_clock::now();
     std::vector<char> scratch(BUFFER_LENGTH);
     int off = 0;
@@ -598,6 +771,7 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
     SetTransaction(txn_id, context, sess_iso);
 
     ExecOutcome outcome = ExecOutcome::OK;
+    AbortReason reason = AbortReason::NONE;
     bool finish_analyze = false;
     bool used_yacc = false;
     YY_BUFFER_STATE buf = nullptr;
@@ -659,7 +833,8 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
         try { txn_manager->abort(context->txn_, log_manager.get()); }
         catch (std::exception &e2) { std::cerr << "[wire] abort failed: " << e2.what() << std::endl; }
         catch (...) { std::cerr << "[wire] abort failed: unknown" << std::endl; }
-        diag = e.GetInfo();
+        reason = e.GetAbortReason();
+        diag = pa1_abort_diag(reason);
         outcome = ExecOutcome::ABORT;
     } catch (BufferPoolPressureError &e) {
         // 瞬时帧耗尽（fetch_page ~2s 放弃）：可重试压力，按写冲突同款处理——回滚后回
@@ -674,7 +849,8 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
             try { txn_manager->abort(context->txn_, log_manager.get()); }
             catch (std::exception &e2) { std::cerr << "[wire] pressure-abort failed: " << e2.what() << std::endl; }
             catch (...) { std::cerr << "[wire] pressure-abort failed: unknown" << std::endl; }
-            diag = e.what();
+            reason = AbortReason::BUFFER_POOL_PRESSURE;
+            diag = pa1_abort_diag(reason, e.what());
             outcome = ExecOutcome::ABORT;
             fprintf(stderr, "[pressure-abort] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
         }
@@ -685,6 +861,8 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
             try { txn_manager->abort(context->txn_, log_manager.get()); }
             catch (std::exception &e2) { std::cerr << "[wire] error-abort failed: " << e2.what() << std::endl; }
             catch (...) { std::cerr << "[wire] error-abort failed: unknown" << std::endl; }
+            reason = AbortReason::OTHER;
+            diag = pa1_abort_diag(reason, e.what());
             outcome = ExecOutcome::ABORT;
             fprintf(stderr, "[error-abort] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
         } else {
@@ -701,7 +879,8 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
             try { txn_manager->abort(context->txn_, log_manager.get()); }
             catch (std::exception &e2) { std::cerr << "[wire] pressure-abort failed: " << e2.what() << std::endl; }
             catch (...) { std::cerr << "[wire] pressure-abort failed: unknown" << std::endl; }
-            diag = "bad_alloc";
+            reason = AbortReason::BUFFER_POOL_PRESSURE;
+            diag = pa1_abort_diag(reason, "bad_alloc");
             outcome = ExecOutcome::ABORT;
             fprintf(stderr, "[pressure-abort] bad_alloc | sql: %.160s\n", sql.c_str());
         }
@@ -712,6 +891,8 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
             try { txn_manager->abort(context->txn_, log_manager.get()); }
             catch (std::exception &e2) { std::cerr << "[wire] error-abort failed: " << e2.what() << std::endl; }
             catch (...) { std::cerr << "[wire] error-abort failed: unknown" << std::endl; }
+            reason = AbortReason::OTHER;
+            diag = pa1_abort_diag(reason, e.what());
             outcome = ExecOutcome::ABORT;
             fprintf(stderr, "[error-abort] %.200s | sql: %.160s\n", diag.c_str(), sql.c_str());
         } else {
@@ -752,8 +933,10 @@ static ExecOutcome run_sql_statement(const std::string &sql, txn_id_t *txn_id, I
         if (outcome == ExecOutcome::OK) {
             diag = e.what();
             outcome = ExecOutcome::ERROR;
+            reason = AbortReason::OTHER;
         }
     }
+    if (reason_out != nullptr) *reason_out = reason;
     return outcome;
 }
 
@@ -1016,50 +1199,29 @@ static void handle_exec_batch(int fd, const std::string &payload,
         WirePreparedStmt &st = prepared.at(stmt_id);
         std::string sql = wire_substitute_params(st.sql_template, literals);
 
-        // 批内语句级耗时账（RMDB_STMT_STATS=1）：按 stmt_id 聚合 wall/次数/abort 数。
-        // 用途：量化写意向（UPDATE district/stock）之后批内剩余语句的执行时间——
-        // 这段就是 SI no-wait 的 w-w 冲突窗口，NewOrder 放弃率的分母（Docs/Optimize/14 §6.5-1）
-        static const bool stmt_stats_on = std::getenv("RMDB_STMT_STATS") != nullptr;
-        static std::array<std::atomic<uint64_t>, 256> ss_cnt, ss_us, ss_abort;
-        const auto op_t0 = stmt_stats_on ? std::chrono::steady_clock::now()
-                                         : std::chrono::steady_clock::time_point{};
+        // P-A1：开关关闭时不取时钟、不分配计数表，也不做原子更新。
+        Pa1StmtStats *stmt_stats = pa1_stmt_stats();
+        const auto op_t0 = stmt_stats != nullptr ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
 
         ExecOutcome outc;
+        AbortReason abort_reason = AbortReason::NONE;
         if (st.is_query) {
             BufferSink sink;
-            outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag, /*batch_retryable=*/true);
+            outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag,
+                                     /*batch_retryable=*/true, &abort_reason);
             if (outc == ExecOutcome::OK)
                 results.push_back(OpResult{op, sink.row_count(), sink.rows_payload()});
         } else {
-            outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag, /*batch_retryable=*/true);
+            outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag,
+                                     /*batch_retryable=*/true, &abort_reason);
         }
-        if (stmt_stats_on) {
+        if (stmt_stats != nullptr) {
             uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                               std::chrono::steady_clock::now() - op_t0).count();
-            ss_cnt[stmt_id & 0xFF].fetch_add(1, std::memory_order_relaxed);
-            ss_us[stmt_id & 0xFF].fetch_add(us, std::memory_order_relaxed);
-            if (outc == ExecOutcome::ABORT)
-                ss_abort[stmt_id & 0xFF].fetch_add(1, std::memory_order_relaxed);
-            // 每 ~60s 由碰上整点的线程打印一次（低频、无锁）
-            static std::atomic<int64_t> ss_next_print{0};
-            int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count();
-            int64_t nxt = ss_next_print.load(std::memory_order_relaxed);
-            if (now_s >= nxt &&
-                ss_next_print.compare_exchange_strong(nxt, now_s + 60, std::memory_order_relaxed)) {
-                std::string line = "[stmt-stats]";
-                for (int i = 0; i < 256; i++) {
-                    uint64_t n = ss_cnt[i].load(std::memory_order_relaxed);
-                    if (!n) continue;
-                    char buf[96];
-                    snprintf(buf, sizeof(buf), " s%d:n=%llu,avg=%lluus,ab=%llu", i,
-                             (unsigned long long)n,
-                             (unsigned long long)(ss_us[i].load(std::memory_order_relaxed) / n),
-                             (unsigned long long)ss_abort[i].load(std::memory_order_relaxed));
-                    line += buf;
-                }
-                fprintf(stderr, "%s\n", line.c_str());
-            }
+            if (outc != ExecOutcome::OK && abort_reason == AbortReason::NONE)
+                abort_reason = AbortReason::OTHER;
+            stmt_stats->record(fd, stmt_id, op, abort_reason, outc == ExecOutcome::ABORT, us);
         }
         if (outc != ExecOutcome::OK) {
             status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
@@ -1314,6 +1476,7 @@ void *client_handler(void *sock_fd) {
                 std::cerr << "[wire] connection thread escaped unknown exception" << std::endl;
             }
             std::cout << "Terminating current wire client_connection..." << std::endl;
+            if (Pa1StmtStats *stats = pa1_stmt_stats()) stats->flush_partial();
             close(fd);
             pthread_exit(NULL);
         }
