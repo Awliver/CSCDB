@@ -11,7 +11,7 @@
 | **学校** | 华中科技大学 |
 | **队员** | 王圣翊、李正文、甘可欣 |
 
-## 项目状态（2026-08-02）
+## 项目状态（2026-08-03）
 
 | 项 | 状态 |
 |----|------|
@@ -19,10 +19,11 @@
 | 初赛性能锚点 | `5a5527f` · 3615.5 tpmC（历史） |
 | **当前阶段** | **决赛** |
 | 决赛成绩结构 | 正确性门禁 100/0 + NewOrder/min 排名（SI） |
-| **最新决赛 OJ** | `5ae93e4` **全 PASS · 33,862.8 NewOrder/min**；H3/H4 已冻结，性能回退锚点仍为 `c524ff8` **37,248.4** |
+| **最新决赛 OJ** | `c446377` **全 PASS · 40,264.8 NewOrder/min**；较旧锚点 +8.10%，已升级为新的正确性与性能锚点 |
+| **当前工作** | P-A1 实现与 W=5 单变量取证完成；W=50 开启态终验因本机资源约束冻结，转入架构定稿与线下答辩准备 |
 | 本机 Git 远端 | 仅 `gitlab`（教育平台） |
 
-主线文档：[`Docs/FinalCompetition/决赛赛题整理.md`](Docs/FinalCompetition/决赛赛题整理.md) · [`Docs/FinalCompetition/决赛准备Todo.md`](Docs/FinalCompetition/决赛准备Todo.md)
+主线文档：[`Docs/FinalCompetition/决赛赛题整理.md`](Docs/FinalCompetition/决赛赛题整理.md) · [`Docs/FinalCompetition/决赛准备Todo.md`](Docs/FinalCompetition/决赛准备Todo.md) · [`Docs/FinalCompetition/线下赛与答辩准备计划.md`](Docs/FinalCompetition/线下赛与答辩准备计划.md)
 
 ## 系统模块
 
