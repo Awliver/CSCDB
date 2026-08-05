@@ -89,67 +89,45 @@ void BufferPoolManager::cleaner_loop() {
             }
             if (total_free >= low_water) continue;
         }
-        struct CleanerPage {
-            size_t shard_idx;
-            frame_id_t frame;
-            PageId pid;
-            uint32_t mod_ver;
-            std::array<char, PAGE_SIZE> data;
-            bool released = false;
-        };
-        std::vector<CleanerPage> pending;
-        pending.reserve(CLEANER_BATCH);
-
-        // 先固定整批页的快照，再统一刷一次 WAL。每个快照对应的修改都在页面
-        // unpin 前完成了日志追加，因此这次 WAL flush 安全覆盖整批页面。旧实现
-        // 每写一个 4 KiB 页都 fdatasync 一次，LOAD 超过缓冲池后会退化成大量小同步。
-        for (size_t k = 0; k < BPM_NSHARDS && pending.size() < CLEANER_BATCH; ++k) {
-            const size_t shard_idx = (next_shard + k) % BPM_NSHARDS;
-            BpmShard &sh = shards_[shard_idx];
-            std::unique_lock<std::shared_mutex> lock(sh.latch_);
-            for (auto &entry : sh.page_table_) {
-                if (pending.size() >= CLEANER_BATCH) break;
-                frame_id_t frame = entry.second;
-                Page &page = pages_[frame];
-                if (page.pin_count_ != 0 || !page.is_dirty_) continue;
-                if (frame_io_inflight_[frame].load(std::memory_order_acquire)) continue;
-                CleanerPage item{shard_idx, frame, page.id_, page.mod_ver_, {}, false};
-                memcpy(item.data.data(), page.data_, PAGE_SIZE);
-                pending.push_back(std::move(item));
-                // Reserve the frame until its snapshot is written.  Writers
-                // may still pin and update it, but eviction cannot reuse the
-                // frame and let an old cleaner snapshot overwrite a new page.
-                sh.replacer_->pin(frame);
-                page.pin_count_++;
+        int flushed = 0;
+        for (size_t k = 0; k < BPM_NSHARDS && flushed < CLEANER_BATCH; ++k) {
+            BpmShard &sh = shards_[(next_shard + k) % BPM_NSHARDS];
+            while (flushed < CLEANER_BATCH) {
+                if (cleaner_stop_) return;
+                frame_id_t target = INVALID_FRAME_ID;
+                PageId pid{-1, INVALID_PAGE_ID};
+                uint32_t snap_ver = 0;
+                char flush_buf[PAGE_SIZE];
+                {
+                    std::unique_lock<std::shared_mutex> lock(sh.latch_);
+                    for (auto &entry : sh.page_table_) {
+                        frame_id_t f = entry.second;
+                        Page &pg = pages_[f];
+                        if (pg.pin_count_ != 0 || !pg.is_dirty_) continue;
+                        if (frame_io_inflight_[f].load(std::memory_order_acquire)) continue;
+                        target = f;
+                        pid = pg.id_;
+                        snap_ver = pg.mod_ver_;
+                        memcpy(flush_buf, pg.data_, PAGE_SIZE);
+                        break;
+                    }
+                    if (target == INVALID_FRAME_ID) break;
+                }
+                if (g_log_manager) g_log_manager->flush_log_to_disk();
+                disk_manager_->write_page(pid.fd, pid.page_no, flush_buf, PAGE_SIZE);
+                {
+                    std::unique_lock<std::shared_mutex> lock(sh.latch_);
+                    Page &pg = pages_[target];
+                    // mod_ver_ 相同才能清脏标：锁外写盘期间若有新修改（写者 pin→改→
+                    // unpin(dirty) 已完成），盘上是旧快照，清标会让新修改被当作已落盘
+                    // → 页被干净淘汰 → 已提交更新丢失
+                    if (pg.pin_count_ == 0 && pg.id_ == pid && pg.is_dirty_ &&
+                        pg.mod_ver_ == snap_ver) {
+                        pg.is_dirty_ = false;
+                    }
+                }
+                ++flushed;
             }
-        }
-        auto release_item = [&](CleanerPage &item, bool wrote) {
-            if (item.released) return;
-            BpmShard &sh = shards_[item.shard_idx];
-            std::unique_lock<std::shared_mutex> lock(sh.latch_);
-            Page &page = pages_[item.frame];
-            // 只清理由本次快照落盘的版本；并发新写会推进 mod_ver 并保持 dirty。
-            if (wrote && page.id_ == item.pid && page.is_dirty_ &&
-                page.mod_ver_ == item.mod_ver) {
-                page.is_dirty_ = false;
-            }
-            page.pin_count_--;
-            if (page.pin_count_ == 0) sh.replacer_->unpin(item.frame);
-            item.released = true;
-        };
-        try {
-            if (cleaner_stop_) {
-                for (auto &item : pending) release_item(item, false);
-                return;
-            }
-            if (g_log_manager && !pending.empty()) g_log_manager->flush_log_to_disk();
-            for (auto &item : pending) {
-                disk_manager_->write_page(item.pid.fd, item.pid.page_no, item.data.data(), PAGE_SIZE);
-                release_item(item, true);
-            }
-        } catch (...) {
-            for (auto &item : pending) release_item(item, false);
-            throw;
         }
         next_shard = (next_shard + 1) % BPM_NSHARDS;
     }

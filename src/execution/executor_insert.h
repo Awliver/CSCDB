@@ -156,20 +156,10 @@ class InsertExecutor : public AbstractExecutor {
                 throw;
             }
         } else {
+            rid_ = fh_->insert_record(rec.data, context_);
             if (context_ && context_->log_mgr_ && context_->txn_) {
-                rid_ = fh_->reserve_insert_slot();
-                bool heap_reserved = true;
-                try {
-                    InsertLogRecord lr(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
-                    context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
-                    fh_->publish_insert_slot(rid_, rec.data);
-                    heap_reserved = false;
-                } catch (...) {
-                    if (heap_reserved) fh_->cancel_insert_slot(rid_);
-                    throw;
-                }
-            } else {
-                rid_ = fh_->insert_record(rec.data, context_);
+                InsertLogRecord lr(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+                context_->txn_->set_prev_lsn(context_->log_mgr_->add_log_to_buffer(&lr));
             }
             if (context_ && context_->txn_ && context_->txn_mgr_ &&
                 context_->txn_mgr_->uses_si_fast_path(context_->txn_)) {
