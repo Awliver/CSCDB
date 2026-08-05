@@ -663,19 +663,45 @@ void QlManager::run_dml(std::unique_ptr<AbstractExecutor> exec){
 
 namespace {
 
-std::vector<std::string> split_csv_line(const std::string &line) {
-    std::vector<std::string> fields;
-    std::string cur;
-    for (char c : line) {
-        if (c == ',') {
-            fields.push_back(cur);
-            cur.clear();
-        } else {
-            cur += c;
-        }
+struct CsvField {
+    char *data;
+    size_t size;
+};
+
+void split_csv_line(std::string &line, std::vector<CsvField> &fields) {
+    fields.clear();
+    const size_t size = line.size();
+    line.push_back('\0');
+    char *data = line.data();
+    size_t begin = 0;
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i] != ',') continue;
+        data[i] = '\0';
+        fields.push_back({data + begin, i - begin});
+        begin = i + 1;
     }
-    fields.push_back(cur);
-    return fields;
+    fields.push_back({data + begin, size - begin});
+}
+
+void make_load_index_key(const IndexMeta &index, const char *record, char *key) {
+    int offset = 0;
+    for (const auto &col : index.cols) {
+        memcpy(key + offset, record + col.offset, col.len);
+        offset += col.len;
+    }
+}
+
+void bulk_load_sorted_index(RmFileHandle *fh, const IndexMeta &index,
+                            IxIndexHandle *ih, size_t count) {
+    RmScan scan(fh);
+    ih->bulk_load(static_cast<long>(count), [&](char *key, Rid *rid) {
+        if (scan.is_end()) {
+            throw InternalError("LOAD index build ended before expected row count");
+        }
+        make_load_index_key(index, scan.record_data(), key);
+        *rid = scan.rid();
+        scan.next();
+    });
 }
 
 }  // namespace
@@ -688,51 +714,124 @@ void QlManager::run_load(const std::string &file_path, const std::string &tab_na
         throw RMDBError("Cannot open load file: " + file_path + "\n");
     }
     const int rec_size = fh->get_file_hdr().record_size;
+
+    // Finals create indexes before LOAD.  Incremental insertion of every CSV
+    // row makes that path O(rows * tree height), even though generated data is
+    // normally already in primary-key order.  On an empty table, defer each
+    // index independently while its incoming keys remain strictly increasing;
+    // such an index can be built bottom-up in one linear pass.  If an index is
+    // not ordered (for example a secondary lookup index), materialize the
+    // already sorted prefix and immediately fall back to ordinary inserts.
+    struct LoadIndexState {
+        const IndexMeta *meta = nullptr;
+        IxIndexHandle *handle = nullptr;
+        bool deferred = false;
+        std::vector<ColType> types;
+        std::vector<int> lens;
+        std::vector<char> previous_key;
+        std::vector<char> current_key;
+    };
+    bool table_empty = false;
+    {
+        RmScan probe(fh);
+        table_empty = probe.is_end();
+    }
+    std::vector<LoadIndexState> indexes;
+    indexes.reserve(tab.indexes.size());
+    for (const auto &index : tab.indexes) {
+        LoadIndexState state;
+        state.meta = &index;
+        state.handle = sm_manager_->ihs_.at(
+            sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        state.deferred = table_empty;
+        state.previous_key.resize(index.col_tot_len);
+        state.current_key.resize(index.col_tot_len);
+        for (const auto &col : index.cols) {
+            state.types.push_back(col.type);
+            state.lens.push_back(col.len);
+        }
+        indexes.push_back(std::move(state));
+    }
+
     std::string line;
+    std::vector<CsvField> fields;
+    fields.reserve(tab.cols.size());
+    RmRecord rec(rec_size);
+    size_t loaded_rows = 0;
     while (std::getline(infile, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-        auto fields = split_csv_line(line);
+        split_csv_line(line, fields);
         if (fields.size() != tab.cols.size()) {
             throw RMDBError("Column count mismatch in load file\n");
         }
         // CSV 首行常为列名表头（如 w_id,w_name,...），跳过以免多插入一行
         bool is_header = true;
         for (size_t i = 0; i < tab.cols.size(); ++i) {
-            if (fields[i] != tab.cols[i].name) {
+            if (fields[i].size != tab.cols[i].name.size() ||
+                memcmp(fields[i].data, tab.cols[i].name.data(), fields[i].size) != 0) {
                 is_header = false;
                 break;
             }
         }
         if (is_header) continue;
-        RmRecord rec(rec_size);
         memset(rec.data, 0, rec_size);
         for (size_t i = 0; i < tab.cols.size(); ++i) {
             auto &col = tab.cols[i];
             if (col.type == TYPE_INT) {
-                *(int *)(rec.data + col.offset) = std::atoi(fields[i].c_str());
+                *(int *)(rec.data + col.offset) = std::atoi(fields[i].data);
             } else if (col.type == TYPE_FLOAT) {
-                *(float *)(rec.data + col.offset) = static_cast<float>(std::atof(fields[i].c_str()));
+                *(float *)(rec.data + col.offset) = static_cast<float>(std::atof(fields[i].data));
             } else {
-                size_t cpy = std::min(fields[i].size(), static_cast<size_t>(col.len));
-                memcpy(rec.data + col.offset, fields[i].c_str(), cpy);
+                size_t cpy = std::min(fields[i].size, static_cast<size_t>(col.len));
+                memcpy(rec.data + col.offset, fields[i].data, cpy);
             }
         }
-        Rid rid = fh->insert_record(rec.data, context);
+
+        for (auto &index : indexes) {
+            make_load_index_key(*index.meta, rec.data, index.current_key.data());
+            if (index.deferred && loaded_rows > 0 &&
+                ix_compare(index.previous_key.data(), index.current_key.data(),
+                           index.types, index.lens) >= 0) {
+                // The current row is not in the heap yet, so the existing
+                // prefix is still strictly ordered and can be bulk-built.
+                bulk_load_sorted_index(fh, *index.meta, index.handle, loaded_rows);
+                index.deferred = false;
+            }
+        }
+
+        Rid rid;
         if (context && context->log_mgr_ && context->txn_) {
-            InsertLogRecord lr(context->txn_->get_transaction_id(), rec, rid, tab_name);
-            context->txn_->set_prev_lsn(context->log_mgr_->add_log_to_buffer(&lr));
-        }
-        for (auto &index : tab.indexes) {
-            auto ih = sm_manager_->ihs_.at(
-                sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-            std::vector<char> key(index.col_tot_len);
-            int off = 0;
-            for (auto &idx_col : index.cols) {
-                memcpy(key.data() + off, rec.data + idx_col.offset, idx_col.len);
-                off += idx_col.len;
+            // Reserve first so the WAL record can carry the final RID, append
+            // WAL before publishing the heap slot, then make the row visible.
+            // This closes the full-page unpin -> WAL append gap during LOAD.
+            rid = fh->reserve_insert_slot();
+            try {
+                InsertLogRecord lr(context->txn_->get_transaction_id(), rec, rid, tab_name);
+                context->txn_->set_prev_lsn(context->log_mgr_->add_log_to_buffer(&lr));
+                fh->publish_insert_slot(rid, rec.data);
+            } catch (...) {
+                fh->cancel_insert_slot(rid);
+                throw;
             }
-            ih->insert_entry(key.data(), rid, context ? context->txn_ : nullptr);
+        } else {
+            rid = fh->insert_record(rec.data, context);
+        }
+        for (auto &index : indexes) {
+            if (index.deferred) {
+                index.previous_key.swap(index.current_key);
+            } else {
+                index.handle->insert_entry(index.current_key.data(), rid,
+                                           context ? context->txn_ : nullptr);
+            }
+        }
+        ++loaded_rows;
+    }
+
+    for (auto &index : indexes) {
+        if (index.deferred && loaded_rows > 0) {
+            bulk_load_sorted_index(fh, *index.meta, index.handle, loaded_rows);
+            index.deferred = false;
         }
     }
     // 每表装载完成后（语句事务提交后）打检查点：装载数据全量落盘 + 推进 restart
