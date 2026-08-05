@@ -1206,13 +1206,16 @@ static std::optional<WirePreparedStmt::PointShape> wire_point_shape(
 }
 
 /*
- * P-A2：TPC-C 写事务首批次已经声明了当前点写，以及随后会点写的同表同键读取。
- * 在 BEGIN 取得 SI read_ts 之前对整组逻辑键做准入，冲突事务会在快照外等待；前一
- * 事务结束后再取得的新快照不会因等待期间的提交变成 STALE_SNAPSHOT_WRITE。
+ * 可选的热点写准入实验：TPC-C 写事务首批次已经声明了当前点写，以及随后会点写的
+ * 同表同键读取。在 BEGIN 取得 SI read_ts 之前对整组逻辑键做准入，冲突事务会在
+ * 快照外等待；前一事务结束后再取得的新快照不会因等待期间的提交变成
+ * STALE_SNAPSHOT_WRITE。
  *
- * 这是排名路径的调度层，不替代 MVCC/行锁：无法识别的 batch、普通 SQL、SER 以及
- * 超时请求仍走原有 first-committer-wins 规则。整组 all-or-none，避免远程多仓订单
- * 持部分键等待形成死锁。
+ * P-A2 的排名基线默认关闭该调度层：OJ 结果表明通用准入虽然压低 abort-rate，却因
+ * 排队损失了更多 NewOrder/min。只有显式设置 RMDB_HOT_KEY_ADMISSION=1 才启用，默认
+ * 路径继续使用原生 SI first-committer-wins。该实验机制不替代 MVCC/行锁；无法识别
+ * 的 batch、普通 SQL、SER 以及超时请求仍走原规则。整组 all-or-none，避免远程多仓
+ * 订单持部分键等待形成死锁。
  */
 class HotKeyAdmission {
 public:
@@ -1236,9 +1239,11 @@ public:
     bool enabled() const {
         static const bool on = [] {
             const char *v = std::getenv("RMDB_HOT_KEY_ADMISSION");
-            return v == nullptr ||
-                   (strcmp(v, "0") != 0 && strcasecmp(v, "off") != 0 &&
-                    strcasecmp(v, "false") != 0);
+            // P-A2：严格显式 opt-in。环境变量缺失或拼写错误都不得让排名默认路径
+            // 悄然重新进入通用热点排队。
+            return v != nullptr &&
+                   (strcmp(v, "1") == 0 || strcasecmp(v, "on") == 0 ||
+                    strcasecmp(v, "true") == 0);
         }();
         return on;
     }

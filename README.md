@@ -21,7 +21,7 @@
 | 决赛成绩结构 | 正确性门禁 100/0 + NewOrder/min 排名（SI） |
 | **性能锚点** | `c446377` **全 PASS · 40,264.8 NewOrder/min**；较旧锚点 +8.10%，仍为性能回退基线 |
 | **最新决赛 OJ** | 2026-08-05 12:24 全流程 PASS · **29,650.4 NewOrder/min** · abort-rate 0.17%；用于记录“压低 abort 但损失并行度”的反例，不替换性能锚点 |
-| **当前工作** | 所有优化均以遵守比赛规则、项目规范和 ACID 为不可让步前提；在此前提下唯一目标是尽可能提高 W=50×32 三窗中位 NewOrder/min（Rank） |
+| **当前工作** | **P-A2**：通用热点 admission 改为显式 opt-in，默认回到原生 SI；本地 W=50×32 无 admission 三窗全 PASS，中位 **18,634.04 NewOrder/min**（仅作同机基线，绝不与 OJ 绝对值横比） |
 | 本机 Git 远端 | 仅 `gitlab`（教育平台） |
 
 主线文档：[`Docs/FinalCompetition/决赛赛题整理.md`](Docs/FinalCompetition/决赛赛题整理.md) · [`Docs/FinalCompetition/决赛准备Todo.md`](Docs/FinalCompetition/决赛准备Todo.md) · [`Docs/FinalCompetition/线下赛与答辩准备计划.md`](Docs/FinalCompetition/线下赛与答辩准备计划.md)

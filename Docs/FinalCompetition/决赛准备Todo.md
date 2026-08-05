@@ -2,7 +2,7 @@
 
 > **⚡ 状态速览（2026-08-05）**：性能锚点仍为 `c446377` OJ **全 PASS**、排名中位 **40,264.8 NewOrder/min**。08-05 12:24 的新样本全流程 PASS、abort-rate **0.17%**，但排名仅 **29,650.4 NewOrder/min**；它确认 abort-rate 不是优化目标，不能以吞吐换取更低 abort。
 > 正确性、COMMIT 持久化、恢复、W=50 装载与 I/O 诊断均通过；最新装载 **620.61s**（9 表、25,051,681 行）。详见 [`08-03 OJ 性能测评报告摘要`](./0803-OJ性能测评报告摘要.md)。
-> P-A1 实现、确定性闭环和 W=5 单变量取证已完成；本机 W=50 开启态终验成本不可接受，相关性能实验按项目决策冻结，转入架构定稿与线下答辩准备。
+> P-A2 已把通用热点 admission 从默认路径移除，仅保留环境变量显式 opt-in；本地 W=50×32 无 admission 三窗全 PASS，中位 **18,634.04 NewOrder/min**，作为后续同机 Rank A/B 基线。
 > 本文以下内容保留作检查清单；已被官方结果覆盖的条目已更新。
 
 > **末次修订**：2026-08-05（补充 abort-rate 与 Rank 取舍、硬编码禁令）
@@ -31,8 +31,8 @@
 正确性 / 持久化 / 恢复 / 装载门禁   最新 c446377 已通过
 当前 W=50×32 三窗中位               40,264.8 NewOrder/min
 当前性能锚点                         c446377 · 40,264.8 NewOrder/min
-后续工作                             总体架构定稿、文档归档与线下答辩准备
-本地 W=5                           仅作趋势和定向定位
+后续工作                             P-A2 无 admission 提交做 OJ Rank 验证
+本地 W=50×32                       无 admission 基线 18,634.04（仅同机比较）
 ```
 
 ### 官方建议工作顺序
@@ -61,6 +61,22 @@
 4. 全部合规候选中以 **Rank 中位数最高** 者为准；只有 Rank 接近时，才优先更低 abort、更低 p99 和更稳窗口。
 
 任何为压低 abort 而扩大串行区、延长默认等待或粗化锁粒度的改动，均须证明其 **NewOrder/min 中位数** 没有下降；否则不得作为默认或提交方案。
+
+### 0.2 P-A2 无 admission 本地合规基线
+
+2026-08-05 在默认环境（未设置 `RMDB_HOT_KEY_ADMISSION`）完成 fresh W=50、32 clients、30s warmup、3×150s BATCH/SI 测量：
+
+| 项 | 结果 |
+|------|------:|
+| 三轮 NewOrder/min | **19,280.23 / 16,524.26 / 18,634.04** |
+| 排名中位 | **18,634.04 NewOrder/min** |
+| NewOrder | 145,762 attempted / 136,245 committed / 9,517 abnormal abort（**6.53%**） |
+| 全事务异常 abort | 24,180 / 324,163 attempted（**7.46%**） |
+| NewOrder 冲突位置 | district 6,737（70.79%）/ stock_home 2,527 / stock_remote 253 |
+| NewOrder 原因 | ACTIVE_WRITE_CONFLICT 5,744 / STALE_SNAPSHOT_WRITE 3,773 |
+| 合规结果 | 三轮均完整 150s、50/50 warehouse；P-A1 对账 PASS；后测一致性 PASS；0 transaction ERROR |
+
+裁决：较高 abort 是无 admission 基线的预期代价，不能单独判负；它允许冲突事务快速失败并重试，避免通用队列压低尝试速率。该本地绝对 Rank 受硬件与自生成数据影响，**不得与 OJ 的 29,650.4 或 40,264.8 直接横比**；后续只接受相同环境 A/B 或新 OJ 三窗中位 Rank 的裁决。原始结果：`build/p_a2_no_admission_finals.json`。
 
 ---
 
