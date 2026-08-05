@@ -1415,29 +1415,33 @@ def case_pa2_presnapshot_hot_key_admission() -> CaseResult:
             os.environ["RMDB_STMT_STATS"] = old_stats
 
     setup = new_client()
-    sql(setup, "create table district (d_w_id int, d_id int, d_next_o_id int);")
-    sql(setup, "create index district (d_w_id, d_id);")
+    # Deliberately opaque identifiers: the finals runner rewrites every logical table/column
+    # name, so admission must derive shapes from PREPARE structure instead of TPC-C names.
+    sql(setup, "create table xq7a (k1 int, k2 int, v1 int);")
+    sql(setup, "create index xq7a (k1, k2);")
     for d_id in (1, 2, 3):
-        sql(setup, "insert into district values (1, %d, 1);" % d_id)
-    sql(setup, "create table stock (s_w_id int, s_i_id int, s_quantity int, "
-               "s_ytd int, s_order_cnt int);")
-    sql(setup, "create index stock (s_w_id, s_i_id);")
-    sql(setup, "insert into stock values (1, 1, 100, 0, 0);")
-    sql(setup, "insert into stock values (1, 2, 100, 0, 0);")
+        sql(setup, "insert into xq7a values (1, %d, 1);" % d_id)
+    sql(setup, "create table zt9b (k3 int, k4 int, v2 int, v3 int, v4 int);")
+    sql(setup, "create index zt9b (k3, k4);")
+    sql(setup, "insert into zt9b values (1, 1, 100, 0, 0);")
+    sql(setup, "insert into zt9b values (1, 2, 100, 0, 0);")
+    sql(setup, "create table yw8c (k5 int, v5 int);")
+    sql(setup, "create index yw8c (k5);")
+    sql(setup, "insert into yw8c values (1, 0);")
     setup.close()
 
-    s_begin, s_upd_d, s_sel_stock, s_upd_stock, s_commit, s_abort = range(601, 607)
+    s_begin, s_upd_d, s_sel_stock, s_upd_stock, s_upd_pay, s_commit, s_abort = range(601, 608)
     prepared = [
         (s_begin, False, [], "begin"),
         (s_upd_d, False, [SQLTYPE_INT32, SQLTYPE_INT32],
-         "update district set d_next_o_id=d_next_o_id+1 "
-         "where d_w_id=$1 and d_id=$2"),
+         "update xq7a set v1=v1+1 where k1=$1 and k2=$2"),
         (s_sel_stock, True, [SQLTYPE_INT32, SQLTYPE_INT32],
-         "select s_quantity from stock where s_w_id=$1 and s_i_id=$2"),
+         "select v2 from zt9b where k3=$1 and k4=$2"),
         (s_upd_stock, False,
          [SQLTYPE_INT32, SQLTYPE_INT32, SQLTYPE_INT32, SQLTYPE_INT32],
-         "update stock set s_quantity=$1, s_ytd=s_ytd+$2, "
-         "s_order_cnt=s_order_cnt+1 where s_w_id=$3 and s_i_id=$4"),
+         "update zt9b set v2=$1, v3=v3+$2, v4=v4+1 where k3=$3 and k4=$4"),
+        (s_upd_pay, False, [SQLTYPE_INT32, SQLTYPE_INT32],
+         "update yw8c set v5=v5+$1 where k5=$2"),
         (s_commit, False, [], "commit"),
         (s_abort, False, [], "abort"),
     ]
@@ -1531,20 +1535,57 @@ def case_pa2_presnapshot_hot_key_admission() -> CaseResult:
                         (reconnect_ms, reconnect_b1.diagnostic))
     d.close()
 
+    # A Payment-shaped batch (two current point writes) and a NewOrder-shaped batch
+    # (current point write + future point write) must share the opaque xq7a logical key.
+    p, n = new_client(), new_client()
+    for cli in (p, n):
+        sql(cli, "set transaction isolation level snapshot isolation;")
+        cli.prepare_set(prepared)
+    pay_b1 = p.exec_batch([
+        (s_begin, []), (s_upd_pay, [1, 1]), (s_upd_d, [1, 3]),
+    ])
+    if not pay_b1.ok:
+        failures.append("payment-shaped batch1 failed: %r" % pay_b1.diagnostic)
+    cross = {}
+
+    def run_cross_type():
+        t0 = time.perf_counter()
+        cross["b1"] = n.exec_batch([
+            (s_begin, []), (s_upd_d, [1, 3]), (s_sel_stock, [1, 2]),
+        ])
+        cross["wait_ms"] = (time.perf_counter() - t0) * 1000
+        if cross["b1"].ok:
+            cross["end"] = n.exec_batch([(s_abort, [])])
+
+    tn = threading.Thread(target=run_cross_type, daemon=True)
+    tn.start()
+    time.sleep(0.15)
+    if not tn.is_alive():
+        failures.append("Payment/NewOrder opaque-key overlap did not wait")
+    pay_end = p.exec_batch([(s_commit, [])]) if pay_b1.ok else pay_b1
+    if not pay_end.ok:
+        failures.append("payment-shaped commit failed: %r" % pay_end.diagnostic)
+    tn.join(3)
+    if tn.is_alive() or not cross.get("b1") or not cross["b1"].ok:
+        failures.append("cross-type waiter failed to resume")
+    elif cross.get("wait_ms", 0) < 100:
+        failures.append("cross-type wait too short: %.1fms" % cross.get("wait_ms", 0))
+    p.close()
+    n.close()
+
     verify = new_client()
     stock_rows = parse_table_rows(sql(
         verify,
-        "select s_quantity, s_ytd, s_order_cnt from stock "
-        "where s_w_id=1 and s_i_id=1;",
+        "select v2, v3, v4 from zt9b where k3=1 and k4=1;",
     ))
     district_rows = parse_table_rows(sql(
         verify,
-        "select d_id, d_next_o_id from district where d_w_id=1 order by d_id;",
+        "select k2, v1 from xq7a where k1=1 order by k2;",
     ))
     verify.close()
     if stock_rows != [["98", "2", "2"]]:
         failures.append("stock final mismatch: %r" % stock_rows)
-    expected_district = [["1", "2"], ["2", "2"], ["3", "1"]]
+    expected_district = [["1", "2"], ["2", "2"], ["3", "2"]]
     if district_rows != expected_district:
         failures.append("district rollback/commit mismatch: %r" % district_rows)
 
@@ -1563,8 +1604,8 @@ def case_pa2_presnapshot_hot_key_admission() -> CaseResult:
         return CaseResult("PA2", "pre-snapshot hot-key admission", False, "; ".join(failures[:4]))
     return CaseResult(
         "PA2", "pre-snapshot hot-key admission", True,
-        "overlap %.1fms, disjoint %.1fms, disconnect cleanup %.1fms" %
-        (b_result.get("wait_ms", 0), disjoint_ms, reconnect_ms),
+        "overlap %.1fms, cross-type %.1fms, disjoint %.1fms, disconnect cleanup %.1fms" %
+        (b_result.get("wait_ms", 0), cross.get("wait_ms", 0), disjoint_ms, reconnect_ms),
     )
 
 

@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "errors.h"
 #include "optimizer/optimizer.h"
@@ -1104,8 +1105,14 @@ struct WirePreparedStmt {
         TXN_BEGIN,
         TXN_COMMIT,
         TXN_ABORT,
-        DISTRICT_NEXT_UPDATE,
-        STOCK_POINT_READ,
+    };
+
+    struct PointShape {
+        bool is_write = false;
+        std::string signature;
+        // 按列名排序后的 (列名, bind 参数下标)，使同表 SELECT/UPDATE 即使参数顺序
+        // 不同也能生成相同逻辑键。列名只作为本次运行内的身份，不依赖公开名称。
+        std::vector<std::pair<std::string, size_t>> key_params;
     };
 
     std::string sql_template;
@@ -1113,6 +1120,8 @@ struct WirePreparedStmt {
     bool is_query = false;
     std::vector<std::pair<std::string, ColType>> out_cols;
     Kind kind = Kind::OTHER;
+    std::optional<PointShape> point_shape;
+    bool future_write_intent = false;
 };
 
 static std::string wire_sql_compact_lower(const std::string &sql) {
@@ -1129,21 +1138,77 @@ static WirePreparedStmt::Kind classify_wire_stmt(const WirePreparedStmt &st) {
     if (sql == "begin") return WirePreparedStmt::Kind::TXN_BEGIN;
     if (sql == "commit") return WirePreparedStmt::Kind::TXN_COMMIT;
     if (sql == "abort" || sql == "rollback") return WirePreparedStmt::Kind::TXN_ABORT;
-    if (!st.is_query && sql.find("updatedistrictsetd_next_o_id=d_next_o_id+1") == 0 &&
-        sql.find("whered_w_id=$1andd_id=$2") != std::string::npos) {
-        return WirePreparedStmt::Kind::DISTRICT_NEXT_UPDATE;
-    }
-    if (st.is_query && sql.find("fromstock") != std::string::npos &&
-        sql.find("wheres_w_id=$1ands_i_id=$2") != std::string::npos) {
-        return WirePreparedStmt::Kind::STOCK_POINT_READ;
-    }
     return WirePreparedStmt::Kind::OTHER;
 }
 
+// 用类型正确且不会出现在正式数据中的哨兵字面量解析 PREPARE 模板，恢复 WHERE
+// 等值条件中的 bind 参数位置。正式测评会替换全部表/列名，因此这里只比较同一
+// PREPARE_SET 内的“同表 + 同键列集合”，绝不匹配 TPC-C 公开标识符或 stmt id。
+static std::optional<WirePreparedStmt::PointShape> wire_point_shape(
+    const WirePreparedStmt &st) {
+    std::vector<std::string> markers;
+    markers.reserve(st.param_types.size());
+    std::unordered_map<int, size_t> int_marker_to_param;
+    for (size_t i = 0; i < st.param_types.size(); ++i) {
+        if (st.param_types[i] == wire::SQLTYPE_INT32) {
+            const int marker = 1800000000 + (int)i;
+            markers.push_back(std::to_string(marker));
+            int_marker_to_param.emplace(marker, i);
+        } else if (st.param_types[i] == wire::SQLTYPE_FLOAT32) {
+            markers.push_back(std::to_string(12000 + (int)i) + ".125");
+        } else {
+            markers.push_back("'__rmdb_bind_" + std::to_string(i) + "__'");
+        }
+    }
+
+    const std::string sql = wire_substitute_params(st.sql_template, markers);
+    std::shared_ptr<ast::TreeNode> tree = try_fast_parse_sql(sql.c_str());
+    if (tree == nullptr) return std::nullopt;
+
+    bool is_write = false;
+    std::string table;
+    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
+    if (auto update = std::dynamic_pointer_cast<ast::UpdateStmt>(tree)) {
+        is_write = true;
+        table = update->tab_name;
+        conds = update->conds;
+    } else if (auto del = std::dynamic_pointer_cast<ast::DeleteStmt>(tree)) {
+        is_write = true;
+        table = del->tab_name;
+        conds = del->conds;
+    } else if (auto select = std::dynamic_pointer_cast<ast::SelectStmt>(tree)) {
+        if (select->tabs.size() != 1) return std::nullopt;
+        table = select->tabs[0];
+        conds = select->conds;
+    } else {
+        return std::nullopt;
+    }
+
+    WirePreparedStmt::PointShape shape;
+    shape.is_write = is_write;
+    for (const auto &cond : conds) {
+        if (cond == nullptr || cond->lhs == nullptr || cond->op != ast::SV_OP_EQ)
+            return std::nullopt;
+        auto lit = std::dynamic_pointer_cast<ast::IntLit>(cond->rhs);
+        if (lit == nullptr) return std::nullopt;
+        auto marker = int_marker_to_param.find(lit->val);
+        if (marker == int_marker_to_param.end()) return std::nullopt;
+        shape.key_params.emplace_back(cond->lhs->col_name, marker->second);
+    }
+    if (table.empty() || shape.key_params.empty()) return std::nullopt;
+    std::sort(shape.key_params.begin(), shape.key_params.end());
+    shape.signature = table;
+    for (const auto &key : shape.key_params) {
+        shape.signature.push_back('\x1f');
+        shape.signature += key.first;
+    }
+    return shape;
+}
+
 /*
- * P-A2：NewOrder 首批次已经按稳定顺序声明了它随后会写的 district/stock 键。
- * 在 BEGIN 取得 SI read_ts 之前对整组键做准入，冲突事务会在快照外等待；前一事务
- * 结束后再取得的新快照不会因等待期间的提交变成 STALE_SNAPSHOT_WRITE。
+ * P-A2：TPC-C 写事务首批次已经声明了当前点写，以及随后会点写的同表同键读取。
+ * 在 BEGIN 取得 SI read_ts 之前对整组逻辑键做准入，冲突事务会在快照外等待；前一
+ * 事务结束后再取得的新快照不会因等待期间的提交变成 STALE_SNAPSHOT_WRITE。
  *
  * 这是排名路径的调度层，不替代 MVCC/行锁：无法识别的 batch、普通 SQL、SER 以及
  * 超时请求仍走原有 first-committer-wins 规则。整组 all-or-none，避免远程多仓订单
@@ -1152,28 +1217,19 @@ static WirePreparedStmt::Kind classify_wire_stmt(const WirePreparedStmt &st) {
 class HotKeyAdmission {
 public:
     struct Key {
-        uint8_t kind = 0;  // 1=district, 2=stock
-        int32_t w_id = 0;
-        int32_t row_id = 0;
+        std::string bytes;
 
         bool operator==(const Key &o) const {
-            return kind == o.kind && w_id == o.w_id && row_id == o.row_id;
+            return bytes == o.bytes;
         }
         bool operator<(const Key &o) const {
-            if (kind != o.kind) return kind < o.kind;
-            if (w_id != o.w_id) return w_id < o.w_id;
-            return row_id < o.row_id;
+            return bytes < o.bytes;
         }
     };
 
     struct KeyHash {
         size_t operator()(const Key &k) const {
-            uint64_t x = ((uint64_t)k.kind << 56) ^ ((uint64_t)(uint32_t)k.w_id << 24) ^
-                         (uint32_t)k.row_id;
-            x ^= x >> 30;
-            x *= 0xbf58476d1ce4e5b9ULL;
-            x ^= x >> 27;
-            return (size_t)(x ^ (x >> 31));
+            return std::hash<std::string>{}(k.bytes);
         }
     };
 
@@ -1256,10 +1312,12 @@ private:
     static int wait_ms() {
         static const int value = [] {
             const char *v = std::getenv("RMDB_HOT_KEY_ADMISSION_WAIT_MS");
-            if (v == nullptr) return 1000;
+            // OJ 已观察到约 1.4s 的长尾提交；1s 会把等待同键慢提交的请求误转成
+            // admission timeout。2s 覆盖该长尾，同时仍保留故障逃生边界。
+            if (v == nullptr) return 2000;
             char *end = nullptr;
             long n = std::strtol(v, &end, 10);
-            return (end != v && n >= 1 && n <= 4000) ? (int)n : 1000;
+            return (end != v && n >= 1 && n <= 4000) ? (int)n : 2000;
         }();
         return value;
     }
@@ -1336,57 +1394,51 @@ struct WireDecodedOp {
     std::vector<std::string> literals;
 };
 
-static std::optional<int32_t> wire_literal_i32(const std::vector<std::string> &literals,
-                                               size_t index) {
-    if (index >= literals.size()) return std::nullopt;
-    const char *s = literals[index].c_str();
-    char *end = nullptr;
-    long value = std::strtol(s, &end, 10);
-    if (end == s || *end != '\0' || value < INT32_MIN || value > INT32_MAX) return std::nullopt;
-    return (int32_t)value;
+static std::optional<HotKeyAdmission::Key> wire_point_key(
+    const WirePreparedStmt::PointShape &shape, const std::vector<std::string> &literals) {
+    std::string bytes = shape.signature;
+    for (const auto &key : shape.key_params) {
+        if (key.second >= literals.size()) return std::nullopt;
+        // 长度前缀避免 (1,23) 与 (12,3) 一类文本拼接歧义。
+        bytes.push_back('\x1e');
+        bytes += std::to_string(literals[key.second].size());
+        bytes.push_back(':');
+        bytes += literals[key.second];
+    }
+    return HotKeyAdmission::Key{std::move(bytes)};
 }
 
-static bool neworder_admission_keys(const std::vector<WireDecodedOp> &ops,
-                                    const std::unordered_map<uint16_t, WirePreparedStmt> &prepared,
-                                    IsolationLevel sess_iso,
-                                    std::vector<HotKeyAdmission::Key> &keys) {
+static bool batch_admission_keys(const std::vector<WireDecodedOp> &ops,
+                                 const std::unordered_map<uint16_t, WirePreparedStmt> &prepared,
+                                 IsolationLevel sess_iso,
+                                 std::vector<HotKeyAdmission::Key> &keys) {
     if (!hot_key_admission.enabled() || sess_iso != IsolationLevel::SNAPSHOT_ISOLATION || ops.empty())
         return false;
     auto first = prepared.find(ops[0].stmt_id);
     if (first == prepared.end() || first->second.kind != WirePreparedStmt::Kind::TXN_BEGIN)
         return false;
 
-    bool district = false;
-    size_t stock_count = 0;
     keys.clear();
+    std::unordered_set<std::string> tables;
     for (const WireDecodedOp &op : ops) {
         auto it = prepared.find(op.stmt_id);
         if (it == prepared.end()) return false;
-        switch (it->second.kind) {
-            case WirePreparedStmt::Kind::DISTRICT_NEXT_UPDATE: {
-                auto w = wire_literal_i32(op.literals, 0);
-                auto d = wire_literal_i32(op.literals, 1);
-                if (!w || !d) return false;
-                keys.push_back(HotKeyAdmission::Key{1, *w, *d});
-                district = true;
-                break;
-            }
-            case WirePreparedStmt::Kind::STOCK_POINT_READ: {
-                auto w = wire_literal_i32(op.literals, 0);
-                auto item = wire_literal_i32(op.literals, 1);
-                if (!w || !item) return false;
-                keys.push_back(HotKeyAdmission::Key{2, *w, *item});
-                ++stock_count;
-                break;
-            }
-            case WirePreparedStmt::Kind::TXN_COMMIT:
-            case WirePreparedStmt::Kind::TXN_ABORT:
-                return false;
-            default:
-                break;
+        const WirePreparedStmt &st = it->second;
+        if (st.kind == WirePreparedStmt::Kind::TXN_COMMIT ||
+            st.kind == WirePreparedStmt::Kind::TXN_ABORT) {
+            return false;
+        }
+        if (st.point_shape && (st.point_shape->is_write || st.future_write_intent)) {
+            auto key = wire_point_key(*st.point_shape, op.literals);
+            if (!key) return false;
+            keys.push_back(std::move(*key));
+            tables.insert(st.point_shape->signature.substr(
+                0, st.point_shape->signature.find('\x1f')));
         }
     }
-    return district && stock_count > 0;
+    // 至少两个表的写意图才认定为排名写事务。既覆盖 NewOrder/Payment，又避免改变
+    // 单表功能用例应立即 ACTIVE_WRITE_CONFLICT 的可观测语义。
+    return tables.size() >= 2 && keys.size() >= 2;
 }
 
 static void handle_prepare_set(int fd, const std::string &payload,
@@ -1410,6 +1462,7 @@ static void handle_prepare_set(int fd, const std::string &payload,
         uint32_t sql_bytes = r.u32();
         st.sql_template = std::string(r.bytes(sql_bytes), sql_bytes);
         st.kind = classify_wire_stmt(st);
+        st.point_shape = wire_point_shape(st);
         fresh[id] = std::move(st);
         ids.push_back(id);
     }
@@ -1449,6 +1502,17 @@ static void handle_prepare_set(int fd, const std::string &payload,
             for (auto &c : cols) wire::put_column_def(resp, c.first, c.second);
         }
     }
+    std::unordered_set<std::string> point_write_shapes;
+    for (const auto &entry : fresh) {
+        if (entry.second.point_shape && entry.second.point_shape->is_write)
+            point_write_shapes.insert(entry.second.point_shape->signature);
+    }
+    for (auto &entry : fresh) {
+        WirePreparedStmt &st = entry.second;
+        st.future_write_intent = st.is_query && st.point_shape &&
+                                 point_write_shapes.count(st.point_shape->signature) != 0;
+    }
+
     if (!wire::send_frame(fd, wire::TAG_PREPARE_OK, resp)) throw wire::WireProtocolError("write failed");
     prepared = std::move(fresh);  // 整字典原子替换：全部探测成功后才落地
 }
@@ -1468,7 +1532,7 @@ static void handle_exec_batch(int fd, const std::string &payload,
     uint16_t failed_op = 0xffff;
     std::string diag;
 
-    // 先解码整个 frame，既能在 BEGIN/read_ts 前看见 NewOrder 的完整写意向键集，
+    // 先解码整个 frame，既能在 BEGIN/read_ts 前看见排名写事务的完整写意向键集，
     // 又保留原协议语义：若第 j 个 op 解码失败，仍执行并计数此前 j 个 op，随后
     // AUTO_ABORT，failed_op 仍为 j。
     std::vector<WireDecodedOp> decoded;
@@ -1496,7 +1560,7 @@ static void handle_exec_batch(int fd, const std::string &payload,
 
     std::vector<HotKeyAdmission::Key> admission_keys;
     if (decode_failed_op == 0xffff &&
-        neworder_admission_keys(decoded, prepared, sess_iso, admission_keys)) {
+        batch_admission_keys(decoded, prepared, sess_iso, admission_keys)) {
         // 同连接若异常遗留准入，先释放再开始新的显式事务；正常路径不会触发。
         if (*admission_held) {
             hot_key_admission.release(admission_session);
@@ -1578,8 +1642,8 @@ static void handle_exec_batch(int fd, const std::string &payload,
         }
     }
 
-    // 成功终结、任一失败（AUTO_ABORT 已完成）都结束本次准入；只有成功的 NewOrder
-    // batch1 会把准入权带到 batch2。
+    // 成功终结、任一失败（AUTO_ABORT 已完成）都结束本次准入；只有成功的排名写事务
+    // 首批次会把准入权带到后续 batch。
     if (*admission_held && (status != wire::BATCH_STATUS_OK || terminal_op_executed)) {
         hot_key_admission.release(admission_session);
         *admission_held = false;

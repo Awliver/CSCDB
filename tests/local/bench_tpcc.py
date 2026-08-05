@@ -197,7 +197,7 @@ def worker_loop(
     thread_idx=0,
     use_batch=True,
     population=None,
-    warehouse_schedule="rotating",
+    warehouse_schedule="random",
 ):
     rng = random.Random(rng_seed)
     worker_scale = dict(scale)
@@ -216,7 +216,11 @@ def worker_loop(
     end = time.perf_counter() + duration_sec
     try:
         while time.perf_counter() < end and not stop_event.is_set():
-            if warehouse_schedule == "rotating":
+            if warehouse_schedule == "random":
+                # 官方路由器逐事务选择 home warehouse；各客户端独立抽样会自然产生
+                # 同仓并发。重试由客户端事务函数内部完成时应复用本次选择。
+                worker_scale["w_id"] = rng.randint(1, scale["warehouses"])
+            elif warehouse_schedule == "rotating":
                 # 无共享锁地轮换 home warehouse。与旧的 thread-fixed 模式相比，
                 # W=50/32 客户端在一个测量窗内会真实覆盖全部 50 个 home warehouse。
                 worker_scale["w_id"] = 1 + (
@@ -253,7 +257,7 @@ def bench_round(
     client_timeout=None,
     use_batch=True,
     population=None,
-    warehouse_schedule="rotating",
+    warehouse_schedule="random",
 ):
     stats = TxnStats()
     worker_scale = dict(scale)
@@ -673,8 +677,8 @@ def main():
     ap.add_argument("--threads", type=int, default=None,
                     help="concurrent clients (max 32; default 16, or 32 with --finals)")
     ap.add_argument(
-        "--warehouse-schedule", choices=["rotating", "fixed"], default="rotating",
-        help="home warehouse assignment: rotating covers all W (OJ-shaped); fixed preserves old per-thread mode",
+        "--warehouse-schedule", choices=["random", "rotating", "fixed"], default="random",
+        help="home warehouse assignment: random models the OJ router; rotating/fixed are diagnostic modes",
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stress-seeds", default=None,
