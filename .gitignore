@@ -70,6 +70,8 @@ $RECYCLE.BIN/
 # ============================================
 *.tmp
 *.bak
+!test.local.bak/
+!test.local.bak/**
 *.orig
 *.rej
 
@@ -104,18 +106,6 @@ perf.data*
 __pycache__/
 *.pyc
 *.pyo
-
-# ============================================
-# Local tests, benchmarks, and documentation
-# ============================================
-# Local-only test, benchmark, and profiling helpers.
-tests/local/
-tests/bench/
-tests/prof/
-
-# Project notes and working documentation.
-Docs/
-docs/
 
 # ============================================
 # Local only (do not upload to remote)
