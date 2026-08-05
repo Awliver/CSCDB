@@ -88,11 +88,12 @@ class TxnStats:
             for name in TXN_NAMES
         }
         self.abort_attribution = defaultdict(int)
+        self.home_warehouses = defaultdict(int)
         self.window_outcomes = defaultdict(lambda: defaultdict(int))
         self.window_abort_attribution = defaultdict(int)
         self.window_started = time.monotonic()
 
-    def record(self, txn_type, result, err="", latency=0.0):
+    def record(self, txn_type, result, err="", latency=0.0, home_w=None):
         if isinstance(result, TxnRunResult):
             rr = result
         else:
@@ -131,6 +132,8 @@ class TxnStats:
             })
             ob["attempted"] += 1
             ob[outcome] += 1
+            if home_w is not None:
+                self.home_warehouses[int(home_w)] += 1
             self.window_outcomes[txn_type]["attempted"] += 1
             self.window_outcomes[txn_type][outcome] += 1
             if outcome == "abnormal_abort":
@@ -180,6 +183,7 @@ class TxnStats:
                 list(self.new_order_latencies),
                 {k: dict(v) for k, v in self.outcomes.items()},
                 dict(self.abort_attribution),
+                dict(self.home_warehouses),
             )
 
 
@@ -193,10 +197,12 @@ def worker_loop(
     thread_idx=0,
     use_batch=True,
     population=None,
+    warehouse_schedule="rotating",
 ):
     rng = random.Random(rng_seed)
     worker_scale = dict(scale)
     worker_scale["w_id"] = 1 + (thread_idx % scale["warehouses"])
+    txn_seq = 0
     pop = population or TXN_POPULATION
     try:
         cli = RmdbClient(timeout=client_timeout)
@@ -210,6 +216,15 @@ def worker_loop(
     end = time.perf_counter() + duration_sec
     try:
         while time.perf_counter() < end and not stop_event.is_set():
+            if warehouse_schedule == "rotating":
+                # 无共享锁地轮换 home warehouse。与旧的 thread-fixed 模式相比，
+                # W=50/32 客户端在一个测量窗内会真实覆盖全部 50 个 home warehouse。
+                worker_scale["w_id"] = 1 + (
+                    (thread_idx + txn_seq * max(1, scale.get("threads_hint", 1)))
+                    % scale["warehouses"]
+                )
+            txn_seq += 1
+            home_w = worker_scale["w_id"]
             txn_name, _ = __import__("tpcc_transactions").pick_txn(rng, pop)
             t0 = time.perf_counter()
             try:
@@ -224,7 +239,7 @@ def worker_loop(
             except (RuntimeError, ConnectionRefusedError, OSError) as e:
                 result = TxnRunResult(False, str(e), outcome="error")
             dt = time.perf_counter() - t0
-            stats.record(txn_name, result, latency=dt)
+            stats.record(txn_name, result, latency=dt, home_w=home_w)
     finally:
         cli.close()
 
@@ -238,8 +253,11 @@ def bench_round(
     client_timeout=None,
     use_batch=True,
     population=None,
+    warehouse_schedule="rotating",
 ):
     stats = TxnStats()
+    worker_scale = dict(scale)
+    worker_scale["threads_hint"] = threads
     stop = threading.Event()
     start = time.perf_counter()
     workers = []
@@ -249,13 +267,14 @@ def bench_round(
             args=(
                 duration_sec,
                 seed + i * 10007,
-                scale,
+                worker_scale,
                 stats,
                 stop,
                 client_timeout,
                 i,
                 use_batch,
                 population,
+                warehouse_schedule,
             ),
             daemon=True,
         )
@@ -264,7 +283,7 @@ def bench_round(
     for t in workers:
         t.join()
     elapsed = time.perf_counter() - start
-    no_ok, no_fail, o_ok, o_fail, last_err, by_type, lats, outcomes, attribution = stats.snapshot()
+    no_ok, no_fail, o_ok, o_fail, last_err, by_type, lats, outcomes, attribution, home_counts = stats.snapshot()
     tpm = (no_ok / elapsed * 60.0) if elapsed > 0 else 0.0
     print(
         "  [%s] elapsed=%.1fs threads=%d new_order ok=%d fail=%d other ok=%d fail=%d tpmC=%.2f"
@@ -272,6 +291,14 @@ def bench_round(
     )
     if no_fail or o_fail:
         print("    last error:", last_err[:120])
+    if home_counts:
+        print(
+            "  P_A1_HOME_COVERAGE schedule=%s covered=%d/%d min=%d max=%d"
+            % (
+                warehouse_schedule, len(home_counts), scale["warehouses"],
+                min(home_counts.values()), max(home_counts.values()),
+            )
+        )
     reconcile_ok = True
     for txn_type in sorted(outcomes):
         b = outcomes[txn_type]
@@ -310,6 +337,9 @@ def bench_round(
             for key, count in sorted(attribution.items())
         ],
         "p_a1_reconcile": reconcile_ok,
+        "p_a1_home_warehouses": home_counts,
+        "p_a1_home_coverage": len(home_counts),
+        "p_a1_home_warehouse_total": scale["warehouses"],
     }
 
 
@@ -642,6 +672,10 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--threads", type=int, default=None,
                     help="concurrent clients (max 32; default 16, or 32 with --finals)")
+    ap.add_argument(
+        "--warehouse-schedule", choices=["rotating", "fixed"], default="rotating",
+        help="home warehouse assignment: rotating covers all W (OJ-shaped); fixed preserves old per-thread mode",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stress-seeds", default=None,
                     help="comma-separated seeds for post-benchmark stress trials "
@@ -790,6 +824,7 @@ def main():
     print("  protocol:", proto_desc)
     print("  mix:", mix_desc)
     print("  warmup=%ss measure=%ss rounds=%d threads=%d" % (warmup, measure, rounds, threads))
+    print("  warehouse-schedule:", args.warehouse_schedule)
     if client_timeout is None:
         print("  client-timeout=unlimited")
     else:
@@ -840,6 +875,7 @@ def main():
                 "storage_mode": storage_mode,
                 "reused_db": args.reuse_db,
                 "base_id": os.environ.get("RMDB_TEST_BASE_ID"),
+                "warehouse_schedule": args.warehouse_schedule,
             },
         )
         if not args.no_save_history:
@@ -925,6 +961,7 @@ def main():
         bench_round(
             warmup, threads, args.seed, scale, label="warmup",
             client_timeout=client_timeout, use_batch=use_batch, population=TXN_POPULATION,
+            warehouse_schedule=args.warehouse_schedule,
         )
 
         for rd in range(1, rounds + 1):
@@ -932,6 +969,7 @@ def main():
             r = bench_round(
                 measure, threads, args.seed + rd * 1000, scale, label="round%d" % rd,
                 client_timeout=client_timeout, use_batch=use_batch, population=TXN_POPULATION,
+                warehouse_schedule=args.warehouse_schedule,
             )
             round_results.append(r)
 

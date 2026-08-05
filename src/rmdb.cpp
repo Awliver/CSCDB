@@ -20,7 +20,10 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "errors.h"
@@ -1096,11 +1099,295 @@ static std::string wire_param_literal(uint8_t sql_type, wire::Reader &r) {
 }
 
 struct WirePreparedStmt {
+    enum class Kind : uint8_t {
+        OTHER = 0,
+        TXN_BEGIN,
+        TXN_COMMIT,
+        TXN_ABORT,
+        DISTRICT_NEXT_UPDATE,
+        STOCK_POINT_READ,
+    };
+
     std::string sql_template;
     std::vector<uint8_t> param_types;
     bool is_query = false;
     std::vector<std::pair<std::string, ColType>> out_cols;
+    Kind kind = Kind::OTHER;
 };
+
+static std::string wire_sql_compact_lower(const std::string &sql) {
+    std::string out;
+    out.reserve(sql.size());
+    for (unsigned char c : sql) {
+        if (!std::isspace(c) && c != ';') out.push_back((char)std::tolower(c));
+    }
+    return out;
+}
+
+static WirePreparedStmt::Kind classify_wire_stmt(const WirePreparedStmt &st) {
+    const std::string sql = wire_sql_compact_lower(st.sql_template);
+    if (sql == "begin") return WirePreparedStmt::Kind::TXN_BEGIN;
+    if (sql == "commit") return WirePreparedStmt::Kind::TXN_COMMIT;
+    if (sql == "abort" || sql == "rollback") return WirePreparedStmt::Kind::TXN_ABORT;
+    if (!st.is_query && sql.find("updatedistrictsetd_next_o_id=d_next_o_id+1") == 0 &&
+        sql.find("whered_w_id=$1andd_id=$2") != std::string::npos) {
+        return WirePreparedStmt::Kind::DISTRICT_NEXT_UPDATE;
+    }
+    if (st.is_query && sql.find("fromstock") != std::string::npos &&
+        sql.find("wheres_w_id=$1ands_i_id=$2") != std::string::npos) {
+        return WirePreparedStmt::Kind::STOCK_POINT_READ;
+    }
+    return WirePreparedStmt::Kind::OTHER;
+}
+
+/*
+ * P-A2：NewOrder 首批次已经按稳定顺序声明了它随后会写的 district/stock 键。
+ * 在 BEGIN 取得 SI read_ts 之前对整组键做准入，冲突事务会在快照外等待；前一事务
+ * 结束后再取得的新快照不会因等待期间的提交变成 STALE_SNAPSHOT_WRITE。
+ *
+ * 这是排名路径的调度层，不替代 MVCC/行锁：无法识别的 batch、普通 SQL、SER 以及
+ * 超时请求仍走原有 first-committer-wins 规则。整组 all-or-none，避免远程多仓订单
+ * 持部分键等待形成死锁。
+ */
+class HotKeyAdmission {
+public:
+    struct Key {
+        uint8_t kind = 0;  // 1=district, 2=stock
+        int32_t w_id = 0;
+        int32_t row_id = 0;
+
+        bool operator==(const Key &o) const {
+            return kind == o.kind && w_id == o.w_id && row_id == o.row_id;
+        }
+        bool operator<(const Key &o) const {
+            if (kind != o.kind) return kind < o.kind;
+            if (w_id != o.w_id) return w_id < o.w_id;
+            return row_id < o.row_id;
+        }
+    };
+
+    struct KeyHash {
+        size_t operator()(const Key &k) const {
+            uint64_t x = ((uint64_t)k.kind << 56) ^ ((uint64_t)(uint32_t)k.w_id << 24) ^
+                         (uint32_t)k.row_id;
+            x ^= x >> 30;
+            x *= 0xbf58476d1ce4e5b9ULL;
+            x ^= x >> 27;
+            return (size_t)(x ^ (x >> 31));
+        }
+    };
+
+    bool enabled() const {
+        static const bool on = [] {
+            const char *v = std::getenv("RMDB_HOT_KEY_ADMISSION");
+            return v == nullptr ||
+                   (strcmp(v, "0") != 0 && strcasecmp(v, "off") != 0 &&
+                    strcasecmp(v, "false") != 0);
+        }();
+        return on;
+    }
+
+    bool acquire(uint64_t session, std::vector<Key> keys) {
+        if (!enabled() || keys.empty()) return true;
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+        Waiter waiter{session, std::move(keys)};
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + std::chrono::milliseconds(wait_ms());
+        bool granted = false;
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            waiters_.push_back(&waiter);
+            while (!can_grant(waiter)) {
+                if (cv_.wait_until(lk, deadline) == std::cv_status::timeout &&
+                    !can_grant(waiter)) {
+                    erase_waiter(&waiter);
+                    timeouts_.fetch_add(1, std::memory_order_relaxed);
+                    cv_.notify_all();
+                    maybe_print();
+                    return false;
+                }
+            }
+            for (const Key &key : waiter.keys) owners_[key] = session;
+            held_[session] = waiter.keys;
+            erase_waiter(&waiter);
+            granted = true;
+        }
+        cv_.notify_all();
+
+        if (granted) {
+            const uint64_t waited_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - started).count();
+            admitted_.fetch_add(1, std::memory_order_relaxed);
+            total_wait_us_.fetch_add(waited_us, std::memory_order_relaxed);
+            if (waited_us >= 100) waited_.fetch_add(1, std::memory_order_relaxed);
+            uint64_t old_max = max_wait_us_.load(std::memory_order_relaxed);
+            while (waited_us > old_max &&
+                   !max_wait_us_.compare_exchange_weak(old_max, waited_us,
+                                                       std::memory_order_relaxed)) {
+            }
+            maybe_print();
+        }
+        return granted;
+    }
+
+    void release(uint64_t session) {
+        if (!enabled()) return;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            auto it = held_.find(session);
+            if (it == held_.end()) return;
+            for (const Key &key : it->second) {
+                auto owner = owners_.find(key);
+                if (owner != owners_.end() && owner->second == session) owners_.erase(owner);
+            }
+            held_.erase(it);
+        }
+        cv_.notify_all();
+    }
+
+private:
+    struct Waiter {
+        uint64_t session;
+        std::vector<Key> keys;
+    };
+
+    static int wait_ms() {
+        static const int value = [] {
+            const char *v = std::getenv("RMDB_HOT_KEY_ADMISSION_WAIT_MS");
+            if (v == nullptr) return 1000;
+            char *end = nullptr;
+            long n = std::strtol(v, &end, 10);
+            return (end != v && n >= 1 && n <= 4000) ? (int)n : 1000;
+        }();
+        return value;
+    }
+
+    static bool overlaps(const std::vector<Key> &a, const std::vector<Key> &b) {
+        size_t i = 0, j = 0;
+        while (i < a.size() && j < b.size()) {
+            if (a[i] == b[j]) return true;
+            if (a[i] < b[j]) ++i;
+            else ++j;
+        }
+        return false;
+    }
+
+    bool can_grant(const Waiter &waiter) const {
+        for (const Key &key : waiter.keys) {
+            auto it = owners_.find(key);
+            if (it != owners_.end() && it->second != waiter.session) return false;
+        }
+        // Disjoint requests may pass; an older overlapping waiter retains priority.
+        for (Waiter *older : waiters_) {
+            if (older == &waiter) break;
+            if (overlaps(older->keys, waiter.keys)) return false;
+        }
+        return true;
+    }
+
+    void erase_waiter(Waiter *target) {
+        auto it = std::find(waiters_.begin(), waiters_.end(), target);
+        if (it != waiters_.end()) waiters_.erase(it);
+    }
+
+    void maybe_print() {
+        static const bool stats_on = [] {
+            const char *v = std::getenv("RMDB_STMT_STATS");
+            return v != nullptr && strcmp(v, "0") != 0 && strcasecmp(v, "off") != 0;
+        }();
+        if (!stats_on) return;
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t expected = next_print_ms_.load(std::memory_order_relaxed);
+        if (now < expected || !next_print_ms_.compare_exchange_strong(
+                                  expected, now + 5000, std::memory_order_relaxed)) return;
+        const uint64_t n = admitted_.load(std::memory_order_relaxed);
+        const uint64_t total = total_wait_us_.load(std::memory_order_relaxed);
+        fprintf(stderr,
+                "P_A1_ADMISSION admitted=%llu waited=%llu timeout=%llu avg_wait_us=%llu "
+                "max_wait_us=%llu\n",
+                (unsigned long long)n,
+                (unsigned long long)waited_.load(std::memory_order_relaxed),
+                (unsigned long long)timeouts_.load(std::memory_order_relaxed),
+                (unsigned long long)(n == 0 ? 0 : total / n),
+                (unsigned long long)max_wait_us_.load(std::memory_order_relaxed));
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::unordered_map<Key, uint64_t, KeyHash> owners_;
+    std::unordered_map<uint64_t, std::vector<Key>> held_;
+    std::deque<Waiter *> waiters_;
+    std::atomic<uint64_t> admitted_{0};
+    std::atomic<uint64_t> waited_{0};
+    std::atomic<uint64_t> timeouts_{0};
+    std::atomic<uint64_t> total_wait_us_{0};
+    std::atomic<uint64_t> max_wait_us_{0};
+    std::atomic<int64_t> next_print_ms_{0};
+};
+
+static HotKeyAdmission hot_key_admission;
+static std::atomic<uint64_t> next_admission_session{1};
+
+struct WireDecodedOp {
+    uint16_t stmt_id = 0;
+    std::vector<std::string> literals;
+};
+
+static std::optional<int32_t> wire_literal_i32(const std::vector<std::string> &literals,
+                                               size_t index) {
+    if (index >= literals.size()) return std::nullopt;
+    const char *s = literals[index].c_str();
+    char *end = nullptr;
+    long value = std::strtol(s, &end, 10);
+    if (end == s || *end != '\0' || value < INT32_MIN || value > INT32_MAX) return std::nullopt;
+    return (int32_t)value;
+}
+
+static bool neworder_admission_keys(const std::vector<WireDecodedOp> &ops,
+                                    const std::unordered_map<uint16_t, WirePreparedStmt> &prepared,
+                                    IsolationLevel sess_iso,
+                                    std::vector<HotKeyAdmission::Key> &keys) {
+    if (!hot_key_admission.enabled() || sess_iso != IsolationLevel::SNAPSHOT_ISOLATION || ops.empty())
+        return false;
+    auto first = prepared.find(ops[0].stmt_id);
+    if (first == prepared.end() || first->second.kind != WirePreparedStmt::Kind::TXN_BEGIN)
+        return false;
+
+    bool district = false;
+    size_t stock_count = 0;
+    keys.clear();
+    for (const WireDecodedOp &op : ops) {
+        auto it = prepared.find(op.stmt_id);
+        if (it == prepared.end()) return false;
+        switch (it->second.kind) {
+            case WirePreparedStmt::Kind::DISTRICT_NEXT_UPDATE: {
+                auto w = wire_literal_i32(op.literals, 0);
+                auto d = wire_literal_i32(op.literals, 1);
+                if (!w || !d) return false;
+                keys.push_back(HotKeyAdmission::Key{1, *w, *d});
+                district = true;
+                break;
+            }
+            case WirePreparedStmt::Kind::STOCK_POINT_READ: {
+                auto w = wire_literal_i32(op.literals, 0);
+                auto item = wire_literal_i32(op.literals, 1);
+                if (!w || !item) return false;
+                keys.push_back(HotKeyAdmission::Key{2, *w, *item});
+                ++stock_count;
+                break;
+            }
+            case WirePreparedStmt::Kind::TXN_COMMIT:
+            case WirePreparedStmt::Kind::TXN_ABORT:
+                return false;
+            default:
+                break;
+        }
+    }
+    return district && stock_count > 0;
+}
 
 static void handle_prepare_set(int fd, const std::string &payload,
                                 std::unordered_map<uint16_t, WirePreparedStmt> &prepared) {
@@ -1122,6 +1409,7 @@ static void handle_prepare_set(int fd, const std::string &payload,
         for (uint16_t k = 0; k < param_count; k++) st.param_types.push_back(r.u8());
         uint32_t sql_bytes = r.u32();
         st.sql_template = std::string(r.bytes(sql_bytes), sql_bytes);
+        st.kind = classify_wire_stmt(st);
         fresh[id] = std::move(st);
         ids.push_back(id);
     }
@@ -1167,7 +1455,8 @@ static void handle_prepare_set(int fd, const std::string &payload,
 
 static void handle_exec_batch(int fd, const std::string &payload,
                                std::unordered_map<uint16_t, WirePreparedStmt> &prepared, txn_id_t *txn_id,
-                               IsolationLevel &sess_iso) {
+                               IsolationLevel &sess_iso, uint64_t admission_session,
+                               bool *admission_held) {
     wire::Reader r(payload.data(), payload.size());
     uint16_t op_count = r.u16();
     if (op_count < 1 || op_count > 256) throw wire::WireProtocolError("operation_count out of range");
@@ -1179,22 +1468,61 @@ static void handle_exec_batch(int fd, const std::string &payload,
     uint16_t failed_op = 0xffff;
     std::string diag;
 
-    for (uint16_t op = 0; op < op_count; op++) {
-        uint16_t stmt_id;
-        std::vector<std::string> literals;
-        bool decode_ok = true;
+    // 先解码整个 frame，既能在 BEGIN/read_ts 前看见 NewOrder 的完整写意向键集，
+    // 又保留原协议语义：若第 j 个 op 解码失败，仍执行并计数此前 j 个 op，随后
+    // AUTO_ABORT，failed_op 仍为 j。
+    std::vector<WireDecodedOp> decoded;
+    decoded.reserve(op_count);
+    uint16_t decode_failed_op = 0xffff;
+    std::string decode_diag;
+    for (uint16_t op = 0; op < op_count; ++op) {
         try {
-            stmt_id = r.u16();
-            auto it = prepared.find(stmt_id);
-            if (it == prepared.end()) throw wire::WireProtocolError("unknown statement id " + std::to_string(stmt_id));
+            WireDecodedOp decoded_op;
+            decoded_op.stmt_id = r.u16();
+            auto it = prepared.find(decoded_op.stmt_id);
+            if (it == prepared.end())
+                throw wire::WireProtocolError("unknown statement id " + std::to_string(decoded_op.stmt_id));
             WirePreparedStmt &st = it->second;
-            literals.resize(st.param_types.size());
-            for (size_t k = 0; k < st.param_types.size(); k++) literals[k] = wire_param_literal(st.param_types[k], r);
+            decoded_op.literals.resize(st.param_types.size());
+            for (size_t k = 0; k < st.param_types.size(); ++k)
+                decoded_op.literals[k] = wire_param_literal(st.param_types[k], r);
+            decoded.push_back(std::move(decoded_op));
         } catch (std::exception &e) {
-            decode_ok = false;
-            diag = e.what();
+            decode_failed_op = op;
+            decode_diag = e.what();
+            break;
         }
-        if (!decode_ok) { status = wire::BATCH_STATUS_ERROR; failed_op = op; break; }
+    }
+
+    std::vector<HotKeyAdmission::Key> admission_keys;
+    if (decode_failed_op == 0xffff &&
+        neworder_admission_keys(decoded, prepared, sess_iso, admission_keys)) {
+        // 同连接若异常遗留准入，先释放再开始新的显式事务；正常路径不会触发。
+        if (*admission_held) {
+            hot_key_admission.release(admission_session);
+            *admission_held = false;
+        }
+        if (!hot_key_admission.acquire(admission_session, std::move(admission_keys))) {
+            status = wire::BATCH_STATUS_TRANSACTION_ABORT;
+            failed_op = 0;
+            diag = pa1_abort_diag(AbortReason::ACTIVE_WRITE_CONFLICT,
+                                  "pre-snapshot hot-key admission timeout");
+        } else {
+            *admission_held = true;
+        }
+    }
+
+    bool terminal_op_executed = false;
+    for (uint16_t op = 0; status == wire::BATCH_STATUS_OK && op < op_count; op++) {
+        if (op == decode_failed_op) {
+            status = wire::BATCH_STATUS_ERROR;
+            failed_op = op;
+            diag = decode_diag;
+            break;
+        }
+        WireDecodedOp &decoded_op = decoded[op];
+        const uint16_t stmt_id = decoded_op.stmt_id;
+        std::vector<std::string> &literals = decoded_op.literals;
 
         WirePreparedStmt &st = prepared.at(stmt_id);
         std::string sql = wire_substitute_params(st.sql_template, literals);
@@ -1229,6 +1557,10 @@ static void handle_exec_batch(int fd, const std::string &payload,
             break;
         }
         executed++;
+        if (st.kind == WirePreparedStmt::Kind::TXN_COMMIT ||
+            st.kind == WirePreparedStmt::Kind::TXN_ABORT) {
+            terminal_op_executed = true;
+        }
     }
 
     // AUTO_ABORT：失败且连接存在活动（显式）事务时，必须先完成回滚再回失败响应。
@@ -1244,6 +1576,13 @@ static void handle_exec_batch(int fd, const std::string &payload,
         } catch (std::exception &e) {
             std::cerr << "[wire] auto-abort failed: " << e.what() << std::endl;
         }
+    }
+
+    // 成功终结、任一失败（AUTO_ABORT 已完成）都结束本次准入；只有成功的 NewOrder
+    // batch1 会把准入权带到 batch2。
+    if (*admission_held && (status != wire::BATCH_STATUS_OK || terminal_op_executed)) {
+        hot_key_admission.release(admission_session);
+        *admission_held = false;
     }
 
     std::string resp;
@@ -1379,6 +1718,8 @@ static void handle_wire_connection(int fd) {
     txn_id_t txn_id = INVALID_TXN_ID;
     IsolationLevel sess_iso = IsolationLevel::SERIALIZABLE;
     std::unordered_map<uint16_t, WirePreparedStmt> prepared;
+    const uint64_t admission_session = next_admission_session.fetch_add(1, std::memory_order_relaxed);
+    bool admission_held = false;
 
     while (true) {
         wire::FrameHeader fh;
@@ -1405,7 +1746,8 @@ static void handle_wire_connection(int fd) {
                 case wire::TAG_EXEC_BATCH:
                     if (fh.flags != wire::EXEC_BATCH_FLAG_AUTO_ABORT)
                         throw wire::WireProtocolError("EXEC_BATCH flags must be AUTO_ABORT");
-                    handle_exec_batch(fd, payload, prepared, &txn_id, sess_iso);
+                    handle_exec_batch(fd, payload, prepared, &txn_id, sess_iso,
+                                      admission_session, &admission_held);
                     break;
                 default:
                     throw wire::WireProtocolError("unknown request tag " + std::to_string((int)fh.tag));
@@ -1450,6 +1792,7 @@ static void handle_wire_connection(int fd) {
             std::cerr << "[wire] teardown abort failed: unknown exception" << std::endl;
         }
     }
+    if (admission_held) hot_key_admission.release(admission_session);
 }
 
 void *client_handler(void *sock_fd) {

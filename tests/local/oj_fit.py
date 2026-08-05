@@ -153,6 +153,12 @@ def print_oj_summary(
             "PASS" if pa1_attempted == pa1_rhs else "FAIL", pa1_attempted, pa1_rhs
         ))
     for i, r in enumerate(round_results, 1):
+        coverage = r.get("p_a1_home_coverage")
+        if coverage is not None:
+            print("  round %d home:   %d/%d warehouses" % (
+                i, coverage, r.get("p_a1_home_warehouse_total", coverage)
+            ))
+    for i, r in enumerate(round_results, 1):
         elapsed = r.get("elapsed", 0)
         expected = measure
         flag = ""
@@ -249,6 +255,7 @@ def build_result_payload(
     g = git_info()
     pa1_outcomes = {}
     pa1_abort_rows = {}
+    pa1_home_warehouses = {}
     for result in round_results or []:
         for txn, counts in result.get("p_a1_outcomes", {}).items():
             dst = pa1_outcomes.setdefault(txn, {
@@ -264,6 +271,9 @@ def build_result_payload(
                 pa1_abort_rows[key] = dict(row)
                 pa1_abort_rows[key]["count"] = 0
             pa1_abort_rows[key]["count"] += row.get("count", 0)
+        for warehouse, count in result.get("p_a1_home_warehouses", {}).items():
+            key = str(warehouse)
+            pa1_home_warehouses[key] = pa1_home_warehouses.get(key, 0) + count
     total_abnormal = sum(v.get("abnormal_abort", 0) for v in pa1_outcomes.values())
     reason_counts = {}
     for row in pa1_abort_rows.values():
@@ -302,6 +312,8 @@ def build_result_payload(
         "p_a1_reason_counts": reason_counts,
         "p_a1_top3_abort_coverage": (top3 / total_abnormal) if total_abnormal else 1.0,
         "p_a1_reconcile": pa1_reconcile,
+        "p_a1_home_warehouses": pa1_home_warehouses,
+        "p_a1_home_coverage": len(pa1_home_warehouses),
         "consistency": (
             None if consistency_ok is None else ("PASS" if consistency_ok else "FAIL")
         ),

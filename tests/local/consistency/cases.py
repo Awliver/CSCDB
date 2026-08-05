@@ -1394,6 +1394,180 @@ def case_c8_delete_reinsert_abort_restores_visibility() -> CaseResult:
 # ---------------------------------------------------------------------------
 
 
+def case_pa2_presnapshot_hot_key_admission() -> CaseResult:
+    """P-A2: overlapping NewOrder keys wait before BEGIN; both SI transactions commit."""
+    db = "cons_pa2_hot_key_admission"
+    log_path = os.path.join(BUILD, db + ".server.log")
+    old_admission = os.environ.get("RMDB_HOT_KEY_ADMISSION")
+    old_stats = os.environ.get("RMDB_STMT_STATS")
+    os.environ["RMDB_HOT_KEY_ADMISSION"] = "1"
+    os.environ["RMDB_STMT_STATS"] = "1"
+    try:
+        proc, _ = fresh_db(db, log_path=log_path)
+    finally:
+        if old_admission is None:
+            os.environ.pop("RMDB_HOT_KEY_ADMISSION", None)
+        else:
+            os.environ["RMDB_HOT_KEY_ADMISSION"] = old_admission
+        if old_stats is None:
+            os.environ.pop("RMDB_STMT_STATS", None)
+        else:
+            os.environ["RMDB_STMT_STATS"] = old_stats
+
+    setup = new_client()
+    sql(setup, "create table district (d_w_id int, d_id int, d_next_o_id int);")
+    sql(setup, "create index district (d_w_id, d_id);")
+    for d_id in (1, 2, 3):
+        sql(setup, "insert into district values (1, %d, 1);" % d_id)
+    sql(setup, "create table stock (s_w_id int, s_i_id int, s_quantity int, "
+               "s_ytd int, s_order_cnt int);")
+    sql(setup, "create index stock (s_w_id, s_i_id);")
+    sql(setup, "insert into stock values (1, 1, 100, 0, 0);")
+    sql(setup, "insert into stock values (1, 2, 100, 0, 0);")
+    setup.close()
+
+    s_begin, s_upd_d, s_sel_stock, s_upd_stock, s_commit, s_abort = range(601, 607)
+    prepared = [
+        (s_begin, False, [], "begin"),
+        (s_upd_d, False, [SQLTYPE_INT32, SQLTYPE_INT32],
+         "update district set d_next_o_id=d_next_o_id+1 "
+         "where d_w_id=$1 and d_id=$2"),
+        (s_sel_stock, True, [SQLTYPE_INT32, SQLTYPE_INT32],
+         "select s_quantity from stock where s_w_id=$1 and s_i_id=$2"),
+        (s_upd_stock, False,
+         [SQLTYPE_INT32, SQLTYPE_INT32, SQLTYPE_INT32, SQLTYPE_INT32],
+         "update stock set s_quantity=$1, s_ytd=s_ytd+$2, "
+         "s_order_cnt=s_order_cnt+1 where s_w_id=$3 and s_i_id=$4"),
+        (s_commit, False, [], "commit"),
+        (s_abort, False, [], "abort"),
+    ]
+    a, b, c = new_client(), new_client(), new_client()
+    for cli in (a, b, c):
+        sql(cli, "set transaction isolation level snapshot isolation;")
+        cli.prepare_set(prepared)
+
+    failures = []
+    a_b1 = a.exec_batch([
+        (s_begin, []), (s_upd_d, [1, 1]), (s_sel_stock, [1, 1]),
+    ])
+    if not a_b1.ok:
+        failures.append("A batch1 failed: %r" % a_b1.diagnostic)
+
+    # A holds stock(1,1). A disjoint stock key must not serialize behind it.
+    disjoint_t0 = time.perf_counter()
+    c_b1 = c.exec_batch([
+        (s_begin, []), (s_upd_d, [1, 3]), (s_sel_stock, [1, 2]),
+    ])
+    disjoint_ms = (time.perf_counter() - disjoint_t0) * 1000
+    c_end = c.exec_batch([(s_abort, [])]) if c_b1.ok else c_b1
+    if not c_b1.ok or not c_end.ok or disjoint_ms > 500:
+        failures.append("disjoint key blocked/failed: %.1fms %r" % (disjoint_ms, c_b1.diagnostic))
+
+    b_started = threading.Event()
+    b_done = threading.Event()
+    b_result = {}
+
+    def run_b():
+        b_started.set()
+        t0 = time.perf_counter()
+        first = b.exec_batch([
+            (s_begin, []), (s_upd_d, [1, 2]), (s_sel_stock, [1, 1]),
+        ])
+        b_result["wait_ms"] = (time.perf_counter() - t0) * 1000
+        b_result["b1"] = first
+        if first.ok:
+            rows = first.results.get(2) or []
+            current = int(float(rows[0][0])) if rows else -1
+            b_result["seen"] = current
+            b_result["b2"] = b.exec_batch([
+                (s_upd_stock, [current - 1, 1, 1, 1]), (s_commit, []),
+            ])
+        b_done.set()
+
+    tb = threading.Thread(target=run_b, daemon=True)
+    tb.start()
+    b_started.wait(1)
+    time.sleep(0.15)
+    if b_done.is_set():
+        failures.append("overlapping B did not wait before BEGIN")
+
+    a_b2 = a.exec_batch([(s_upd_stock, [99, 1, 1, 1]), (s_commit, [])])
+    if not a_b2.ok:
+        failures.append("A batch2 failed: %r" % a_b2.diagnostic)
+    tb.join(3)
+    if tb.is_alive():
+        failures.append("B remained blocked after A commit")
+    else:
+        b_b1 = b_result.get("b1")
+        b_b2 = b_result.get("b2")
+        if b_b1 is None or not b_b1.ok:
+            failures.append("B batch1 failed: %r" % getattr(b_b1, "diagnostic", None))
+        elif b_result.get("seen") != 99:
+            failures.append("B snapshot was not refreshed: saw %r" % b_result.get("seen"))
+        elif b_b2 is None or not b_b2.ok:
+            failures.append("B batch2 failed: %r" % getattr(b_b2, "diagnostic", None))
+        if b_result.get("wait_ms", 0) < 100:
+            failures.append("B wait too short: %.1fms" % b_result.get("wait_ms", 0))
+
+    # A connection disappearing between batches must roll back and release its pre-snapshot
+    # reservation; the next owner of the same logical keys must not wait until timeout.
+    disconnect_b1 = c.exec_batch([
+        (s_begin, []), (s_upd_d, [1, 3]), (s_sel_stock, [1, 2]),
+    ])
+    if not disconnect_b1.ok:
+        failures.append("disconnect setup failed: %r" % disconnect_b1.diagnostic)
+    c.close()
+    d = new_client()
+    sql(d, "set transaction isolation level snapshot isolation;")
+    d.prepare_set(prepared)
+    reconnect_t0 = time.perf_counter()
+    reconnect_b1 = d.exec_batch([
+        (s_begin, []), (s_upd_d, [1, 3]), (s_sel_stock, [1, 2]),
+    ])
+    reconnect_ms = (time.perf_counter() - reconnect_t0) * 1000
+    reconnect_end = d.exec_batch([(s_abort, [])]) if reconnect_b1.ok else reconnect_b1
+    if not reconnect_b1.ok or not reconnect_end.ok or reconnect_ms > 900:
+        failures.append("disconnect leaked admission: %.1fms %r" %
+                        (reconnect_ms, reconnect_b1.diagnostic))
+    d.close()
+
+    verify = new_client()
+    stock_rows = parse_table_rows(sql(
+        verify,
+        "select s_quantity, s_ytd, s_order_cnt from stock "
+        "where s_w_id=1 and s_i_id=1;",
+    ))
+    district_rows = parse_table_rows(sql(
+        verify,
+        "select d_id, d_next_o_id from district where d_w_id=1 order by d_id;",
+    ))
+    verify.close()
+    if stock_rows != [["98", "2", "2"]]:
+        failures.append("stock final mismatch: %r" % stock_rows)
+    expected_district = [["1", "2"], ["2", "2"], ["3", "1"]]
+    if district_rows != expected_district:
+        failures.append("district rollback/commit mismatch: %r" % district_rows)
+
+    a.close()
+    b.close()
+    stop_server(proc)
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            server_log = f.read()
+    except OSError:
+        server_log = ""
+    if "P_A1_ADMISSION admitted=" not in server_log:
+        failures.append("admission stats missing")
+
+    if failures:
+        return CaseResult("PA2", "pre-snapshot hot-key admission", False, "; ".join(failures[:4]))
+    return CaseResult(
+        "PA2", "pre-snapshot hot-key admission", True,
+        "overlap %.1fms, disjoint %.1fms, disconnect cleanup %.1fms" %
+        (b_result.get("wait_ms", 0), disjoint_ms, reconnect_ms),
+    )
+
+
 def case_pa1_abort_attribution() -> CaseResult:
     """P-A1: stable tokens + failed_op + AUTO_ABORT cleanup + server window stats."""
     db = "cons_pa1_attribution"
@@ -1512,6 +1686,8 @@ def case_pa1_abort_attribution() -> CaseResult:
 ALL_CASES: List[CaseSpec] = [
     CaseSpec("PA1", "abort attribution closure", case_pa1_abort_attribution,
              ("observability", "mvcc", "finals")),
+    CaseSpec("PA2", "pre-snapshot hot-key admission", case_pa2_presnapshot_hot_key_admission,
+             ("mvcc", "contention", "finals")),
     CaseSpec("C1", "insert heap/MVCC micro-window", case_c1_insert_heap_race, ("mvcc",)),
     CaseSpec("C1b", "uncommitted insert invisible", case_c1_uncommitted_not_visible, ("mvcc",)),
     CaseSpec("C2", "pending overlay same-key insert", case_c2_pending_same_key_insert, ("mvcc",)),
