@@ -9,6 +9,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+
+#include <algorithm>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -107,6 +110,16 @@ class ProjectionExecutor : public AbstractExecutor {
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
     size_t tupleLen() const override { return len_; }
+
+    // 投影不会改变输入行序。把有序性向上传递，避免逻辑投影下推后遮蔽
+    // IndexScan 的顺序属性（例如 MIN(col) 的索引首行早停）。
+    bool sorted_asc_on(const TabCol &col) const override {
+        const bool exposed = std::any_of(cols_.begin(), cols_.end(), [&](const ColMeta &meta) {
+            return meta.name == col.col_name &&
+                   (col.tab_name.empty() || meta.tab_name == col.tab_name);
+        });
+        return exposed && prev_->sorted_asc_on(col);
+    }
 
     Rid &rid() override { return _abstract_rid; }
 };

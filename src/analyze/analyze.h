@@ -58,6 +58,15 @@ class Query{
     std::vector<TabCol> group_by_cols;
     std::vector<Condition> having_conds;
     std::vector<std::pair<TabCol, ast::OrderByDir>> orders;
+
+    // Planner 生成的逻辑优化结果。原始 conds 保持不变，供 EXPLAIN 等后续
+    // 阶段使用；物理规划直接消费已下推的单表谓词和剩余连接谓词。
+    std::map<std::string, std::vector<Condition>> table_filters;
+    std::vector<Condition> join_conditions;
+    // 多表非 SELECT * 查询会为每个表保存投影（即使恰好保留整表列），以便
+    // 在 Join 之前显式裁列；单表查询只保存能实际裁列的投影。
+    std::map<std::string, std::vector<TabCol>> table_projections;
+
     bool has_limit = false;
     int limit_count = 0;
     int limit = -1;  // 题10 简单 LIMIT 兼容

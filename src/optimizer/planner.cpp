@@ -10,7 +10,11 @@ See the Mulan PSL v2 for more details. */
 
 #include "planner.h"
 
+#include <algorithm>
+#include <map>
 #include <memory>
+#include <set>
+#include <utility>
 
 #include "execution/executor_delete.h"
 #include "execution/executor_index_scan.h"
@@ -21,6 +25,10 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_update.h"
 #include "index/ix.h"
 #include "record_printer.h"
+
+namespace {
+std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan);
+}
 
 // 最左匹配规则：对表上每条索引按 cols 顺序贪心匹配前缀。
 // 列要么能找到 OP_EQ 条件（继续匹配后续列），要么找到 OP_LT/GT/LE/GE 条件（匹配此列后停止）。
@@ -166,12 +174,29 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::vec
 std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
                                               std::vector<Condition> join_conds) {
     auto right_scan = std::dynamic_pointer_cast<ScanPlan>(right);
+    auto right_projection = std::dynamic_pointer_cast<ProjectionPlan>(right);
+    if (right_scan == nullptr && right_projection != nullptr) {
+        right_scan = std::dynamic_pointer_cast<ScanPlan>(right_projection->subplan_);
+    }
     if (right_scan != nullptr) {
         std::vector<std::string> index_col_names;
         if (get_join_index_cols(right_scan->tab_name_, right_scan->conds_, join_conds, index_col_names)) {
             right_scan->tag = T_IndexScan;
             right_scan->index_col_names_ = std::move(index_col_names);
-            return std::make_shared<JoinPlan>(T_IndexNestLoop, std::move(left), std::move(right), std::move(join_conds));
+            // IndexNestedLoopJoinExecutor 需要直接接收 ScanPlan。若逻辑优化已在
+            // 右分支放置投影，则先执行 INLJ，再立即投影为“左侧现有列 + 右侧
+            // 必需列”；对上层连接而言与在右分支投影等价，且不会禁用索引连接。
+            if (right_projection != nullptr) {
+                auto output_cols = plan_output_cols(left);
+                output_cols.insert(output_cols.end(), right_projection->sel_cols_.begin(),
+                                   right_projection->sel_cols_.end());
+                auto join = std::make_shared<JoinPlan>(T_IndexNestLoop, std::move(left),
+                                                       std::move(right_scan), std::move(join_conds));
+                return std::make_shared<ProjectionPlan>(T_Projection, std::move(join),
+                                                        std::move(output_cols));
+            }
+            return std::make_shared<JoinPlan>(T_IndexNestLoop, std::move(left), std::move(right),
+                                              std::move(join_conds));
         }
     }
     return std::make_shared<JoinPlan>(T_NestLoop, std::move(left), std::move(right), std::move(join_conds));
@@ -184,14 +209,17 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
  * @param tab_names 表名
  * @return std::vector<Condition>
  */
-std::vector<Condition> pop_conds(std::vector<Condition> &conds, std::string tab_names) {
+std::vector<Condition> pop_conds(std::vector<Condition> &conds, const std::string &tab_name) {
     // auto has_tab = [&](const std::string &tab_name) {
     //     return std::find(tab_names.begin(), tab_names.end(), tab_name) != tab_names.end();
     // };
     std::vector<Condition> solved_conds;
     auto it = conds.begin();
     while (it != conds.end()) {
-        if ((tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val) || (it->lhs_col.tab_name.compare(it->rhs_col.tab_name) == 0)) {
+        const bool belongs_to_table =
+            it->lhs_col.tab_name == tab_name &&
+            (it->is_rhs_val || it->rhs_col.tab_name == tab_name);
+        if (belongs_to_table) {
             solved_conds.emplace_back(std::move(*it));
             it = conds.erase(it);
         } else {
@@ -259,11 +287,109 @@ std::shared_ptr<Plan> pop_scan(int *scantbl, std::string table, std::vector<std:
     return nullptr;
 }
 
+namespace {
+
+// 返回计划节点真正向父节点暴露的列，用于 INLJ 右侧投影改写。INLJ 必须直接
+// 持有 ScanPlan，因此把右侧投影等价地放到 INLJ 之上时，需要同时保留左侧列。
+std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan) {
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return projection->sel_cols_;
+    }
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        std::vector<TabCol> cols;
+        cols.reserve(scan->cols_.size());
+        for (const auto &col : scan->cols_) cols.push_back({col.tab_name, col.name});
+        return cols;
+    }
+    if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        auto cols = plan_output_cols(join->left_);
+        auto right_cols = plan_output_cols(join->right_);
+        cols.insert(cols.end(), right_cols.begin(), right_cols.end());
+        return cols;
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return plan_output_cols(sort->subplan_);
+    }
+    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        return plan_output_cols(limit->subplan_);
+    }
+    return {};
+}
+
+}  // namespace
+
 
 std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> query, Context *context)
 {
-    
-    //TODO 实现逻辑优化规则
+    if (query == nullptr) return nullptr;
+    (void)context;
+
+    std::set<std::string> query_tables(query->tables.begin(), query->tables.end());
+
+    // 1. 谓词下推。只依赖一个表的谓词直接归入该表的 ScanPlan；跨表谓词
+    // 留给能够同时提供两侧列的最底层 JoinPlan。保留原始 conds 不变，避免
+    // 物理规划破坏 EXPLAIN 所需的原始条件集合。
+    query->table_filters.clear();
+    query->join_conditions.clear();
+    for (const auto &cond : query->conds) {
+        const bool single_table =
+            query_tables.count(cond.lhs_col.tab_name) != 0 &&
+            (cond.is_rhs_val || cond.rhs_col.tab_name == cond.lhs_col.tab_name);
+        if (single_table) {
+            query->table_filters[cond.lhs_col.tab_name].push_back(cond);
+        } else {
+            query->join_conditions.push_back(cond);
+        }
+    }
+
+    // 2. 投影下推。扫描节点仍负责先计算本表谓词，因此分支向 Join/Sort/Agg
+    // 只需暴露最终输出、连接、分组、聚合和排序真正依赖的列。普通单表查询的
+    // 根 Projection 已紧邻 Scan，无需重复添加；多表查询则为每个分支显式生成
+    // Project 节点，使优化后的计划树能够直接体现投影下推。
+    query->table_projections.clear();
+    const bool has_intermediate_operator =
+        query->tables.size() > 1 || !query->orders.empty() || !query->aggs.empty() ||
+        !query->group_by_cols.empty();
+    if (!has_intermediate_operator || query->select_all) return query;
+
+    std::map<std::string, std::set<std::string>> required_cols;
+    auto require_col = [&](const TabCol &col) {
+        if (query_tables.count(col.tab_name) != 0) {
+            required_cols[col.tab_name].insert(col.col_name);
+        }
+    };
+
+    for (const auto &col : query->cols) require_col(col);
+    for (const auto &cond : query->join_conditions) {
+        if (cond.is_rhs_val) continue;
+        require_col(cond.lhs_col);
+        require_col(cond.rhs_col);
+    }
+    for (const auto &col : query->group_by_cols) require_col(col);
+    for (const auto &agg : query->aggs) {
+        if (!agg.is_star) require_col(agg.col);
+    }
+    for (const auto &cond : query->having_conds) {
+        require_col(cond.lhs_col);
+        if (!cond.is_rhs_val) require_col(cond.rhs_col);
+    }
+    for (const auto &order : query->orders) require_col(order.first);
+
+    for (const auto &table_name : query->tables) {
+        const auto &table = sm_manager_->db_.get_table(table_name);
+        std::vector<TabCol> projection;
+        const auto required_it = required_cols.find(table_name);
+        if (required_it != required_cols.end()) {
+            for (const auto &col : table.cols) {
+                if (required_it->second.count(col.name) != 0) {
+                    projection.push_back({table_name, col.name});
+                }
+            }
+        }
+        if (query->tables.size() > 1 || projection.size() < table.cols.size()) {
+            query->table_projections.emplace(table_name, std::move(projection));
+        }
+    }
 
     return query;
 }
@@ -309,18 +435,29 @@ std::shared_ptr<Plan> Planner::make_one_rel_sql_order(std::shared_ptr<Query> que
     std::vector<std::string> tables = query->tables;
     if (tables.empty()) return nullptr;
 
+    // logical_optimization 已将单表谓词下推，并保留原始 query->conds 供
+    // EXPLAIN 使用；这里仅消费优化后的分类结果。
+    auto remaining_conds = query->join_conditions;
     std::vector<std::shared_ptr<Plan>> scans(tables.size());
     for (size_t i = 0; i < tables.size(); i++) {
-        auto curr_conds = pop_conds(query->conds, tables[i]);
+        std::vector<Condition> curr_conds;
+        auto filters = query->table_filters.find(tables[i]);
+        if (filters != query->table_filters.end()) curr_conds = filters->second;
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
         if (index_exist && mvcc_force_seqscan(context, tables[i], tables.size(), curr_conds)) index_exist = false;
-        scans[i] = std::make_shared<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan, sm_manager_,
-                                              tables[i], curr_conds, index_col_names);
+        std::shared_ptr<Plan> scan = std::make_shared<ScanPlan>(
+            index_exist ? T_IndexScan : T_SeqScan, sm_manager_, tables[i],
+            std::move(curr_conds), std::move(index_col_names));
+        auto projection = query->table_projections.find(tables[i]);
+        if (projection != query->table_projections.end()) {
+            scan = std::make_shared<ProjectionPlan>(T_Projection, std::move(scan), projection->second);
+        }
+        scans[i] = std::move(scan);
     }
     if (tables.size() == 1) return scans[0];
 
-    auto conds = query->conds;
+    auto conds = std::move(remaining_conds);
     std::shared_ptr<Plan> current = scans[0];
     std::vector<std::string> joined{tables[0]};
 
