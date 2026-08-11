@@ -160,6 +160,7 @@ class IxManager {
         char* data = new char[ih->file_hdr_->tot_len_];
         ih->file_hdr_->serialize(data);
         disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
+        delete[] data;
         // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
         buffer_pool_manager_->flush_all_pages(ih->fd_);
         // 清空 BPM 中此 fd 的所有页，避免 fd 被 OS 重用时读到旧 fd 的脏数据

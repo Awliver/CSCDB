@@ -11,7 +11,7 @@
 | **学校** | 华中科技大学 |
 | **队员** | 王圣翊、李正文、甘可欣 |
 
-## 项目状态（2026-08-05）
+## 项目状态（2026-08-11）
 
 | 项 | 状态 |
 |----|------|
@@ -21,7 +21,8 @@
 | 决赛成绩结构 | 正确性门禁 100/0 + NewOrder/min 排名（SI） |
 | **性能锚点** | `c446377` **全 PASS · 40,264.8 NewOrder/min**；较旧锚点 +8.10%，仍为性能回退基线 |
 | **最新决赛 OJ** | 2026-08-05 12:24 全流程 PASS · **29,650.4 NewOrder/min** · abort-rate 0.17%；用于记录“压低 abort 但损失并行度”的反例，不替换性能锚点 |
-| **当前工作** | **P-A2**：通用热点 admission 改为显式 opt-in，默认回到原生 SI；本地 W=50×32 无 admission 三窗全 PASS，中位 **18,634.04 NewOrder/min**（仅作同机基线，绝不与 OJ 绝对值横比） |
+| **当前工作** | JOIN 扩展主线完成并补齐架构文档；唯一索引的重复键/唯一性语义作为下一条独立改动推进 |
+| **JOIN 扩展** | 基本 JOIN 已通过 OJ；结构化 JOIN Tree 与 LEFT/RIGHT/FULL NULL 扩展已通过本地完整功能测试 12/12，OJ 未专项覆盖新增语义 |
 | 本机 Git 远端 | 仅 `gitlab`（教育平台） |
 
 主线文档：[`Docs/FinalCompetition/决赛赛题整理.md`](Docs/FinalCompetition/决赛赛题整理.md) · [`Docs/FinalCompetition/决赛准备Todo.md`](Docs/FinalCompetition/决赛准备Todo.md) · [`Docs/FinalCompetition/线下赛与答辩准备计划.md`](Docs/FinalCompetition/线下赛与答辩准备计划.md)
@@ -36,7 +37,7 @@
 | P4 | 查询优化 | Done |
 | P5 | 聚合 | Done |
 | P6 | Union 算子 | Done |
-| P7 | NLJ / INLJ | Done |
+| P7 | JOIN Tree / NLJ / INLJ / 外连接 | Done（基本 JOIN OJ；扩展本地回归） |
 | P8 | 事务控制 | Done |
 | P9 | 隔离级别 | Done |
 | P10 | 故障恢复 | Done |
@@ -48,6 +49,8 @@ Parser → Analyze → Optimizer → Portal → Execution
 Transaction / Lock / Log / Recovery
 B+ Index · Slotted-Page Record · Buffer Pool · Disk
 ```
+
+JOIN 的跨层架构、优化边界和 NULL 协议见 [`Docs/Analysis/ProjectAnalysis/7.JOIN扩展架构.md`](Docs/Analysis/ProjectAnalysis/7.JOIN扩展架构.md)。
 
 ## 构建与运行
 

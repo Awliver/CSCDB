@@ -201,7 +201,10 @@ class IxIndexHandle {
                                                  bool find_first = false);
 
     // for insert
-    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction);
+    // inserted 非空时返回本次是否真正插入；重复键仍保持原有返回页号，便于调用方
+    // 在不改变唯一 B+ 树结构的前提下识别唯一性冲突。
+    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction,
+                           bool *inserted = nullptr);
 
     /* 批量装载：next(key_out, rid_out) 按 key 升序（ix_compare 序）逐条产出 n 条
      * 键值对，自底向上顺序构建整棵树并直接写盘（绕过逐条 insert_entry 的全树下降

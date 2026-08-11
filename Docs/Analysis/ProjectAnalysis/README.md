@@ -1,6 +1,6 @@
 # ProjectAnalysis（代码位置索引）
 
-> **阶段（2026-08-01）**：10 题功能 ✅ · **决赛**（官方全流程 PASS）
+> **阶段（2026-08-11）**：10 题功能 ✅ · 基本 JOIN 再次通过 OJ · JOIN Tree/外连接扩展本地回归 12/12 PASS
 > 最新官方结果 → [`08-01 OJ 报告摘要`](../../FinalCompetition/0801-OJ性能测评报告摘要.md) · 性能落地分类 → [`Docs/Optimize/5`](../../Optimize/5.已完成优化摘要.md) · 初赛锚点 → [`12`](../../Optimize/12.初赛冻结备忘.md) · 决赛 → [`FinalCompetition/决赛准备`](../../FinalCompetition/决赛准备Todo.md) · 入口 → [`Docs/README`](../../README.md)
 
 本目录是**代码定位与契约备忘**，不是待填空清单。文中残留的 `📝` 多为功能填充阶段历史标记，**现均已实现**。
@@ -15,5 +15,6 @@
 | [6a.查询执行调用链](./6a.查询执行调用链.md) | SQL → 算子控制流 |
 | [6b.存储与索引调用链](./6b.存储与索引调用链.md) | BPM / 记录 / B+ |
 | [6c.事务恢复调用链](./6c.事务恢复调用链.md) | 事务 / MVCC / WAL |
+| [7.JOIN扩展架构](./7.JOIN扩展架构.md) | Parser → Analyze → Planner → Executor 的 JOIN Tree、外连接与 NULL 协议 |
 
 **阅读建议**：改某模块前先看对应 `6x` + `5`；查「优化做了啥」看 Optimize §5，不必在本目录找 tpmC。

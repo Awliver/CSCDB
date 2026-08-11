@@ -1,7 +1,7 @@
 # Docs 文档索引（本地，不上传远程）
 
 > 队伍 **orzcle** · RMDB 2026 · **决赛阶段**  
-> 最后更新：**2026-08-03**
+> 最后更新：**2026-08-11**
 > **决赛规范**：[FinalCompetition/决赛赛题整理](./FinalCompetition/决赛赛题整理.md) · **主线 Todo**：[FinalCompetition/决赛准备](./FinalCompetition/决赛准备Todo.md)  
 > **现行优化裁决**：[Optimize/14](./Optimize/14.决赛优化状态与实施计划.md) · 初赛锚点：[Optimize/12](./Optimize/12.初赛冻结备忘.md) · 已落地：[Optimize/5](./Optimize/5.已完成优化摘要.md)
 
@@ -29,7 +29,7 @@
 | — | [1](./Optimize/1.TPC-C性能优化分析.md) · [4](./Optimize/4.S5-WAL组提交深化.md) · [11](./Optimize/11.WAL四项优化实现设计.md) | 分析 / WAL 专题 |
 | — | [6.搁置](./Optimize/6.搁置与低优先级方案.md) · [7.外部参考](./Optimize/7.外部参考-DuckDB与ClickHouse.md) · [8.火焰图](./Optimize/8.火焰图实测与性能对比分析.md) | 备忘 |
 | — | [10.注释](./Optimize/10.代码注释与人味化备忘.md) | 改 `src/` 纪律 |
-| — | [Analysis/ProjectAnalysis](./Analysis/ProjectAnalysis/README.md) | 代码定位 / 陷阱 / 调用链 |
+| — | [Analysis/ProjectAnalysis](./Analysis/ProjectAnalysis/README.md) | 代码定位 / 陷阱 / 调用链；含 [JOIN 扩展架构](./Analysis/ProjectAnalysis/7.JOIN扩展架构.md) |
 
 **仓库可见文件约束**：`notes/personal/项目注意.md`。
 

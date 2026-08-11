@@ -377,8 +377,10 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @param transaction 事务指针
  * @return page_id_t 插入到的叶结点的page_no
  */
-page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
+page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction,
+                                      bool *inserted) {
     std::unique_lock<FairSharedMutex> lock(root_latch_);
+    if (inserted != nullptr) *inserted = false;
 
     // 顺序追加快路径：缓存的叶仍是最右叶且 key 不小于其首 key 时，落点必在此叶。
     // 若上次那页的 pin 还攥着（pinned_leaf_no_ 命中），直接用，连 fetch_node 都省了；
@@ -421,6 +423,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
         delete leaf;
         return leaf_page;
     }
+    if (inserted != nullptr) *inserted = true;
 
     // 仅当插入成为叶子首 key 时才需向上传播分隔键；追加插入首 key 未变，省去父节点访问
     if (memcmp(leaf->get_key(0), key, file_hdr_->col_tot_len_) == 0) {
