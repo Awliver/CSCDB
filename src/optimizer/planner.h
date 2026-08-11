@@ -49,6 +49,7 @@ class Planner {
 
     std::shared_ptr<Plan> make_one_rel(std::shared_ptr<Query> query);
     std::shared_ptr<Plan> make_one_rel_sql_order(std::shared_ptr<Query> query, Context *context);
+    std::shared_ptr<Plan> make_join_tree_plan(std::shared_ptr<Query> query, Context *context);
 
     std::shared_ptr<Plan> generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
     
@@ -56,12 +57,17 @@ class Planner {
 
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
-    bool get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names);
-    bool get_join_index_cols(const std::string &right_table, const std::vector<Condition> &scan_conds,
+    bool get_index_cols(std::string tab_name, std::vector<Condition> curr_conds,
+                        std::vector<std::string>& index_col_names,
+                        const std::string &binding_name = "");
+    bool get_join_index_cols(const std::string &right_table, const std::string &right_binding,
+                             const std::vector<Condition> &scan_conds,
                              const std::vector<Condition> &join_conds,
                              std::vector<std::string> &index_col_names);
     std::shared_ptr<Plan> make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
-                                         std::vector<Condition> join_conds);
+                                         std::vector<Condition> join_conds,
+                                         JoinType join_type = INNER_JOIN,
+                                         Context *context = nullptr);
 
     ColType interp_sv_type(ast::SvType sv_type) {
         std::map<ast::SvType, ColType> m = {

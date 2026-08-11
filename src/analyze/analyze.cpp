@@ -141,13 +141,20 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     }
     else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
-        query->tables = x->tabs;
+        auto from_result = x->from != nullptr
+                               ? analyze_from(x->from)
+                               : analyze_legacy_from(x->tabs, x->aliases);
+        query->from = from_result.node;
+        query->tables = from_result.scope.table_names;
+        query->is_outer_join = from_result.has_outer_join;
+        query->requires_join_tree_planner = from_result.has_outer_join ||
+                                            from_result.has_repeated_table; // 标记当前无法安全处理的查询，包含外连接或自连接时设为 true
         query->is_explain = x->is_explain;
-        for (size_t i = 0; i < x->tabs.size(); ++i) {
-            const std::string &real = x->tabs[i];
-            std::string al = (i < x->aliases.size()) ? x->aliases[i] : "";
+        for (const auto &binding : from_result.scope.bindings) {
+            const std::string &real = binding.table_name;
+            const std::string &al = binding.binding_name;
             query->alias2real[real] = real;
-            if (!al.empty()) {
+            if (al != real) {
                 query->alias2real[al] = real;
                 query->real2alias[real] = al;
             } else {
@@ -162,9 +169,10 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 普通列
         for (auto &sv_sel_col : x->cols) {
             if (sv_sel_col->agg_type != 0) continue;  // 题10 简单聚合走下方转换
-            std::string tn = sv_sel_col->tab_name;
-            if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
-            TabCol sel_col = {.tab_name = tn, .col_name = sv_sel_col->col_name};
+            TabCol sel_col = resolve_column(
+                from_result.scope, 
+                {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name});
+            sel_col = to_physical_column(from_result.scope, std::move(sel_col));
             sel_col.alias = sv_sel_col->alias;        // 决赛：col AS alias（输出列名用别名）
             query->cols.push_back(sel_col);
         }
@@ -186,10 +194,10 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             agg.alias = sv_agg->alias;
             agg.distinct = sv_agg->distinct;
             if (sv_agg->col) {
-                agg.col = {.tab_name = sv_agg->col->tab_name, .col_name = sv_agg->col->col_name};
-                if (!agg.col.tab_name.empty() && query->alias2real.count(agg.col.tab_name))
-                    agg.col.tab_name = query->alias2real[agg.col.tab_name];
-                agg.col = check_column(all_cols, agg.col);
+                agg.col = resolve_column(
+                    from_result.scope,
+                    {.tab_name = sv_agg->col->tab_name, .col_name = sv_agg->col->col_name});
+                agg.col = to_physical_column(from_result.scope, std::move(agg.col));
                 agg.arg_type = get_col_type(all_cols, agg.col);
                 if (sv_agg->agg_type != ast::AGG_COUNT &&
                     agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT &&
@@ -214,10 +222,10 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             if (agg.is_star) {
                 agg.arg_type = TYPE_INT;
             } else {
-                std::string tn = sv_sel_col->tab_name;
-                if (!tn.empty() && query->alias2real.count(tn)) tn = query->alias2real[tn];
-                agg.col = {tn, sv_sel_col->col_name};
-                agg.col = check_column(all_cols, agg.col);
+                agg.col = resolve_column(
+                    from_result.scope,
+                    {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name});
+                agg.col = to_physical_column(from_result.scope, std::move(agg.col));
                 agg.arg_type = get_col_type(all_cols, agg.col);
             }
             query->aggs.push_back(agg);
@@ -225,10 +233,10 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
 
         for (auto &sv_gb : x->group_by_cols) {
-            TabCol gb_col = {.tab_name = sv_gb->tab_name, .col_name = sv_gb->col_name};
-            if (!gb_col.tab_name.empty() && query->alias2real.count(gb_col.tab_name))
-                gb_col.tab_name = query->alias2real[gb_col.tab_name];
-            gb_col = check_column(all_cols, gb_col);
+            TabCol gb_col = resolve_column(
+                from_result.scope,
+                {.tab_name = sv_gb->tab_name, .col_name = sv_gb->col_name});
+            gb_col = to_physical_column(from_result.scope, std::move(gb_col));
             query->group_by_cols.push_back(gb_col);
         }
 
@@ -241,16 +249,20 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         if (!x->orders.empty()) {
             for (auto &sv_order : x->orders) {
                 TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
-                if (!order_col.tab_name.empty() && query->alias2real.count(order_col.tab_name))
-                    order_col.tab_name = query->alias2real[order_col.tab_name];
+                if (!order_col.tab_name.empty()) {
+                    order_col = resolve_column(from_result.scope, std::move(order_col));
+                    order_col = to_physical_column(from_result.scope, std::move(order_col));
+                }
                 order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
                                                  query->aggs, all_cols);
                 query->orders.emplace_back(order_col, sv_order->orderby_dir);
             }
         } else if (x->order) {
             TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
-            if (!order_col.tab_name.empty() && query->alias2real.count(order_col.tab_name))
-                order_col.tab_name = query->alias2real[order_col.tab_name];
+            if (!order_col.tab_name.empty()) {
+                order_col = resolve_column(from_result.scope, std::move(order_col));
+                order_col = to_physical_column(from_result.scope, std::move(order_col));
+            }
             order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
                                              query->aggs, all_cols);
             query->orders.emplace_back(order_col, x->order->orderby_dir);
@@ -268,17 +280,24 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             query->sel_captions.push_back(sel_col.alias.empty() ? sel_col.col_name : sel_col.alias);
         }
 
-        get_clause(x->conds, query->conds);
-        for (auto &cond : query->conds) {
-            if (!cond.lhs_col.tab_name.empty() && query->alias2real.count(cond.lhs_col.tab_name))
-                cond.lhs_col.tab_name = query->alias2real[cond.lhs_col.tab_name];
-            if (!cond.is_rhs_val && !cond.rhs_col.tab_name.empty() && query->alias2real.count(cond.rhs_col.tab_name))
-                cond.rhs_col.tab_name = query->alias2real[cond.rhs_col.tab_name];
-        }
-        check_clause(query->tables, query->conds);
-        check_where_no_aggregate(x->conds);
+        const auto &where_ast = x->from != nullptr ? x->where_conds : x->conds;
+        query->where_conds = analyze_conditions(where_ast, from_result.scope);
+        check_where_no_aggregate(where_ast);
 
-        if (!query->is_explain) {
+        // 为旧 Planner 生成物理表名形式的兼容条件。规范语义仍保存在
+        // Query::from 和 Query::where_conds 中，不能从这里反推 ON/WHERE 归属。
+        std::vector<Condition> semantic_conds;
+        collect_join_conditions(query->from, semantic_conds);
+        semantic_conds.insert(semantic_conds.end(), query->where_conds.begin(),
+                              query->where_conds.end());
+        query->conds.clear();
+        query->conds.reserve(semantic_conds.size());
+        for (auto cond : semantic_conds) {
+            query->conds.push_back(to_physical_condition(from_result.scope, std::move(cond)));
+        }
+
+        // 等值条件传播对内连接安全，但对外连接可能改变结果；因此只有当只有没有 JOIN 时，才执行条件传播
+        if (!query->is_explain && !query->requires_join_tree_planner) {
             for (int pass = 0; pass < 3; ++pass) {
                 bool changed = false;
                 std::vector<Condition> derived;
@@ -452,6 +471,240 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     }
     query->parse = std::move(parse);
     return query;
+}
+
+// 递归分析 jointree
+Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::FromExpr> &from) {
+    if (from == nullptr) {
+        throw InternalError("SELECT has no FROM expression");
+    }
+
+    if (auto table = std::dynamic_pointer_cast<ast::TableRef>(from)) {
+        // 当前节点为表节点
+        // get_table 同时完成表存在性检查。
+        const auto &meta = sm_manager_->db_.get_table(table->tab_name); // 检查当前表是否存在
+        TableBinding binding{table->tab_name, table->alias.empty() ? table->tab_name : table->alias}; // 获取别名
+
+        AnalyzedFromResult result; // 创建表节点
+        result.node = std::make_shared<AnalyzedFrom>();
+        result.node->is_table = true;
+        result.node->table = binding;
+        result.node->bindings.push_back(binding);
+        result.scope.bindings.push_back(binding);
+        result.scope.table_names.push_back(table->tab_name);
+        for (auto col : meta.cols) {
+            // 语义树使用关系实例名，确保 e1/e2 这样的自连接实例不会混淆。
+            col.tab_name = binding.binding_name;
+            result.scope.cols.push_back(std::move(col));
+        }
+        return result;
+    }
+
+    auto join = std::dynamic_pointer_cast<ast::JoinExpr>(from); // 处理 JOIN 节点
+    if (join == nullptr) {
+        throw InternalError("Unexpected FROM expression");
+    }
+
+    auto left = analyze_from(join->left); // 递归分析左子树
+    auto right = analyze_from(join->right); // 递归分析右子树
+
+    AnalyzedFromResult result;
+    result.scope = merge_scopes(left.scope, right.scope); // 合并左右作用域
+    result.has_outer_join = left.has_outer_join || right.has_outer_join ||
+                            join->type == LEFT_JOIN || join->type == RIGHT_JOIN ||
+                            join->type == FULL_JOIN;
+    result.has_repeated_table = left.has_repeated_table || right.has_repeated_table; // 检查
+    for (const auto &left_binding : left.scope.bindings) {
+        for (const auto &right_binding : right.scope.bindings) {
+            if (left_binding.table_name == right_binding.table_name) {
+                result.has_repeated_table = true;
+            }
+        }
+    }
+
+    if (join->type == CROSS_JOIN && !join->on_conds.empty()) {
+        throw InternalError("CROSS JOIN cannot have an ON clause");
+    }
+    if (join->type != CROSS_JOIN && join->on_conds.empty()) {
+        throw InternalError("JOIN requires an ON clause");
+    }
+
+    result.node = std::make_shared<AnalyzedFrom>();
+    result.node->is_table = false;
+    result.node->join_type = join->type;
+    result.node->left = std::move(left.node);
+    result.node->right = std::move(right.node);
+    check_where_no_aggregate(join->on_conds);
+    result.node->on_conds = analyze_conditions(join->on_conds, result.scope);
+    result.node->bindings = result.scope.bindings;
+    return result;
+}
+
+// 用于兼容旧式快速解析器，多个表使用逗号连接使用 CROSS JOIN
+Analyze::AnalyzedFromResult Analyze::analyze_legacy_from(
+    const std::vector<std::string> &tabs, const std::vector<std::string> &aliases) {
+    if (tabs.empty()) {
+        throw InternalError("SELECT has no table");
+    }
+
+    std::shared_ptr<ast::FromExpr> from;
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        const std::string alias = i < aliases.size() ? aliases[i] : "";
+        auto table = std::make_shared<ast::TableRef>(tabs[i], alias);
+        if (from == nullptr) {
+            from = table;
+        } else {
+            from = std::make_shared<ast::JoinExpr>(
+                CROSS_JOIN, std::move(from), table,
+                std::vector<std::shared_ptr<ast::BinaryExpr>>{});
+        }
+    }
+    return analyze_from(from);
+}
+
+AnalyzeScope Analyze::merge_scopes(const AnalyzeScope &left,
+                                   const AnalyzeScope &right) {
+    AnalyzeScope result = left;
+    for (const auto &incoming : right.bindings) {
+        for (const auto &existing : result.bindings) {
+            if (existing.binding_name == incoming.binding_name) {
+                // 出现自定义同名表，无法判断来自哪种表
+                throw InternalError("Duplicate table binding: " + incoming.binding_name);
+            }
+        }
+        result.bindings.push_back(incoming);
+    }
+    result.table_names.insert(result.table_names.end(), right.table_names.begin(),
+                              right.table_names.end());
+    result.cols.insert(result.cols.end(), right.cols.begin(), right.cols.end());
+    return result; // 左表与右表合并作用域
+}
+
+// 统一的列解析，给col绑定一个唯一确定的table后返回
+TabCol Analyze::resolve_column(const AnalyzeScope &scope, TabCol target) {
+    if (target.tab_name.empty()) { // 未指明表名前缀
+        std::string binding_name;
+        for (const auto &col : scope.cols) { // 搜索当前作用域的所有列
+            if (col.name != target.col_name) continue;
+            if (!binding_name.empty() && binding_name != col.tab_name) {
+                throw AmbiguousColumnError(target.col_name); // 不止一张表有该列，抛出错误
+            }
+            binding_name = col.tab_name;
+        }
+        if (binding_name.empty()) {
+            throw ColumnNotFoundError(target.col_name); // 所有表都没有该列
+        }
+        target.tab_name = binding_name;
+        return target;
+    }
+
+    bool binding_exists = false; // 是否作用域当前作用域
+    for (const auto &binding : scope.bindings) {
+        if (binding.binding_name == target.tab_name) {
+            binding_exists = true;
+            break;
+        }
+    }
+    if (!binding_exists) {
+        throw TableNotFoundError(target.tab_name);
+    }
+    for (const auto &col : scope.cols) { // 对应表是否存在该列
+        if (col.tab_name == target.tab_name && col.name == target.col_name) {
+            return target;
+        }
+    }
+    throw ColumnNotFoundError(target.col_name);
+}
+
+// 为 ON 和 WHERE 建立统一的条件分析流程
+std::vector<Condition> Analyze::analyze_conditions(
+    const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+    const AnalyzeScope &scope) {
+    std::vector<Condition> conds;
+    get_clause(sv_conds, conds); // 转换为 condition
+    for (auto &cond : conds) {
+        cond.lhs_col = resolve_column(scope, cond.lhs_col); // 解析左侧列
+        if (!cond.is_rhs_val) {
+            cond.rhs_col = resolve_column(scope, cond.rhs_col); // 解析右侧列
+        }
+    }
+    check_condition_types(scope, conds); // 检查左右类型是否匹配
+    return conds;
+}
+
+// 
+void Analyze::check_condition_types(const AnalyzeScope &scope,
+                                    std::vector<Condition> &conds) {
+    auto find_col = [&](const TabCol &target) -> const ColMeta & {
+        for (const auto &col : scope.cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                return col; // 
+            }
+        }
+        throw ColumnNotFoundError(target.col_name);
+    };
+
+    std::vector<Condition> kept;
+    kept.reserve(conds.size());
+    for (auto &cond : conds) {
+        const auto &lhs_col = find_col(cond.lhs_col);
+        const ColType lhs_type = lhs_col.type;
+        ColType rhs_type;
+        if (cond.is_rhs_val) {
+            if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
+                cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val)); // FLOAT 与 INT 比较时，将 INT 提升为 FLOAT
+            } else if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_FLOAT &&
+                       std::isnan(cond.rhs_val.float_val)) {
+                if (cond.op == OP_NE) continue;
+                cond.op = OP_LT;
+                cond.rhs_val.set_float(-INFINITY);
+            } else if (lhs_type == TYPE_INT && cond.rhs_val.type == TYPE_FLOAT) {
+                IntFloatRewrite rewrite = rewrite_int_col_float_val(cond);
+                if (rewrite == IntFloatRewrite::ALWAYS_TRUE) continue;
+                if (rewrite == IntFloatRewrite::ALWAYS_FALSE) {
+                    cond.op = OP_LT;
+                    cond.rhs_val.set_int(INT32_MIN);
+                }
+            }
+            cond.rhs_val.init_raw(lhs_col.len);
+            rhs_type = cond.rhs_val.type;
+        } else {
+            rhs_type = find_col(cond.rhs_col).type;
+        }
+        if (lhs_type != rhs_type) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+        }
+        kept.push_back(std::move(cond));
+    }
+    conds.swap(kept);
+}
+
+// 递归收集 JOIN 条件
+void Analyze::collect_join_conditions(const std::shared_ptr<AnalyzedFrom> &from,
+                                      std::vector<Condition> &conds) {
+    if (from == nullptr || from->is_table) return;
+    collect_join_conditions(from->left, conds);
+    collect_join_conditions(from->right, conds);
+    conds.insert(conds.end(), from->on_conds.begin(), from->on_conds.end());
+}
+
+// 返回给定列的数据库中的列
+TabCol Analyze::to_physical_column(const AnalyzeScope &scope, TabCol col) {
+    for (const auto &binding : scope.bindings) {
+        if (binding.binding_name == col.tab_name) {
+            col.tab_name = binding.table_name;
+            return col;
+        }
+    }
+    throw TableNotFoundError(col.tab_name);
+}
+
+Condition Analyze::to_physical_condition(const AnalyzeScope &scope, Condition cond) {
+    cond.lhs_col = to_physical_column(scope, std::move(cond.lhs_col));
+    if (!cond.is_rhs_val) {
+        cond.rhs_col = to_physical_column(scope, std::move(cond.rhs_col));
+    }
+    return cond;
 }
 
 std::vector<ColMeta> Analyze::infer_select_output_cols(const std::shared_ptr<Query> &query) {

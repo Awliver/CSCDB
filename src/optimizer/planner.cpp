@@ -11,6 +11,9 @@ See the Mulan PSL v2 for more details. */
 #include "planner.h"
 
 #include <algorithm>
+#include <cmath>
+#include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -28,14 +31,19 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan);
+bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables,
+                        const std::vector<Condition> &conds);
 }
 
 // 最左匹配规则：对表上每条索引按 cols 顺序贪心匹配前缀。
 // 列要么能找到 OP_EQ 条件（继续匹配后续列），要么找到 OP_LT/GT/LE/GE 条件（匹配此列后停止）。
 // 跨多条索引时选匹配前缀最长的。
-bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
+bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds,
+                             std::vector<std::string>& index_col_names,
+                             const std::string &binding_name) {
     index_col_names.clear();
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
+    const std::string &condition_table = binding_name.empty() ? tab_name : binding_name;
 
     int best_match_len = 0;
     const IndexMeta* best_index = nullptr;
@@ -47,7 +55,7 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
             bool found_range = false;
             for (auto& cond : curr_conds) {
                 if (!cond.is_rhs_val) continue;
-                if (cond.lhs_col.tab_name != tab_name) continue;
+                if (cond.lhs_col.tab_name != condition_table) continue;
                 if (cond.lhs_col.col_name != idx_col.name) continue;
                 if (cond.op == OP_EQ) { found_eq = true; break; }
                 if (cond.op == OP_LT || cond.op == OP_GT || cond.op == OP_LE || cond.op == OP_GE) {
@@ -82,7 +90,7 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
                 bool found_eq = false;
                 for (auto& cond : curr_conds) {
                     if (cond.is_rhs_val && cond.op == OP_EQ &&
-                        cond.lhs_col.tab_name == tab_name &&
+                        cond.lhs_col.tab_name == condition_table &&
                         cond.lhs_col.col_name == index.cols[ci].name) {
                         found_eq = true;
                         break;
@@ -94,7 +102,7 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
             // 首列自身不得有条件（有条件则常规匹配早已命中）
             bool first_has_cond = false;
             for (auto& cond : curr_conds) {
-                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name &&
+                if (cond.is_rhs_val && cond.lhs_col.tab_name == condition_table &&
                     cond.lhs_col.col_name == index.cols[0].name) {
                     first_has_cond = true;
                     break;
@@ -117,7 +125,8 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
     return true;
 }
 
-bool Planner::get_join_index_cols(const std::string &right_table, const std::vector<Condition> &scan_conds,
+bool Planner::get_join_index_cols(const std::string &right_table, const std::string &right_binding,
+                                  const std::vector<Condition> &scan_conds,
                                   const std::vector<Condition> &join_conds,
                                   std::vector<std::string> &index_col_names) {
     index_col_names.clear();
@@ -126,8 +135,8 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::vec
     auto is_join_eq_on_col = [&](const std::string &col_name) {
         for (auto &cond : join_conds) {
             if (cond.op != OP_EQ || cond.is_rhs_val) continue;
-            if ((cond.lhs_col.tab_name == right_table && cond.lhs_col.col_name == col_name) ||
-                (cond.rhs_col.tab_name == right_table && cond.rhs_col.col_name == col_name)) {
+            if ((cond.lhs_col.tab_name == right_binding && cond.lhs_col.col_name == col_name) ||
+                (cond.rhs_col.tab_name == right_binding && cond.rhs_col.col_name == col_name)) {
                 return true;
             }
         }
@@ -142,7 +151,7 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::vec
             bool matched = false;
             for (auto &cond : scan_conds) {
                 if (!cond.is_rhs_val || cond.op != OP_EQ) continue;
-                if (cond.lhs_col.tab_name != right_table) continue;
+                if (cond.lhs_col.tab_name != right_binding) continue;
                 if (cond.lhs_col.col_name != idx_col.name) continue;
                 matched = true;
                 break;
@@ -172,15 +181,19 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::vec
 }
 
 std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
-                                              std::vector<Condition> join_conds) {
+                                              std::vector<Condition> join_conds,
+                                              JoinType join_type, Context *context) {
     auto right_scan = std::dynamic_pointer_cast<ScanPlan>(right);
     auto right_projection = std::dynamic_pointer_cast<ProjectionPlan>(right);
     if (right_scan == nullptr && right_projection != nullptr) {
         right_scan = std::dynamic_pointer_cast<ScanPlan>(right_projection->subplan_);
     }
-    if (right_scan != nullptr) {
+    if (join_type == INNER_JOIN && right_scan != nullptr &&
+        !mvcc_force_seqscan(context, right_scan->tab_name_, 2, right_scan->conds_)) {
+            // 只有 INNER JOIN 才选择 INLJ
         std::vector<std::string> index_col_names;
-        if (get_join_index_cols(right_scan->tab_name_, right_scan->conds_, join_conds, index_col_names)) {
+        if (get_join_index_cols(right_scan->tab_name_, right_scan->binding_name_,
+                                right_scan->conds_, join_conds, index_col_names)) {
             right_scan->tag = T_IndexScan;
             right_scan->index_col_names_ = std::move(index_col_names);
             // IndexNestedLoopJoinExecutor 需要直接接收 ScanPlan。若逻辑优化已在
@@ -190,16 +203,17 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
                 auto output_cols = plan_output_cols(left);
                 output_cols.insert(output_cols.end(), right_projection->sel_cols_.begin(),
                                    right_projection->sel_cols_.end());
-                auto join = std::make_shared<JoinPlan>(T_IndexNestLoop, std::move(left),
+                auto join = std::make_shared<JoinPlan>(T_IndexNestLoop, join_type, std::move(left),
                                                        std::move(right_scan), std::move(join_conds));
                 return std::make_shared<ProjectionPlan>(T_Projection, std::move(join),
                                                         std::move(output_cols));
             }
-            return std::make_shared<JoinPlan>(T_IndexNestLoop, std::move(left), std::move(right),
+            return std::make_shared<JoinPlan>(T_IndexNestLoop, join_type, std::move(left), std::move(right),
                                               std::move(join_conds));
         }
     }
-    return std::make_shared<JoinPlan>(T_NestLoop, std::move(left), std::move(right), std::move(join_conds));
+    return std::make_shared<JoinPlan>(T_NestLoop, join_type, std::move(left), std::move(right),
+                                      std::move(join_conds));
 }
 
 /**
@@ -233,9 +247,9 @@ int push_conds(Condition *cond, std::shared_ptr<Plan> plan)
 {
     if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan))
     {
-        if(x->tab_name_.compare(cond->lhs_col.tab_name) == 0) {
+        if(x->binding_name_.compare(cond->lhs_col.tab_name) == 0) {
             return 1;
-        } else if(x->tab_name_.compare(cond->rhs_col.tab_name) == 0){
+        } else if(x->binding_name_.compare(cond->rhs_col.tab_name) == 0){
             return 2;
         } else {
             return 0;
@@ -277,10 +291,10 @@ std::shared_ptr<Plan> pop_scan(int *scantbl, std::string table, std::vector<std:
 {
     for (size_t i = 0; i < plans.size(); i++) {
         auto x = std::dynamic_pointer_cast<ScanPlan>(plans[i]);
-        if(x->tab_name_.compare(table) == 0)
+        if(x->binding_name_.compare(table) == 0)
         {
             scantbl[i] = 1;
-            joined_tables.emplace_back(x->tab_name_);
+            joined_tables.emplace_back(x->binding_name_);
             return plans[i];
         }
     }
@@ -309,6 +323,9 @@ std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan) {
     }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         return plan_output_cols(sort->subplan_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        return plan_output_cols(filter->subplan_);
     }
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
         return plan_output_cols(limit->subplan_);
@@ -412,8 +429,9 @@ static bool has_range_cond(const std::vector<Condition> &conds, const std::strin
 //      题九并发测试逐字比对 SELECT 输出、期望值是旧的强制 SeqScan(插入序)所生成，
 //      范围查询改走 IndexScan 会因行序不符而失败。
 // 单表等值点查可走 IndexScan；join 内表或范围条件仍强制 SeqScan（SER 谓词读保序）。
-static bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables,
-                               const std::vector<Condition> &conds) {
+namespace {
+bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_tables,
+                        const std::vector<Condition> &conds) {
     if (!(context && context->txn_ && context->txn_mgr_ &&
           context->txn_mgr_->is_ser(context->txn_)))
         return false;
@@ -422,10 +440,400 @@ static bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t 
     if (n_tables > 1) return true;                 // join：内表 INLJ 无 SSI 钩子
     return has_range_cond(conds, tab);             // 范围查询保序；等值点查放行索引
 }
+}  // namespace
+
+/*
+    专门对连接进行逻辑优化和物理优化
+    逻辑优化主要解决三个问题：条件应该放在scan、join、还是join上方？保留哪些列？哪些逻辑变换不会影响结果
+
+*/
+std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query, Context *context) {
+    if (query == nullptr || query->from == nullptr) return make_one_rel_sql_order(query, context);
+
+    using BindingSet = std::set<std::string>;
+    struct BuildResult {
+        std::shared_ptr<Plan> plan;
+        BindingSet bindings;
+        double rows = 1.0;
+    };
+
+    auto all_bindings = query->from->bindings;
+    std::map<std::string, std::vector<std::string>> physical_bindings;
+    for (const auto &binding : all_bindings) {
+        physical_bindings[binding.table_name].push_back(binding.binding_name);
+    }
+
+    auto bind_col = [&](TabCol col) {
+        for (const auto &binding : all_bindings) {
+            if (binding.binding_name == col.tab_name) return col;
+        }
+        auto it = physical_bindings.find(col.tab_name);
+        if (it != physical_bindings.end() && it->second.size() == 1) col.tab_name = it->second.front();
+        return col;
+    };
+    auto use_explicit_binding = [&](TabCol &col, const std::string &qualifier) {
+        if (qualifier.empty()) return;
+        for (const auto &binding : all_bindings) {
+            if (binding.binding_name == qualifier) {
+                col.tab_name = binding.binding_name;
+                return;
+            }
+        }
+    };
+
+    // Analyze 为兼容旧 Planner 保留了部分物理表名列。新路径在进入
+    // 物理规划前将其还原为 binding 名，使自连接的两个关系实例可区分。
+    if (query->select_all) {
+        query->cols.clear();
+        for (const auto &binding : all_bindings) {
+            const auto &tab = sm_manager_->db_.get_table(binding.table_name);
+            for (const auto &col : tab.cols) query->cols.push_back({binding.binding_name, col.name});
+        }
+    } else {
+        for (auto &col : query->cols) col = bind_col(std::move(col));
+        if (auto select = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
+            size_t output_index = 0;
+            for (const auto &ast_col : select->cols) {
+                if (ast_col->agg_type != 0) continue;
+                if (output_index >= query->cols.size()) break;
+                use_explicit_binding(query->cols[output_index], ast_col->tab_name);
+                output_index++;
+            }
+        }
+    }
+    for (auto &col : query->group_by_cols) col = bind_col(std::move(col));
+    for (auto &agg : query->aggs) {
+        if (!agg.is_star) agg.col = bind_col(std::move(agg.col));
+    }
+    for (auto &cond : query->having_conds) {
+        cond.lhs_col = bind_col(std::move(cond.lhs_col));
+        if (!cond.is_rhs_val) cond.rhs_col = bind_col(std::move(cond.rhs_col));
+    }
+    for (auto &order : query->orders) order.first = bind_col(std::move(order.first));
+    if (auto select = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
+        for (size_t i = 0; i < query->group_by_cols.size() && i < select->group_by_cols.size(); ++i) {
+            use_explicit_binding(query->group_by_cols[i], select->group_by_cols[i]->tab_name);
+        }
+        size_t agg_index = 0;
+        for (const auto &ast_agg : select->aggs) {
+            if (agg_index >= query->aggs.size()) break;
+            if (ast_agg->col != nullptr) {
+                use_explicit_binding(query->aggs[agg_index].col, ast_agg->col->tab_name);
+            }
+            agg_index++;
+        }
+        for (const auto &ast_col : select->cols) {
+            if (ast_col->agg_type == 0 || agg_index >= query->aggs.size()) continue;
+            use_explicit_binding(query->aggs[agg_index].col, ast_col->tab_name);
+            agg_index++;
+        }
+        for (size_t i = 0; i < query->orders.size() && i < select->orders.size(); ++i) {
+            use_explicit_binding(query->orders[i].first, select->orders[i]->cols->tab_name);
+        }
+        if (query->orders.size() == 1 && select->orders.empty() && select->order != nullptr) {
+            use_explicit_binding(query->orders[0].first, select->order->cols->tab_name);
+        }
+    }
+
+    auto condition_bindings = [](const Condition &cond) {
+        BindingSet result{cond.lhs_col.tab_name};
+        if (!cond.is_rhs_val) result.insert(cond.rhs_col.tab_name);
+        result.erase("");
+        return result;
+    };
+    auto node_bindings = [](const std::shared_ptr<AnalyzedFrom> &node) {
+        BindingSet result;
+        for (const auto &binding : node->bindings) result.insert(binding.binding_name);
+        return result;
+    };
+    // jointree 是否包含非 INNER 或 CROSS JOIN
+    std::function<bool(const std::shared_ptr<AnalyzedFrom> &)> is_inner_group;
+    is_inner_group = [&](const std::shared_ptr<AnalyzedFrom> &node) {
+        if (node->is_table) return true;
+        if (node->join_type != INNER_JOIN && node->join_type != CROSS_JOIN) return false;
+        return is_inner_group(node->left) && is_inner_group(node->right);
+    };
+
+    std::map<std::string, std::vector<Condition>> scan_filters; // 对应表的 ScabPlan
+    std::map<const AnalyzedFrom *, std::vector<Condition>> join_filters; // 对应 JoinPlan 的 ON 条件
+
+    /*
+        ON 条件只在不改变外连接补行语义时下推
+        例如 LEFT JOIN 的右表单表 ON 谓词可下推，左表单表 ON 谓词不可下推
+        INNER JOIN：左右单表 ON 都可下推
+        LEFT JOIN：只有右侧单表 ON 可下推
+        RIGHT JOIN：只有左侧单表 ON 可下推
+        FULL JOIN：左右都不可下推
+        核心递归函数
+    */
+    std::function<void(const std::shared_ptr<AnalyzedFrom> &)> prepare_on; 
+    prepare_on = [&](const std::shared_ptr<AnalyzedFrom> &node) {
+        if (node->is_table) return; // 根节点返回
+        prepare_on(node->left); // 递归处理左子树
+        prepare_on(node->right); // 递归处理右子树
+        const auto left_names = node_bindings(node->left);
+        const auto right_names = node_bindings(node->right);
+        for (const auto &cond : node->on_conds) {
+            const auto names = condition_bindings(cond);
+            if (names.size() == 1) {
+                const auto &name = *names.begin();
+                const bool in_left = left_names.count(name) != 0; // 单表条件是在左侧
+                const bool in_right = right_names.count(name) != 0; // 单表条件在右侧
+                const bool push_left = in_left && is_inner_group(node->left) &&
+                    (node->join_type == INNER_JOIN || node->join_type == RIGHT_JOIN);
+                const bool push_right = in_right && is_inner_group(node->right) &&
+                    (node->join_type == INNER_JOIN || node->join_type == LEFT_JOIN);
+                if (push_left || push_right) {
+                    scan_filters[name].push_back(cond); // 能下推
+                    continue;
+                }
+            }
+            join_filters[node.get()].push_back(cond); // 不能下推
+        }
+    };
+    prepare_on(query->from);
+
+    /*
+        WHERE 只能穿过保留该侧输出的连接，一旦路径上该关系处于NULL-supplying 一侧，条件就留在 JOIN 上方的 FilterPlan。
+        检查条件能否从 Join Tree 顶部一直下推到目标表。
+    */
+    std::function<bool(const std::shared_ptr<AnalyzedFrom> &, const std::string &)> where_pushable;
+    where_pushable = [&](const std::shared_ptr<AnalyzedFrom> &node, const std::string &binding) {
+        if (node->is_table) return node->table.binding_name == binding;
+        const auto left_names = node_bindings(node->left);
+        if (left_names.count(binding) != 0) {
+            if (node->join_type == RIGHT_JOIN || node->join_type == FULL_JOIN) return false;
+            return where_pushable(node->left, binding);
+        }
+        const auto right_names = node_bindings(node->right);
+        if (right_names.count(binding) != 0) {
+            if (node->join_type == LEFT_JOIN || node->join_type == FULL_JOIN) return false;
+            return where_pushable(node->right, binding);
+        }
+        return false;
+    };
+
+    std::vector<Condition> post_join_filters; // 整颗 jointree 上发的 FilterPlan
+    for (const auto &cond : query->where_conds) { // 最终分类
+        const auto names = condition_bindings(cond);
+        if (names.size() == 1 && where_pushable(query->from, *names.begin())) {
+            scan_filters[*names.begin()].push_back(cond); // 只涉及到一张表，且路径安全，则可下推
+        } else if (names.size() > 1 && is_inner_group(query->from)) {
+            // 将笛卡尔积转化为 INNER JOIN
+            join_filters[query->from.get()].push_back(cond);
+        } else {
+            post_join_filters.push_back(cond); // 否则放入 JoinPlan
+        }
+    }
+
+    /*
+        投影下推的必需列集：最终输出以及 WHERE/ON/GROUP/AGG/HAVING/ORDER
+        任一后续算子会用到的列都不能被裁掉，包括一下来源：
+            query->cols
+            query->group_by_cols
+            query->aggs
+            query->having_conds
+            query->orders
+            scan_filters
+            join_filters
+            post_join_filters
+    */
+    std::map<std::string, std::set<std::string>> required_cols;
+    auto require_col = [&](const TabCol &col) {
+        if (!col.tab_name.empty() && !col.col_name.empty()) required_cols[col.tab_name].insert(col.col_name);
+    };
+    auto require_cond = [&](const Condition &cond) {
+        require_col(cond.lhs_col);
+        if (!cond.is_rhs_val) require_col(cond.rhs_col);
+    };
+    for (const auto &col : query->cols) require_col(col);
+    for (const auto &col : query->group_by_cols) require_col(col);
+    for (const auto &agg : query->aggs) if (!agg.is_star) require_col(agg.col);
+    for (const auto &cond : query->having_conds) require_cond(cond);
+    for (const auto &order : query->orders) require_col(order.first);
+    for (const auto &[_, conds] : scan_filters) for (const auto &cond : conds) require_cond(cond);
+    for (const auto &[_, conds] : join_filters) for (const auto &cond : conds) require_cond(cond);
+    for (const auto &cond : post_join_filters) require_cond(cond);
+
+    const size_t relation_count = all_bindings.size();
+    auto make_scan = [&](const TableBinding &binding) -> BuildResult {
+        auto conds = scan_filters[binding.binding_name];
+        std::vector<std::string> index_cols;
+        bool use_index = get_index_cols(binding.table_name, conds, index_cols, binding.binding_name);
+        if (use_index && mvcc_force_seqscan(context, binding.table_name, relation_count, conds)) use_index = false;
+        std::shared_ptr<Plan> plan = std::make_shared<ScanPlan>(
+            use_index ? T_IndexScan : T_SeqScan, sm_manager_, binding.table_name,
+            binding.binding_name, conds, index_cols);
+
+        const auto &table = sm_manager_->db_.get_table(binding.table_name);
+        std::vector<TabCol> projection;
+        for (const auto &col : table.cols) { // 建立 Scan 时遍历真实表的列
+            if (required_cols[binding.binding_name].count(col.name) != 0) {
+                projection.push_back({binding.binding_name, col.name});
+            }
+        }
+        if (!projection.empty() && projection.size() < table.cols.size()) {
+            // 若存在投影，则加入 ProjectionPlan
+            plan = std::make_shared<ProjectionPlan>(T_Projection, std::move(plan), std::move(projection));
+        }
+
+        double rows = 1000.0; // 估算计划大概会输出多少行
+        auto fh = sm_manager_->fhs_.find(binding.table_name);
+        if (fh != sm_manager_->fhs_.end() && fh->second != nullptr) {
+            const auto &hdr = fh->second->get_file_hdr();
+            rows = std::max(1, hdr.num_pages - 1) * std::max(1, hdr.num_records_per_page);
+        }
+        for (const auto &cond : conds) rows *= cond.op == OP_EQ ? 0.1 : (cond.op == OP_NE ? 0.5 : 0.3);
+        return {std::move(plan), {binding.binding_name}, std::max(1.0, rows)};
+    };
+
+    //  连接顺序优化，判断当前连接子树能否重排
+    //  INNER JOIN / CROSS JOIN 组成的子树可以重排
+    //  LEFT / RIGHT / FULL JOIN 会成为重排障碍
+    std::function<BuildResult(const std::shared_ptr<AnalyzedFrom> &)> build;
+    build = [&](const std::shared_ptr<AnalyzedFrom> &node) -> BuildResult {
+        if (node->is_table) return make_scan(node->table);
+
+        if (is_inner_group(node)) { // 纯 INNER / CROSS 子树，则会将其展开
+            std::vector<TableBinding> leaves;
+            std::vector<Condition> conditions;
+            std::function<void(const std::shared_ptr<AnalyzedFrom> &)> flatten;
+            flatten = [&](const std::shared_ptr<AnalyzedFrom> &part) {
+                if (part->is_table) {
+                    leaves.push_back(part->table);
+                    return;
+                }
+                flatten(part->left);
+                flatten(part->right);
+                const auto &local = join_filters[part.get()];
+                conditions.insert(conditions.end(), local.begin(), local.end()); // 收集所有连接条件
+            };
+            flatten(node);
+
+            std::vector<BuildResult> relations;
+            relations.reserve(leaves.size());
+            for (const auto &leaf : leaves) relations.push_back(make_scan(leaf)); // 为每个关系建立候选 Scan
+            size_t seed = 0; // 选择估算行数最少的关系
+            for (size_t i = 1; i < relations.size(); ++i) {
+                if (relations[i].rows < relations[seed].rows) seed = i;
+            }
+            BuildResult current = std::move(relations[seed]);
+            relations.erase(relations.begin() + seed);
+
+            std::vector<bool> used(conditions.size(), false);
+            while (!relations.empty()) {
+                size_t best = 0;
+                double best_score = std::numeric_limits<double>::max();
+                for (size_t i = 0; i < relations.size(); ++i) {
+                    bool connected = false;
+                    for (size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
+                        if (used[condition_index]) continue;
+                        const auto names = condition_bindings(conditions[condition_index]);
+                        bool has_current = false;
+                        bool has_candidate = false;
+                        for (const auto &name : names) {
+                            has_current = has_current || current.bindings.count(name) != 0;
+                            has_candidate = has_candidate || relations[i].bindings.count(name) != 0;
+                        }
+                        connected = connected || (has_current && has_candidate);
+                    }
+                    double score = relations[i].rows * (connected ? 0.1 : 10.0);
+                    if (connected) {
+                        auto right_scan = std::dynamic_pointer_cast<ScanPlan>(relations[i].plan);
+                        if (right_scan == nullptr) {
+                            if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(relations[i].plan)) {
+                                right_scan = std::dynamic_pointer_cast<ScanPlan>(projection->subplan_);
+                            }
+                        }
+                        if (right_scan != nullptr) {
+                            std::vector<Condition> candidate_conds;
+                            for (size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
+                                if (used[condition_index]) continue;
+                                const auto names = condition_bindings(conditions[condition_index]);
+                                bool touches_left = false;
+                                bool touches_right = false;
+                                for (const auto &name : names) {
+                                    touches_left = touches_left || current.bindings.count(name) != 0;
+                                    touches_right = touches_right || relations[i].bindings.count(name) != 0;
+                                }
+                                if (touches_left && touches_right) candidate_conds.push_back(conditions[condition_index]);
+                            }
+                            std::vector<std::string> index_cols;
+                            if (get_join_index_cols(right_scan->tab_name_, right_scan->binding_name_,
+                                                    right_scan->conds_, candidate_conds, index_cols)) {
+                                score *= 0.5;
+                            }
+                        }
+                    }
+                    if (score < best_score) {
+                        best_score = score;
+                        best = i;
+                    }
+                }
+
+                auto right = std::move(relations[best]);
+                relations.erase(relations.begin() + best);
+                BindingSet combined = current.bindings;
+                combined.insert(right.bindings.begin(), right.bindings.end());
+                std::vector<Condition> join_conds;
+                for (size_t i = 0; i < conditions.size(); ++i) {
+                    if (used[i]) continue;
+                    const auto names = condition_bindings(conditions[i]);
+                    bool all_available = true;
+                    bool touches_left = false;
+                    bool touches_right = false;
+                    for (const auto &name : names) {
+                        all_available = all_available && combined.count(name) != 0;
+                        touches_left = touches_left || current.bindings.count(name) != 0;
+                        touches_right = touches_right || right.bindings.count(name) != 0;
+                    }
+                    if (all_available && touches_left && touches_right) {
+                        join_conds.push_back(conditions[i]);
+                        used[i] = true;
+                    }
+                }
+                const JoinType type = join_conds.empty() ? CROSS_JOIN : INNER_JOIN;
+                const double selectivity = join_conds.empty() ? 1.0 : std::pow(0.1, join_conds.size());
+                auto plan = make_join_plan(std::move(current.plan), std::move(right.plan),
+                                           std::move(join_conds), type, context);
+                current = {std::move(plan), std::move(combined),
+                           std::max(1.0, current.rows * right.rows * selectivity)};
+            }
+            return current;
+        }
+
+        //  外连接是重排屏障；它的左右子树仍可以各自优化纯内连接组。
+        //  可以优化外连接内部的子树
+        //  不能跨过外连接边界重排
+        auto left = build(node->left);
+        auto right = build(node->right);
+        BindingSet combined = left.bindings;
+        combined.insert(right.bindings.begin(), right.bindings.end());
+        auto conds = join_filters[node.get()];
+        const double selectivity = conds.empty() ? 1.0 : std::pow(0.1, conds.size());
+        const double inner_rows = std::max(1.0, left.rows * right.rows * selectivity);
+        double rows = inner_rows;
+        if (node->join_type == LEFT_JOIN) rows = std::max(rows, left.rows);
+        if (node->join_type == RIGHT_JOIN) rows = std::max(rows, right.rows);
+        if (node->join_type == FULL_JOIN) rows = std::max(rows, left.rows + right.rows);
+        return {make_join_plan(std::move(left.plan), std::move(right.plan), std::move(conds),
+                               node->join_type, context), std::move(combined), rows};
+    };
+
+    auto result = build(query->from);
+    if (!post_join_filters.empty()) {
+        result.plan = std::make_shared<FilterPlan>(T_Filter, std::move(result.plan),
+                                                   std::move(post_join_filters));
+    }
+    query->table_filters = scan_filters;
+    return result.plan;
+}
 
 std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> query, Context *context)
 {
-    std::shared_ptr<Plan> plan = make_one_rel_sql_order(query, context);
+    std::shared_ptr<Plan> plan = query->from != nullptr
+                                     ? make_join_tree_plan(query, context)
+                                     : make_one_rel_sql_order(query, context);
     // ORDER BY 由 generate_select_plan 统一处理（含聚合别名）
     return plan;
 }
@@ -477,7 +885,8 @@ std::shared_ptr<Plan> Planner::make_one_rel_sql_order(std::shared_ptr<Query> que
                 ++it;
             }
         }
-        current = make_join_plan(std::move(current), scans[i], std::move(join_conds));
+        current = make_join_plan(std::move(current), scans[i], std::move(join_conds),
+                                 INNER_JOIN, context);
         joined.push_back(right_table);
     }
 
@@ -649,12 +1058,16 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
  * @param conds select plan 选取条件
  */
 std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query, Context *context) {
+    // 规划过程会把兼容字段中的物理表名还原为 binding 名，并填充
+    // 谓词/投影优化结果。使用副本，避免污染 Analyze 的语义结果以及
+    // EXPLAIN 保存的原始 Query。
+    query = std::make_shared<Query>(*query);
     //逻辑优化
     query = logical_optimization(std::move(query), context);
 
     //物理优化
-    auto sel_cols = query->cols;
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
+    auto sel_cols = query->cols;
 
     // 聚合+分组
     if (!query->aggs.empty() || !query->group_by_cols.empty()) {
@@ -662,9 +1075,13 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
         int offset = 0;
         // GROUP BY 列
         for (auto &gc : query->group_by_cols) {
-            auto tab = sm_manager_->db_.get_table(gc.tab_name);
+            const auto physical_name = query->alias2real.count(gc.tab_name)
+                                           ? query->alias2real.at(gc.tab_name)
+                                           : gc.tab_name;
+            auto tab = sm_manager_->db_.get_table(physical_name);
             auto col_it = tab.get_col(gc.col_name);
             ColMeta col = *col_it;
+            col.tab_name = gc.tab_name;
             col.offset = offset;
             offset += col.len;
             output_cols.push_back(col);
@@ -687,7 +1104,10 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                 } else if (agg.arg_type == TYPE_FLOAT) {
                     col.len = sizeof(float);
                 } else {
-                    auto tab = sm_manager_->db_.get_table(agg.col.tab_name);
+                    const auto physical_name = query->alias2real.count(agg.col.tab_name)
+                                                   ? query->alias2real.at(agg.col.tab_name)
+                                                   : agg.col.tab_name;
+                    auto tab = sm_manager_->db_.get_table(physical_name);
                     col.len = tab.get_col(agg.col.col_name)->len;
                 }
             }

@@ -44,6 +44,7 @@ typedef enum PlanTag{
     T_NestLoop,
     T_IndexNestLoop,
     T_SortMerge,    // sort merge join
+    T_Filter,
     T_Sort,
     T_Projection,
     T_Aggregation,
@@ -63,12 +64,18 @@ class ScanPlan : public Plan
 {
     public:
         ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names)
+            : ScanPlan(tag, sm_manager, tab_name, tab_name, std::move(conds), std::move(index_col_names)) {}
+
+        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::string binding_name,
+                 std::vector<Condition> conds, std::vector<std::string> index_col_names)
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
+            binding_name_ = std::move(binding_name);
             conds_ = std::move(conds);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
+            for (auto &col : cols_) col.tab_name = binding_name_;
             len_ = cols_.back().offset + cols_.back().len;
             fed_conds_ = conds_;
             index_col_names_ = index_col_names;
@@ -76,7 +83,8 @@ class ScanPlan : public Plan
         }
         ~ScanPlan(){}
         // 以下变量同ScanExecutor中的变量
-        std::string tab_name_;                     
+        std::string tab_name_;                     // 物理表名
+        std::string binding_name_;                 // SQL 中的关系实例名（别名），支持自连接
         std::vector<ColMeta> cols_;                
         std::vector<Condition> conds_;             
         size_t len_;                               
@@ -89,12 +97,17 @@ class JoinPlan : public Plan
 {
     public:
         JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
+            : JoinPlan(tag, INNER_JOIN, std::move(left), std::move(right), std::move(conds)) {}
+
+        JoinPlan(PlanTag tag, JoinType join_type, std::shared_ptr<Plan> left,
+                 std::shared_ptr<Plan> right, std::vector<Condition> conds)
         {
-            Plan::tag = tag;
+            // 分离逻辑连接类型和执行算法
+            Plan::tag = tag; // 执行算法 T_NestLoop, T_IndexNestLoop
+            type = join_type; // 逻辑类型 INNER, LEFT, RIGHT, FULL, CROSS
             left_ = std::move(left);
             right_ = std::move(right);
             conds_ = std::move(conds);
-            type = INNER_JOIN;
         }
         ~JoinPlan(){}
         // 左节点
@@ -103,8 +116,26 @@ class JoinPlan : public Plan
         std::shared_ptr<Plan> right_;
         // 连接条件
         std::vector<Condition> conds_;
-        // future TODO: 后续可以支持的连接类型
+        // 逻辑连接类型，与 tag 表示的物理算法分离
         JoinType type;
+};
+
+/*
+    以前条件分为表内条件和表外条件，这个模型无法表示外连接后的 WHERE
+    必须保留为独立 Filter，不能塞进 ON 或任意下推到 Scan。
+*/
+    class FilterPlan : public Plan
+{
+    public:
+        FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<Condition> conds)
+        {
+            Plan::tag = tag;
+            subplan_ = std::move(subplan);
+            conds_ = std::move(conds);
+        }
+        ~FilterPlan() {}
+        std::shared_ptr<Plan> subplan_;
+        std::vector<Condition> conds_;
 };
 
 class ProjectionPlan : public Plan

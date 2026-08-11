@@ -3,6 +3,7 @@ RMDB is licensed under Mulan PSL v2. */
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -17,7 +18,11 @@ class UnionExecutor : public AbstractExecutor {
     std::vector<std::unique_ptr<AbstractExecutor>> children_;
     std::vector<ColMeta> cols_;
     size_t len_ = 0;
-    std::vector<std::unique_ptr<RmRecord>> rows_;
+    struct BufferedRow {
+        std::unique_ptr<RmRecord> record;
+        std::vector<bool> nulls;
+    };
+    std::vector<BufferedRow> rows_;
     size_t idx_ = 0;
 
     void write_value(char *dest, const ColMeta &dst_col, const char *src, const ColMeta &src_col) {
@@ -58,13 +63,21 @@ class UnionExecutor : public AbstractExecutor {
                     throw InternalError("failure");
                 }
                 auto out = std::make_unique<RmRecord>(len_);
+                memset(out->data, 0, len_);
+                std::vector<bool> out_nulls(cols_.size(), false);
+                const auto *child_nulls = child->null_mask();
                 for (size_t i = 0; i < cols_.size(); i++) {
+                    if (child_nulls != nullptr && i < child_nulls->size() && (*child_nulls)[i]) {
+                        out_nulls[i] = true;
+                        continue;
+                    }
                     write_value(out->data + cols_[i].offset, cols_[i],
                                 src->data + child_cols[i].offset, child_cols[i]);
                 }
                 std::string key(out->data, len_);
+                for (bool is_null : out_nulls) key.push_back(is_null ? '\1' : '\0');
                 if (seen.insert(key).second) {
-                    rows_.push_back(std::move(out));
+                    rows_.push_back({std::move(out), std::move(out_nulls)});
                 }
             }
         }
@@ -76,7 +89,13 @@ class UnionExecutor : public AbstractExecutor {
 
     std::unique_ptr<RmRecord> Next() override {
         if (idx_ >= rows_.size()) return nullptr;
-        return std::make_unique<RmRecord>(*rows_[idx_]);
+        return std::make_unique<RmRecord>(*rows_[idx_].record);
+    }
+
+    const std::vector<bool> *null_mask() const override {
+        if (idx_ >= rows_.size()) return nullptr;
+        const auto &mask = rows_[idx_].nulls;
+        return std::any_of(mask.begin(), mask.end(), [](bool value) { return value; }) ? &mask : nullptr;
     }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }

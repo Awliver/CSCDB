@@ -16,6 +16,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     std::unique_ptr<AbstractExecutor> left_;
     SmManager *sm_manager_;
     std::string right_table_;
+    std::string right_binding_;
     TabMeta right_tab_;
     IndexMeta index_meta_;
     RmFileHandle *right_fh_;
@@ -27,6 +28,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     std::vector<Condition> right_conds_;
 
     std::unique_ptr<RmRecord> left_rec_;
+    std::vector<bool> left_nulls_;
+    std::vector<bool> output_nulls_;
     std::vector<Rid> right_hits_;
     size_t hit_idx_ = 0;
     bool isend_ = true;
@@ -57,11 +60,11 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             TabCol right_col;
             TabCol left_col;
             CompOp op;
-            if (cond.lhs_col.tab_name == right_table_ && cond.rhs_col.tab_name != right_table_) {
+            if (cond.lhs_col.tab_name == right_binding_ && cond.rhs_col.tab_name != right_binding_) {
                 right_col = cond.lhs_col;
                 left_col = cond.rhs_col;
                 op = cond.op;
-            } else if (cond.rhs_col.tab_name == right_table_ && cond.lhs_col.tab_name != right_table_) {
+            } else if (cond.rhs_col.tab_name == right_binding_ && cond.lhs_col.tab_name != right_binding_) {
                 right_col = cond.rhs_col;
                 left_col = cond.lhs_col;
                 op = swap_comp_op(cond.op);
@@ -71,6 +74,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
 
             auto left_it = get_col(left_->cols(), left_col);
             auto right_it = get_col(right_cols_, right_col);
+            const size_t left_index = static_cast<size_t>(left_it - left_->cols().begin());
+            if (left_index < left_nulls_.size() && left_nulls_[left_index]) continue;
             Condition instantiated;
             instantiated.lhs_col = right_col;
             instantiated.op = op;
@@ -79,6 +84,10 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             instantiated.rhs_val.raw = std::make_shared<RmRecord>(right_it->len);
             memcpy(instantiated.rhs_val.raw->data, left_rec_->data + left_it->offset, right_it->len);
             pred.push_back(std::move(instantiated));
+        }
+        for (auto &cond : pred) {
+            if (cond.lhs_col.tab_name == right_binding_) cond.lhs_col.tab_name = right_table_;
+            if (!cond.is_rhs_val && cond.rhs_col.tab_name == right_binding_) cond.rhs_col.tab_name = right_table_;
         }
     }
 
@@ -89,7 +98,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             bool filled = false;
             for (auto &cond : right_conds_) {
                 if (cond.op != OP_EQ || !cond.is_rhs_val) continue;
-                if (cond.lhs_col.tab_name != right_table_ || cond.lhs_col.col_name != idx_col.name) continue;
+                if (cond.lhs_col.tab_name != right_binding_ || cond.lhs_col.col_name != idx_col.name) continue;
                 memcpy(key.data() + key_off, cond.rhs_val.raw->data, idx_col.len);
                 filled = true;
                 break;
@@ -99,15 +108,17 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
                     if (cond.op != OP_EQ || cond.is_rhs_val) continue;
                     TabCol left_col;
                     bool matched = false;
-                    if (cond.lhs_col.tab_name == right_table_ && cond.lhs_col.col_name == idx_col.name) {
+                    if (cond.lhs_col.tab_name == right_binding_ && cond.lhs_col.col_name == idx_col.name) {
                         left_col = cond.rhs_col;
                         matched = true;
-                    } else if (cond.rhs_col.tab_name == right_table_ && cond.rhs_col.col_name == idx_col.name) {
+                    } else if (cond.rhs_col.tab_name == right_binding_ && cond.rhs_col.col_name == idx_col.name) {
                         left_col = cond.lhs_col;
                         matched = true;
                     }
                     if (!matched) continue;
                     auto left_it = get_col(left_->cols(), left_col);
+                    const size_t left_index = static_cast<size_t>(left_it - left_->cols().begin());
+                    if (left_index < left_nulls_.size() && left_nulls_[left_index]) return false;
                     memcpy(key.data() + key_off, left_rec_->data + left_it->offset, idx_col.len);
                     filled = true;
                     break;
@@ -138,6 +149,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
                    (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
         });
         if (lhs_it == cols_.end()) return false;
+        const size_t lhs_index = static_cast<size_t>(lhs_it - cols_.begin());
+        if (lhs_index < left_nulls_.size() && left_nulls_[lhs_index]) return false;
         const char *lhs = data + lhs_it->offset;
         const char *rhs = nullptr;
         if (cond.is_rhs_val) {
@@ -148,6 +161,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
                        (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
             });
             if (rhs_it == cols_.end()) return false;
+            const size_t rhs_index = static_cast<size_t>(rhs_it - cols_.begin());
+            if (rhs_index < left_nulls_.size() && left_nulls_[rhs_index]) return false;
             rhs = data + rhs_it->offset;
         }
         return SeqScanExecutor::compare_value(lhs, rhs, lhs_it->len, lhs_it->type, cond.op);
@@ -220,6 +235,12 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         RmRecord right_rec(right_record_size_);
         while (!left_->is_end()) {
             if (left_rec_ == nullptr) {
+                left_nulls_.assign(left_->cols().size(), false);
+                if (const auto *mask = left_->null_mask(); mask != nullptr) {
+                    for (size_t i = 0; i < left_nulls_.size() && i < mask->size(); ++i) {
+                        left_nulls_[i] = (*mask)[i];
+                    }
+                }
                 left_rec_ = left_->Next();
                 probe_right_index();
             }
@@ -235,6 +256,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
                         }
                     }
                     isend_ = false;
+                    output_nulls_ = left_nulls_;
+                    output_nulls_.insert(output_nulls_.end(), right_cols_.size(), false);
                     return;
                 }
                 hit_idx_++;
@@ -252,11 +275,13 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         sm_manager_ = sm_manager;
         context_ = context;
         right_table_ = right_scan.tab_name_;
+        right_binding_ = right_scan.binding_name_;
         right_tab_ = sm_manager_->db_.get_table(right_table_);
         index_meta_ = *(right_tab_.get_index_meta(right_scan.index_col_names_));
         right_fh_ = sm_manager_->fhs_.at(right_table_).get();
         right_record_size_ = right_fh_->get_file_hdr().record_size;
         right_cols_ = right_tab_.cols;
+        for (auto &col : right_cols_) col.tab_name = right_binding_;
         join_conds_ = std::move(join_conds);
         right_conds_ = right_scan.conds_;
 
@@ -275,6 +300,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
                   context_->txn_mgr_->is_ser(context_->txn_);
         left_->beginTuple();
         left_rec_.reset();
+        left_nulls_.clear();
+        output_nulls_.clear();
         isend_ = left_->is_end();
         if (!isend_) find_next_valid_tuple();
     }
@@ -295,6 +322,11 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     bool is_end() const override { return isend_; }
+    const std::vector<bool> *null_mask() const override {
+        return std::any_of(output_nulls_.begin(), output_nulls_.end(), [](bool value) { return value; })
+                   ? &output_nulls_
+                   : nullptr;
+    }
     size_t tupleLen() const override { return len_; }
     const std::vector<ColMeta> &cols() const override { return cols_; }
     Rid &rid() override { return _abstract_rid; }

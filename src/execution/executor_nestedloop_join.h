@@ -9,57 +9,71 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "parser/ast.h"
 #include "system/sm.h"
 
 class NestedLoopJoinExecutor : public AbstractExecutor {
    private:
-    std::unique_ptr<AbstractExecutor> left_;    // 外表（驱动）
-    std::unique_ptr<AbstractExecutor> right_;   // 内表（被驱动，每次外表推进就重扫）
-    size_t len_;                                // 连接后每条记录的总长度
-    std::vector<ColMeta> cols_;                 // 连接后
-    std::vector<Condition> fed_conds_;          // 连接条件
-    bool isend;
+    enum class OutputKind { MATCHED, LEFT_NULL_EXTENDED, RIGHT_NULL_EXTENDED };
 
-    // 优化：缓存当前对的左右记录，避免对子 Next() 二次调用
+    std::unique_ptr<AbstractExecutor> left_;
+    std::unique_ptr<AbstractExecutor> right_;
+    JoinType join_type_ = INNER_JOIN;
+    size_t len_ = 0;
+    std::vector<ColMeta> cols_;
+    std::vector<Condition> fed_conds_;
+    bool isend_ = true;
+
     std::unique_ptr<RmRecord> cur_left_;
+    std::vector<bool> cur_left_nulls_;
+    bool current_left_matched_ = false;
+    bool left_null_emitted_ = false;
 
-    // 优化：内表物化
+    // NLJ 的右侧一次性物化。FULL/RIGHT JOIN 还需记录哪些右行曾匹配。
     std::vector<std::unique_ptr<RmRecord>> right_buf_;
+    std::vector<std::vector<bool>> right_nulls_;
+    std::vector<bool> right_matched_;
     size_t right_idx_ = 0;
+    size_t current_right_idx_ = 0;
 
-   public:
-    NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
-                            std::vector<Condition> conds) {
-        left_ = std::move(left);
-        right_ = std::move(right);
-        len_ = left_->tupleLen() + right_->tupleLen();
-        cols_ = left_->cols();
-        auto right_cols = right_->cols();
-        // 右表列在连接结果中的偏移要加左表 tuple 长度
-        for (auto &col : right_cols) {
-            col.offset += left_->tupleLen();
+    bool unmatched_right_phase_ = false;
+    size_t unmatched_right_idx_ = 0;
+    OutputKind output_kind_ = OutputKind::MATCHED;
+    std::vector<bool> current_nulls_;
+
+    static std::vector<bool> copy_null_mask(AbstractExecutor *executor) {
+        std::vector<bool> result(executor->cols().size(), false);
+        if (const auto *mask = executor->null_mask(); mask != nullptr) {
+            for (size_t i = 0; i < result.size() && i < mask->size(); ++i) result[i] = (*mask)[i];
         }
-        cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
-        isend = false;
-        fed_conds_ = std::move(conds);
+        return result;
     }
 
     void buffer_right() {
         right_buf_.clear();
+        right_nulls_.clear();
         right_->beginTuple();
         while (!right_->is_end()) {
+            right_nulls_.push_back(copy_null_mask(right_.get()));
             right_buf_.push_back(right_->Next());
             right_->nextTuple();
         }
+        right_matched_.assign(right_buf_.size(), false);
     }
 
-    /**
-     * 按类型/操作符比较两段字节数据
-     */
+    void load_current_left() {
+        cur_left_nulls_ = copy_null_mask(left_.get());
+        cur_left_ = left_->Next();
+        right_idx_ = 0;
+        current_left_matched_ = false;
+        left_null_emitted_ = false;
+    }
+
     static bool compare_value(const char *a, const char *b, int len, ColType type, CompOp op) {
         int cmp;
         if (type == TYPE_INT) {
@@ -84,121 +98,190 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         return false;
     }
 
+    struct Operand {
+        const char *data = nullptr;
+        int len = 0;
+        ColType type = TYPE_INT;
+        bool is_null = false;
+        bool found = false;
+    };
 
-    /**
-     * 评估 JOIN 条件
-     * 列可能在 left_ 或 right_ 的 cols() 里，分别用对应的记录数据偏移
-     */
-    bool eval_join_conds(const RmRecord *left_rec, const RmRecord *right_rec) const {
+    Operand find_operand(const TabCol &target, const RmRecord *left_rec,
+                         const RmRecord *right_rec, size_t right_index) const {
         const auto &left_cols = left_->cols();
-        const auto &right_cols = right_->cols();
-
-        for (const auto &cond : fed_conds_) {
-            // 找 lhs 列
-            const char *lhs_data = nullptr;
-            int lhs_len = 0;
-            ColType lhs_type = TYPE_INT;
-
-            auto lhs_in_left = std::find_if(left_cols.begin(), left_cols.end(), [&](const ColMeta &c) {
-                return c.tab_name == cond.lhs_col.tab_name && c.name == cond.lhs_col.col_name;
-            });
-            if (lhs_in_left != left_cols.end()) {
-                lhs_data = left_rec->data + lhs_in_left->offset;
-                lhs_len = lhs_in_left->len;
-                lhs_type = lhs_in_left->type;
-            } else {
-                auto lhs_in_right = std::find_if(right_cols.begin(), right_cols.end(), [&](const ColMeta &c) {
-                    return c.tab_name == cond.lhs_col.tab_name && c.name == cond.lhs_col.col_name;
-                });
-                if (lhs_in_right == right_cols.end()) return false;
-                lhs_data = right_rec->data + lhs_in_right->offset;
-                lhs_len = lhs_in_right->len;
-                lhs_type = lhs_in_right->type;
+        for (size_t i = 0; i < left_cols.size(); ++i) {
+            const auto &col = left_cols[i];
+            if (col.name == target.col_name &&
+                (target.tab_name.empty() || col.tab_name == target.tab_name)) {
+                return {left_rec->data + col.offset, col.len, col.type,
+                        i < cur_left_nulls_.size() && cur_left_nulls_[i], true};
             }
+        }
 
-            // 找 rhs
+        const auto &right_cols = right_->cols();
+        for (size_t i = 0; i < right_cols.size(); ++i) {
+            const auto &col = right_cols[i];
+            if (col.name == target.col_name &&
+                (target.tab_name.empty() || col.tab_name == target.tab_name)) {
+                const auto &mask = right_nulls_[right_index];
+                return {right_rec->data + col.offset, col.len, col.type,
+                        i < mask.size() && mask[i], true};
+            }
+        }
+        return {};
+    }
+
+    // SQL 三值逻辑：ON 中任一操作数为 NULL 时结果是 UNKNOWN，
+    // 对 JOIN 匹配而言与 false 相同。
+    bool eval_join_conds(const RmRecord *left_rec, const RmRecord *right_rec,
+                         size_t right_index) const {
+        for (const auto &cond : fed_conds_) {
+            const auto lhs = find_operand(cond.lhs_col, left_rec, right_rec, right_index);
+            if (!lhs.found || lhs.is_null) return false;
+
             const char *rhs_data = nullptr;
             if (cond.is_rhs_val) {
                 rhs_data = cond.rhs_val.raw->data;
             } else {
-                auto rhs_in_left = std::find_if(left_cols.begin(), left_cols.end(), [&](const ColMeta &c) {
-                    return c.tab_name == cond.rhs_col.tab_name && c.name == cond.rhs_col.col_name;
-                });
-                if (rhs_in_left != left_cols.end()) {
-                    rhs_data = left_rec->data + rhs_in_left->offset;
-                } else {
-                    auto rhs_in_right = std::find_if(right_cols.begin(), right_cols.end(), [&](const ColMeta &c) {
-                        return c.tab_name == cond.rhs_col.tab_name && c.name == cond.rhs_col.col_name;
-                    });
-                    if (rhs_in_right == right_cols.end()) return false;
-                    rhs_data = right_rec->data + rhs_in_right->offset;
-                }
+                const auto rhs = find_operand(cond.rhs_col, left_rec, right_rec, right_index);
+                if (!rhs.found || rhs.is_null) return false;
+                rhs_data = rhs.data;
             }
-
-            // 比较
-            if (!compare_value(lhs_data, rhs_data, lhs_len, lhs_type, cond.op)) {
-                return false;
-            }
+            if (!compare_value(lhs.data, rhs_data, lhs.len, lhs.type, cond.op)) return false;
         }
-        return true;  // 所有条件满足
+        return true;
     }
 
-    void find_next_match() {
-        while (!isend) {
-            if (right_idx_ >= right_buf_.size()) {
-                left_->nextTuple();
-                if (left_->is_end()) {
-                    isend = true;
+    void set_output_nulls(OutputKind kind, size_t right_index = 0) {
+        current_nulls_.clear();
+        current_nulls_.reserve(cols_.size());
+        if (kind == OutputKind::RIGHT_NULL_EXTENDED) {
+            current_nulls_.insert(current_nulls_.end(), left_->cols().size(), true);
+        } else {
+            current_nulls_.insert(current_nulls_.end(), cur_left_nulls_.begin(), cur_left_nulls_.end());
+        }
+        if (kind == OutputKind::LEFT_NULL_EXTENDED) {
+            current_nulls_.insert(current_nulls_.end(), right_->cols().size(), true);
+        } else {
+            const auto &right_mask = right_nulls_[right_index];
+            current_nulls_.insert(current_nulls_.end(), right_mask.begin(), right_mask.end());
+        }
+    }
+
+    void seek_next_output() {
+        while (true) {
+            if (unmatched_right_phase_) {
+                while (unmatched_right_idx_ < right_buf_.size() && right_matched_[unmatched_right_idx_]) {
+                    ++unmatched_right_idx_;
+                }
+                if (unmatched_right_idx_ >= right_buf_.size()) {
+                    isend_ = true;
+                    current_nulls_.clear();
                     return;
                 }
-                right_idx_ = 0;
-                cur_left_ = left_->Next();
-                continue;
-            }
-            if (eval_join_conds(cur_left_.get(), right_buf_[right_idx_].get())) {
+                current_right_idx_ = unmatched_right_idx_++;
+                output_kind_ = OutputKind::RIGHT_NULL_EXTENDED;
+                set_output_nulls(output_kind_, current_right_idx_);
+                isend_ = false;
                 return;
             }
-            right_idx_++;
+
+            if (cur_left_ == nullptr) {
+                if (join_type_ == RIGHT_JOIN || join_type_ == FULL_JOIN) {
+                    unmatched_right_phase_ = true;
+                    unmatched_right_idx_ = 0;
+                    continue;
+                }
+                isend_ = true;
+                current_nulls_.clear();
+                return;
+            }
+
+            while (right_idx_ < right_buf_.size()) {
+                const size_t candidate = right_idx_++;
+                if (eval_join_conds(cur_left_.get(), right_buf_[candidate].get(), candidate)) {
+                    current_left_matched_ = true;
+                    right_matched_[candidate] = true;
+                    current_right_idx_ = candidate;
+                    output_kind_ = OutputKind::MATCHED;
+                    set_output_nulls(output_kind_, current_right_idx_);
+                    isend_ = false;
+                    return;
+                }
+            }
+
+            if (!current_left_matched_ && !left_null_emitted_ &&
+                (join_type_ == LEFT_JOIN || join_type_ == FULL_JOIN)) {
+                left_null_emitted_ = true;
+                output_kind_ = OutputKind::LEFT_NULL_EXTENDED;
+                set_output_nulls(output_kind_);
+                isend_ = false;
+                return;
+            }
+
+            left_->nextTuple();
+            if (left_->is_end()) {
+                cur_left_.reset();
+            } else {
+                load_current_left();
+            }
         }
+    }
+
+   public:
+    NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left,
+                           std::unique_ptr<AbstractExecutor> right,
+                           std::vector<Condition> conds,
+                           JoinType join_type = INNER_JOIN)
+        : left_(std::move(left)), right_(std::move(right)), join_type_(join_type),
+          fed_conds_(std::move(conds)) {
+        len_ = left_->tupleLen() + right_->tupleLen();
+        cols_ = left_->cols();
+        auto right_cols = right_->cols();
+        for (auto &col : right_cols) col.offset += left_->tupleLen();
+        cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
     }
 
     void beginTuple() override {
+        isend_ = true;
+        unmatched_right_phase_ = false;
+        unmatched_right_idx_ = 0;
+        current_nulls_.clear();
+        cur_left_.reset();
+
+        buffer_right();
         left_->beginTuple();
-        if (left_->is_end()) {
-            isend = true;
-            return;
-        }
-        buffer_right();                   // 一次性物化内表
-        if (right_buf_.empty()) {
-            isend = true;
-            return;
-        }
-        right_idx_ = 0;
-        isend = false;
-        cur_left_ = left_->Next();
-        find_next_match();
+        if (!left_->is_end()) load_current_left();
+        seek_next_output();
     }
 
     void nextTuple() override {
-        if (isend) return;
-        right_idx_++;
-        find_next_match();
+        if (!isend_) seek_next_output();
     }
 
-    bool is_end() const override { return isend; }
+    bool is_end() const override { return isend_; }
 
     std::unique_ptr<RmRecord> Next() override {
+        if (isend_) return nullptr;
         auto joined = std::make_unique<RmRecord>(len_);
-        memcpy(joined->data, cur_left_->data, left_->tupleLen());
-        memcpy(joined->data + left_->tupleLen(), right_buf_[right_idx_]->data, right_->tupleLen());
+        memset(joined->data, 0, len_);
+        if (output_kind_ != OutputKind::RIGHT_NULL_EXTENDED) {
+            memcpy(joined->data, cur_left_->data, left_->tupleLen());
+        }
+        if (output_kind_ != OutputKind::LEFT_NULL_EXTENDED) {
+            memcpy(joined->data + left_->tupleLen(), right_buf_[current_right_idx_]->data,
+                   right_->tupleLen());
+        }
         return joined;
     }
 
+    const std::vector<bool> *null_mask() const override {
+        return std::any_of(current_nulls_.begin(), current_nulls_.end(), [](bool value) { return value; })
+                   ? &current_nulls_
+                   : nullptr;
+    }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
-
     size_t tupleLen() const override { return len_; }
-
     Rid &rid() override { return _abstract_rid; }
-
 };

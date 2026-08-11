@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 
 enum JoinType {
     INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, CROSS_JOIN
-};
+}; // 选择的种类
 namespace ast {
 
 enum SvType {
@@ -250,7 +250,7 @@ struct UpdateStmt : public TreeNode {
 
 struct FromExpr : TreeNode {
     virtual ~FromExpr() = default;
-};
+}; // 表示 FROM 后 WHERE 前的表达式
 
 struct TableRef : FromExpr {
     std::string tab_name;
@@ -259,22 +259,22 @@ struct TableRef : FromExpr {
 };
 
 struct JoinExpr : FromExpr {
-    JoinType type;
-    std::shared_ptr<FromExpr> left;
-    std::shared_ptr<FromExpr> right;
-    std::vector<std::shared_ptr<BinaryExpr>> on_conds;
+    JoinType type; // 连接类型
+    std::shared_ptr<FromExpr> left; // 左表
+    std::shared_ptr<FromExpr> right; // 右表
+    std::vector<std::shared_ptr<BinaryExpr>> on_conds; // on 条件
 
     JoinExpr(JoinType type_, std::shared_ptr<FromExpr> left_,
              std::shared_ptr<FromExpr> right_,
              std::vector<std::shared_ptr<BinaryExpr>> on_conds_)
         : type(type_), left(std::move(left_)), right(std::move(right_)),
           on_conds(std::move(on_conds_)) {}
-};
+}; // 定义专门的连接表达式结构
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Col>> cols;
     std::vector<std::shared_ptr<AggExpr>> aggs;
-    // 保真的 FROM 关系树和 WHERE 谓词。ON 谓词只存在 JoinExpr 上。
+    // 将 FROM 后的 ON 条件与 WHERE 后的 WHERE 条件区分
     std::shared_ptr<FromExpr> from;
     std::vector<std::shared_ptr<BinaryExpr>> where_conds;
 
@@ -283,9 +283,9 @@ struct SelectStmt : public TreeNode {
     // 来判断谓词的语义位置。
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
-    std::vector<std::shared_ptr<JoinExpr>> jointree;
+    std::vector<std::shared_ptr<JoinExpr>> jointree; // vector 实现 jointree
 
-    // 题4：与 tabs 平行的别名（无别名则为空串）；EXPLAIN ANALYZE 标志
+    // 列别名
     std::vector<std::string> aliases;
     bool is_explain = false;
 
@@ -300,7 +300,7 @@ struct SelectStmt : public TreeNode {
     int limit_count = 0;
 
     void set_from(std::shared_ptr<FromExpr> from_,
-                  std::vector<std::shared_ptr<BinaryExpr>> where_conds_) {
+                  std::vector<std::shared_ptr<BinaryExpr>> where_conds_) { // 将 from 构造成 jointree，将条件收集
         from = std::move(from_);
         where_conds = std::move(where_conds_);
         tabs.clear();
@@ -311,8 +311,9 @@ struct SelectStmt : public TreeNode {
         conds.insert(conds.end(), where_conds.begin(), where_conds.end());
     }
 
-    void collect_from(const std::shared_ptr<FromExpr> &node) {
+    void collect_from(const std::shared_ptr<FromExpr> &node) { // 递归构建 jointree
         if (auto table = std::dynamic_pointer_cast<TableRef>(node)) {
+            // jointree 叶子节点即为涉及的表
             tabs.push_back(table->tab_name);
             aliases.push_back(table->alias);
             return;
@@ -321,7 +322,9 @@ struct SelectStmt : public TreeNode {
         if (join == nullptr) return;
         collect_from(join->left);
         collect_from(join->right);
-        jointree.push_back(join);
+        jointree.push_back(join); 
+        // 先处理左子树，再处理右子树，最后将当前节点放入 jointree
+        // 后序遍历，子连接在前，父连接在后
         conds.insert(conds.end(), join->on_conds.begin(), join->on_conds.end());
     }
 

@@ -142,6 +142,7 @@ std::string AggExecutor::make_group_key(const char *data) {
 
         if (is_null(data, *it)) {
             null_bitmap[bit_idx / 8] |= (1 << (bit_idx % 8));
+            key.append(it->len, '\0');
         } else {
             key.append(data + it->offset, it->len);
         }
@@ -167,8 +168,17 @@ int AggExecutor::read_as_int(const char *data, const ColMeta &col) {
 
 bool AggExecutor::is_null(const char *data, const ColMeta &col) {
     (void)data;
-    (void)col;
-    return false;
+    const auto *mask = prev_->null_mask();
+    if (mask == nullptr) return false;
+    const auto &input_cols = prev_->cols();
+    auto it = std::find_if(input_cols.begin(), input_cols.end(), [&](const ColMeta &candidate) {
+        return &candidate == &col ||
+               (candidate.offset == col.offset && candidate.name == col.name &&
+                candidate.tab_name == col.tab_name);
+    });
+    if (it == input_cols.end()) return false;
+    const size_t index = static_cast<size_t>(it - input_cols.begin());
+    return index < mask->size() && (*mask)[index];
 }
 
 std::string AggExecutor::get_agg_func_name(ast::AggType type) {
@@ -491,7 +501,13 @@ void AggExecutor::build_cur() {
         size_t key_off = (group_cols_.size() + 7) / 8;
         for (size_t i = 0; i < group_cols_.size(); ++i) {
             size_t col_len = cols_[i].len;
-            memcpy(dst + cols_[i].offset, key.data() + key_off, col_len);
+            const bool is_null_group =
+                (static_cast<unsigned char>(key[i / 8]) & (1U << (i % 8))) != 0;
+            if (is_null_group) {
+                cur_nulls_[i] = true;
+            } else {
+                memcpy(dst + cols_[i].offset, key.data() + key_off, col_len);
+            }
             key_off += col_len;
         }
     }

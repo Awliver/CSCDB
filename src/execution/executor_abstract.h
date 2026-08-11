@@ -33,7 +33,7 @@ class AbstractExecutor {
     virtual std::string getType() { return "AbstractExecutor"; };
 
     /* 当前输出行的 NULL 掩码（按 cols() 顺序）；nullptr = 无 NULL（默认）。
-       目前仅空集聚合产生 NULL，经 Projection 转发到 wire 层以 present=0 发出。 */
+       外连接和聚合可产生 NULL，后续算子必须消费或原样转发该掩码。 */
     virtual const std::vector<bool> *null_mask() const { return nullptr; }
 
     virtual void beginTuple(){};

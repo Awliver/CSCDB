@@ -168,6 +168,7 @@ bool plan_has_join(const std::shared_ptr<Plan> &plan) {
     if (!plan) return false;
     if (std::dynamic_pointer_cast<JoinPlan>(plan)) return true;
     if (auto p = std::dynamic_pointer_cast<ProjectionPlan>(plan)) return plan_has_join(p->subplan_);
+    if (auto f = std::dynamic_pointer_cast<FilterPlan>(plan)) return plan_has_join(f->subplan_);
     if (auto s = std::dynamic_pointer_cast<SortPlan>(plan)) return plan_has_join(s->subplan_);
     if (auto l = std::dynamic_pointer_cast<LimitPlan>(plan)) return plan_has_join(l->subplan_);
     if (auto a = std::dynamic_pointer_cast<AggPlan>(plan)) return plan_has_join(a->subplan_);
@@ -203,7 +204,7 @@ std::string cond_to_string(const Condition &cond) {
 
 size_t count_scan_rows(SmManager *sm_manager, const ScanPlan &scan) {
     size_t count = 0;
-    SeqScanExecutor exec(sm_manager, scan.tab_name_, scan.conds_, nullptr);
+    SeqScanExecutor exec(sm_manager, scan.tab_name_, scan.binding_name_, scan.conds_, nullptr);
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) count++;
     return count;
 }
@@ -240,6 +241,9 @@ void collect_plan_tables_conds(const std::shared_ptr<Plan> &plan, std::vector<st
         conds.insert(conds.end(), join->conds_.begin(), join->conds_.end());
     } else if (auto proj = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         collect_plan_tables_conds(proj->subplan_, tables, conds);
+    } else if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        collect_plan_tables_conds(filter->subplan_, tables, conds);
+        conds.insert(conds.end(), filter->conds_.begin(), filter->conds_.end());
     } else if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         collect_plan_tables_conds(sort->subplan_, tables, conds);
     } else if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
@@ -289,6 +293,14 @@ size_t count_plan_output(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         return product_count_rec(sm_manager, tables, 0, conds, buf, cols, 0);
     }
     if (auto proj = std::dynamic_pointer_cast<ProjectionPlan>(plan)) return count_plan_output(sm_manager, proj->subplan_);
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        std::vector<std::string> tables;
+        std::vector<Condition> conds;
+        collect_plan_tables_conds(filter, tables, conds);
+        std::vector<char> buf;
+        std::vector<ColMeta> cols;
+        return product_count_rec(sm_manager, tables, 0, conds, buf, cols, 0);
+    }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) return count_plan_output(sm_manager, sort->subplan_);
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
         return std::min(limit->limit_, count_plan_output(sm_manager, limit->subplan_));
@@ -332,6 +344,15 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         render_explain_plan(sm_manager, proj->subplan_, required, depth, outer_rows, forced_rows, lines);
         return;
     }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        std::vector<std::string> conds;
+        for (const auto &cond : filter->conds_) conds.push_back(cond_to_string(cond));
+        lines.push_back(std::string(depth, '\t') + "Filter(condition=[" +
+                        join_strings_sorted(conds) + "])");
+        render_explain_plan(sm_manager, filter->subplan_, required, depth + 1,
+                            outer_rows, forced_rows, lines);
+        return;
+    }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         render_explain_plan(sm_manager, sort->subplan_, required, depth, outer_rows, forced_rows, lines);
         return;
@@ -345,7 +366,10 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         size_t rows = forced_rows >= 0 ? static_cast<size_t>(forced_rows) : count_scan_rows(sm_manager, *scan) * outer_rows;
         auto proj_cols = sorted_project_cols_for_scan(sm_manager, scan->tab_name_, required);
         lines.push_back(indent + "Project(columns=[" + join_strings_sorted(proj_cols) + "], rows=" + std::to_string(rows) + ")");
-        std::string scan_line = std::string(depth + 1, '\t') + "Scan(table=" + scan->tab_name_ + ", type=" +
+        const std::string relation = scan->binding_name_ == scan->tab_name_
+                                         ? scan->tab_name_
+                                         : scan->tab_name_ + " AS " + scan->binding_name_;
+        std::string scan_line = std::string(depth + 1, '\t') + "Scan(table=" + relation + ", type=" +
                                 (scan->tag == T_IndexScan ? "IndexScan" : "SeqScan");
         if (scan->tag == T_IndexScan && !scan->index_col_names_.empty()) {
             scan_line += ", using_index=(" + join_strings_sorted(scan->index_col_names_) + ")";
@@ -361,7 +385,11 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         std::vector<std::string> table_names(tables.begin(), tables.end());
         std::vector<std::string> conds;
         for (auto &cond : join->conds_) conds.push_back(cond_to_string(cond));
-        lines.push_back(indent + "Join(tables=[" + join_strings_sorted(table_names) + "], condition=[" +
+        static const std::map<JoinType, std::string> join_types = {
+            {INNER_JOIN, "INNER"}, {LEFT_JOIN, "LEFT"}, {RIGHT_JOIN, "RIGHT"},
+            {FULL_JOIN, "FULL"}, {CROSS_JOIN, "CROSS"}};
+        lines.push_back(indent + "Join(type=" + join_types.at(join->type) + ", tables=[" +
+                        join_strings_sorted(table_names) + "], condition=[" +
                         join_strings_sorted(conds) + "], rows=" + std::to_string(join_rows) + ")");
         render_explain_plan(sm_manager, join->left_, required, depth + 1, 1, -1, lines);
         bool inlj = join->tag == T_IndexNestLoop;
@@ -500,11 +528,15 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         if (limit >= 0 && num_rec >= (size_t)limit) break;
         auto Tuple = executorTreeRoot->Next();
+        const std::vector<bool> *nulls = executorTreeRoot->null_mask();
         std::vector<std::string> columns;
+        size_t column_index = 0;
         for (auto &col : executorTreeRoot->cols()) {
             std::string col_str;
             char *rec_buf = Tuple->data + col.offset;
-            if (col.type == TYPE_INT) {
+            if (nulls != nullptr && column_index < nulls->size() && (*nulls)[column_index]) {
+                col_str = "NULL";
+            } else if (col.type == TYPE_INT) {
                 col_str = std::to_string(*(int *)rec_buf);
             } else if (col.type == TYPE_FLOAT) {
                 col_str = std::to_string(*(float *)rec_buf);
@@ -513,6 +545,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
                 col_str.resize(strlen(col_str.c_str()));
             }
             columns.push_back(col_str);
+            column_index++;
         }
         // print record into buffer
         rec_printer.print_record(columns, context);

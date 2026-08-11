@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 class SeqScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;              // 表的名称
+    std::string binding_name_;          // SQL 中的关系实例名
     std::vector<Condition> conds_;      // scan的条件
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
@@ -58,13 +59,19 @@ class SeqScanExecutor : public AbstractExecutor {
     SmManager *sm_manager_;
 
    public:
-    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context)
+        : SeqScanExecutor(sm_manager, tab_name, tab_name, std::move(conds), context) {}
+
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::string binding_name,
+                    std::vector<Condition> conds, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
+        binding_name_ = std::move(binding_name);
         conds_ = std::move(conds);
         TabMeta &tab = sm_manager_->db_.get_table(tab_name_);
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab.cols;
+        for (auto &col : cols_) col.tab_name = binding_name_;
         len_ = cols_.back().offset + cols_.back().len;
 
         context_ = context;
@@ -224,9 +231,14 @@ class SeqScanExecutor : public AbstractExecutor {
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
         if (ser_on_) {
-            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);   // 题9 SER 谓词读(含空结果)
+            auto physical_conds = fed_conds_;
+            for (auto &cond : physical_conds) {
+                if (cond.lhs_col.tab_name == binding_name_) cond.lhs_col.tab_name = tab_name_;
+                if (!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_) cond.rhs_col.tab_name = tab_name_;
+            }
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, physical_conds);   // 题9 SER 谓词读(含空结果)
             // 读侧(谓词)：检测匹配本谓词但快照不可见的他事务写(幻影插入)→ rw 反依赖；成 SSI 危险结构则 abort
-            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, physical_conds))
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                 AbortReason::SSI_DANGEROUS_STRUCTURE);
         }

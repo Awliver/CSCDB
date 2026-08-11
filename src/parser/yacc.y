@@ -559,7 +559,7 @@ opt_alias:
         $$ = $1;
     }
     ;
-
+// 新增 from_clause 用于表示select所选择的表
 from_clause:
     joined_table
     {
@@ -567,6 +567,7 @@ from_clause:
     }
     ;
 
+// 含表别名的表表示
 table_ref:
     tbName opt_alias
     {
@@ -578,6 +579,7 @@ table_ref:
     }
     ;
 
+    // joined_table 表示被选择连接的表
 joined_table:
     table_ref
     {

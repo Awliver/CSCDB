@@ -47,5 +47,6 @@ public:
     }
 
     size_t tupleLen() const override { return prev_->tupleLen(); }
+    const std::vector<bool> *null_mask() const override { return prev_->null_mask(); }
     Rid &rid() override { return _abstract_rid; }
 };

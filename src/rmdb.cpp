@@ -671,9 +671,9 @@ std::string pa1_abort_diag(AbortReason reason, const char *detail = nullptr) {
 
 }  // namespace
 
-// 把 sink 的一个 cell 编码为 wire 字节，追加到 buf（present=1：引擎不产生 SQL NULL）
+// 把 sink 的一个 cell 编码为 wire 字节；外连接等产生 SQL NULL 时 present=0。
 static void wire_put_cell(std::string &buf, const WireCell &c) {
-    if (c.is_null) {           // 空集聚合等：present=0，无值字节
+    if (c.is_null) {           // 聚合/外连接等：present=0，无值字节
         wire::put_u8(buf, 0);
         return;
     }

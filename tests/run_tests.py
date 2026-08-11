@@ -62,6 +62,7 @@ def kill_existing_server():
 
 
 def start_server(db_name):
+    os.makedirs(DB_BASE_DIR, exist_ok=True)
     db_dir = os.path.join(DB_BASE_DIR, db_name)
     if os.path.isdir(db_dir):
         shutil.rmtree(db_dir)
@@ -789,6 +790,217 @@ failure
 failure"""
     results.append(run_testpoint("大规模聚合综合测试", "tp11_db", tp11_sqls, tp11_expected))
 
+    # ==================== 测试点12: JOIN 全功能回归 ====================
+    # 覆盖 grammar 中的全部连接写法、全部比较运算符，以及外连接的
+    # ON/WHERE、NULL 扩展、空输入和下游算子语义。
+    tp12_sqls = [
+        "create table jl (id int, lv int)",
+        "create table jr (id int, rv int)",
+        "create table js (id int, sv int)",
+        "create table je (id int)",
+        "insert into jl values (0, 100)",
+        "insert into jl values (1, 10)",
+        "insert into jl values (2, 20)",
+        "insert into jl values (4, 40)",
+        "insert into jr values (0, 900)",
+        "insert into jr values (2, 200)",
+        "insert into jr values (3, 300)",
+        "insert into jr values (4, 400)",
+        "insert into jr values (4, 401)",
+        "insert into js values (2, 2000)",
+        "insert into js values (4, 4000)",
+        "insert into js values (5, 5000)",
+
+        # CROSS JOIN 的三种语法。
+        "select COUNT(*) as cnt from jl, jr",
+        "select COUNT(*) as cnt from jl join jr",
+        "select COUNT(*) as cnt from jl cross join jr",
+
+        # JOIN / INNER JOIN、AS/无 AS 别名，以及重复键。
+        "select l.id, r.id, r.rv from jl as l join jr as r on l.id = r.id order by l.id, r.rv",
+        "select COUNT(*) as cnt from jl l inner join jr r on l.id = r.id",
+
+        # grammar 支持的六种 ON 比较运算符。
+        "select COUNT(*) as eq_cnt from jl l inner join jr r on l.id = r.id",
+        "select COUNT(*) as ne_cnt from jl l inner join jr r on l.id <> r.id",
+        "select COUNT(*) as lt_cnt from jl l inner join jr r on l.id < r.id",
+        "select COUNT(*) as gt_cnt from jl l inner join jr r on l.id > r.id",
+        "select COUNT(*) as le_cnt from jl l inner join jr r on l.id <= r.id",
+        "select COUNT(*) as ge_cnt from jl l inner join jr r on l.id >= r.id",
+
+        # LEFT/RIGHT/FULL 及可选 OUTER 关键字。
+        "select l.id, r.id, r.rv from jl l left join jr r on l.id = r.id order by l.id, r.rv",
+        "select COUNT(*) as rows, COUNT(r.id) as matched from jl l left outer join jr r on l.id = r.id",
+        "select l.id, r.id from jl l right join jr r on l.id = r.id order by r.id, l.id",
+        "select COUNT(*) as rows, COUNT(l.id) as matched from jl l right outer join jr r on l.id = r.id",
+        "select l.id, r.id from jl l full join jr r on l.id = r.id order by l.id, r.id",
+        "select COUNT(*) as rows, COUNT(l.id) as left_rows, COUNT(r.id) as right_rows from jl l full outer join jr r on l.id = r.id",
+
+        # ON 单侧条件不能错误地下推到外连接保留侧；WHERE 必须在 NULL 扩展后执行。
+        "select l.id, r.id from jl l left join jr r on l.id = r.id and l.id > 1 order by l.id, r.id",
+        "select l.id, r.id from jl l right join jr r on l.id = r.id and r.id > 2 order by r.id, l.id",
+        "select l.id, r.id from jl l left join jr r on l.id = r.id and r.rv > 300 order by l.id, r.id",
+        "select l.id, r.id from jl l left join jr r on l.id = r.id where r.rv > 300 order by l.id, r.id",
+        "select l.id, r.id from jl l full join jr r on l.id = r.id where r.id = 3",
+
+        # 多表、括号、混合逗号连接和自连接。
+        "select l.id, r.id, s.id from (jl l inner join jr r on l.id = r.id) inner join js s on r.id = s.id order by l.id, r.rv",
+        "select l.id, r.id, s.id from (jl l left join jr r on l.id = r.id) left join js s on r.id = s.id order by l.id, r.rv",
+        "select COUNT(*) as cnt from jl l, jr r inner join js s on r.id = s.id",
+        "select COUNT(*) as cnt from jl a inner join jl b on a.id < b.id",
+
+        # NULL 掩码必须被聚合、GROUP BY、排序和 LIMIT 正确消费/转发。
+        "select COUNT(*) as rows, COUNT(r.id) as matched, SUM(r.rv) as total from jl l left join jr r on l.id = r.id",
+        "select r.id, COUNT(*) as cnt from jl l left join jr r on l.id = r.id group by r.id order by r.id",
+        "select l.id, r.id from jl l full join jr r on l.id = r.id order by l.id desc, r.id desc",
+        "select l.id, r.id from jl l left join jr r on l.id = r.id order by l.id, r.id limit 3",
+
+        # 任一侧为空及双方均为空。
+        "select l.id, e.id from jl l left join je e on l.id = e.id order by l.id",
+        "select e.id, r.id from je e right join jr r on e.id = r.id order by r.id",
+        "select COUNT(*) as cnt from je a full join je b on a.id = b.id",
+
+        # 唯一连接键索引触发 INNER JOIN 的 INLJ 候选路径，结果语义不变。
+        # 当前存储层索引采用唯一键语义，因此避免用 jr.id 的重复键构造索引。
+        "create index js(id)",
+        "select l.id, s.id, s.sv from jl l inner join js s on l.id = s.id order by l.id",
+
+        # 语法/语义错误：歧义列、重复 binding、未知 binding、非法 CROSS ON、外连接缺 ON。
+        "select id from jl l inner join jr r on l.id = r.id",
+        "select l.id from jl l inner join jr l on l.id = l.id",
+        "select x.id from jl l inner join jr r on l.id = r.id",
+        "select * from jl cross join jr on jl.id = jr.id",
+        "select * from jl left join jr",
+    ]
+    tp12_expected = """| cnt |
+| 20 |
+| cnt |
+| 20 |
+| cnt |
+| 20 |
+| id | id | rv |
+| 0 | 0 | 900 |
+| 2 | 2 | 200 |
+| 4 | 4 | 400 |
+| 4 | 4 | 401 |
+| cnt |
+| 4 |
+| eq_cnt |
+| 4 |
+| ne_cnt |
+| 16 |
+| lt_cnt |
+| 11 |
+| gt_cnt |
+| 5 |
+| le_cnt |
+| 15 |
+| ge_cnt |
+| 9 |
+| id | id | rv |
+| 0 | 0 | 900 |
+| 1 | NULL | NULL |
+| 2 | 2 | 200 |
+| 4 | 4 | 400 |
+| 4 | 4 | 401 |
+| rows | matched |
+| 5 | 4 |
+| id | id |
+| 0 | 0 |
+| 2 | 2 |
+| NULL | 3 |
+| 4 | 4 |
+| 4 | 4 |
+| rows | matched |
+| 5 | 4 |
+| id | id |
+| 0 | 0 |
+| 1 | NULL |
+| 2 | 2 |
+| 4 | 4 |
+| 4 | 4 |
+| NULL | 3 |
+| rows | left_rows | right_rows |
+| 6 | 5 | 5 |
+| id | id |
+| 0 | NULL |
+| 1 | NULL |
+| 2 | 2 |
+| 4 | 4 |
+| 4 | 4 |
+| id | id |
+| NULL | 0 |
+| NULL | 2 |
+| NULL | 3 |
+| 4 | 4 |
+| 4 | 4 |
+| id | id |
+| 0 | 0 |
+| 1 | NULL |
+| 2 | NULL |
+| 4 | 4 |
+| 4 | 4 |
+| id | id |
+| 0 | 0 |
+| 4 | 4 |
+| 4 | 4 |
+| id | id |
+| NULL | 3 |
+| id | id | id |
+| 2 | 2 | 2 |
+| 4 | 4 | 4 |
+| 4 | 4 | 4 |
+| id | id | id |
+| 0 | 0 | NULL |
+| 1 | NULL | NULL |
+| 2 | 2 | 2 |
+| 4 | 4 | 4 |
+| 4 | 4 | 4 |
+| cnt |
+| 12 |
+| cnt |
+| 6 |
+| rows | matched | total |
+| 5 | 4 | 1901 |
+| id | cnt |
+| 0 | 1 |
+| 2 | 1 |
+| 4 | 2 |
+| NULL | 1 |
+| id | id |
+| NULL | 3 |
+| 4 | 4 |
+| 4 | 4 |
+| 2 | 2 |
+| 1 | NULL |
+| 0 | 0 |
+| id | id |
+| 0 | 0 |
+| 1 | NULL |
+| 2 | 2 |
+| id | id |
+| 0 | NULL |
+| 1 | NULL |
+| 2 | NULL |
+| 4 | NULL |
+| id | id |
+| NULL | 0 |
+| NULL | 2 |
+| NULL | 3 |
+| NULL | 4 |
+| NULL | 4 |
+| cnt |
+| 0 |
+| id | id | sv |
+| 2 | 2 | 2000 |
+| 4 | 4 | 4000 |
+failure
+failure
+failure
+failure
+failure"""
+    results.append(run_testpoint("JOIN全功能回归", "tp12_join_db", tp12_sqls, tp12_expected))
+
     # 汇总
     print(f"\n{'='*60}")
     print("测试汇总")
@@ -805,6 +1017,7 @@ failure"""
         "边界情况测试",
         "JOIN聚合测试",
         "大规模聚合综合测试",
+        "JOIN全功能回归",
     ]
     for name, ok in zip(names, results):
         status = "PASS" if ok else "FAIL"

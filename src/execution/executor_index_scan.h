@@ -22,7 +22,8 @@ See the Mulan PSL v2 for more details. */
 
 class IndexScanExecutor : public AbstractExecutor {
    private:
-    std::string tab_name_;                      // 表名称
+    std::string tab_name_;                      // 物理表名
+    std::string binding_name_;                  // SQL 中的关系实例名
     TabMeta tab_;                               // 表的元数据
     std::vector<Condition> conds_;              // 扫描条件
     RmFileHandle *fh_;                          // 表的数据文件句柄
@@ -90,11 +91,18 @@ class IndexScanExecutor : public AbstractExecutor {
     bool ser_on_ = false;
 
    public:
-    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
-                    Context *context) {
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
+                      std::vector<std::string> index_col_names, Context *context)
+        : IndexScanExecutor(sm_manager, tab_name, tab_name, std::move(conds),
+                            std::move(index_col_names), context) {}
+
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::string binding_name,
+                      std::vector<Condition> conds, std::vector<std::string> index_col_names,
+                      Context *context) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
+        binding_name_ = std::move(binding_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
         // index_no_ = index_no;
@@ -102,15 +110,16 @@ class IndexScanExecutor : public AbstractExecutor {
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
+        for (auto &col : cols_) col.tab_name = binding_name_;
         len_ = cols_.back().offset + cols_.back().len;
         std::map<CompOp, CompOp> swap_op = {
             {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
         };
 
         for (auto &cond : conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
+            if (cond.lhs_col.tab_name != binding_name_) {
                 // lhs is on other table, now rhs must be on this table
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_);
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = swap_op.at(cond.op);
@@ -211,7 +220,7 @@ class IndexScanExecutor : public AbstractExecutor {
             bool found_eq = false;
             for (const auto &cond : fed_conds_) {
                 if (cond.is_rhs_val && cond.op == OP_EQ &&
-                    cond.lhs_col.tab_name == tab_name_ &&
+                    cond.lhs_col.tab_name == binding_name_ &&
                     cond.lhs_col.col_name == col.name) {
                     eq_prefix_data_.insert(eq_prefix_data_.end(),
                                            cond.rhs_val.raw->data,
@@ -230,7 +239,7 @@ class IndexScanExecutor : public AbstractExecutor {
         if (eq_match_count_ == 0 && index_meta_.cols.size() >= 2) {
             bool first_has_cond = false;
             for (const auto &cond : fed_conds_) {
-                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name_ &&
+                if (cond.is_rhs_val && cond.lhs_col.tab_name == binding_name_ &&
                     cond.lhs_col.col_name == index_meta_.cols[0].name) {
                     first_has_cond = true;
                     break;
@@ -242,7 +251,7 @@ class IndexScanExecutor : public AbstractExecutor {
                     bool found_eq = false;
                     for (const auto &cond : fed_conds_) {
                         if (cond.is_rhs_val && cond.op == OP_EQ &&
-                            cond.lhs_col.tab_name == tab_name_ &&
+                            cond.lhs_col.tab_name == binding_name_ &&
                             cond.lhs_col.col_name == col.name) {
                             skip_eq_data_.insert(skip_eq_data_.end(),
                                                  cond.rhs_val.raw->data,
@@ -558,7 +567,7 @@ class IndexScanExecutor : public AbstractExecutor {
      * SSI 的逐行读跟踪依赖真实触行，提前停读会缩小读集。 */
     bool sorted_asc_on(const TabCol &col) const override {
         if (skip_mode_ || ser_on_) return false;
-        if (!col.tab_name.empty() && col.tab_name != tab_name_) return false;
+        if (!col.tab_name.empty() && col.tab_name != binding_name_) return false;
         for (int i = 0; i <= eq_match_count_ && i < (int)index_meta_.cols.size(); ++i) {
             if (index_meta_.cols[i].name == col.col_name) return true;
         }
@@ -573,9 +582,14 @@ class IndexScanExecutor : public AbstractExecutor {
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
         if (ser_on_) {
-            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, fed_conds_);
+            auto physical_conds = fed_conds_;
+            for (auto &cond : physical_conds) {
+                if (cond.lhs_col.tab_name == binding_name_) cond.lhs_col.tab_name = tab_name_;
+                if (!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_) cond.rhs_col.tab_name = tab_name_;
+            }
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, physical_conds);
             // 读侧(谓词)：匹配本谓词但快照不可见的他事务写(幻影插入) → rw 反依赖；危险结构则 abort
-            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, fed_conds_))
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, physical_conds))
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                 AbortReason::SSI_DANGEROUS_STRUCTURE);
         }
@@ -627,7 +641,7 @@ class IndexScanExecutor : public AbstractExecutor {
             const auto &range_col = index_meta_.cols[eq_match_count_];
             for (const auto &cond : fed_conds_) {
                 if (!cond.is_rhs_val) continue;
-                if (cond.lhs_col.tab_name != tab_name_) continue;
+                if (cond.lhs_col.tab_name != binding_name_) continue;
                 if (cond.lhs_col.col_name != range_col.name) continue;
 
                 const char *cv = cond.rhs_val.raw->data;
