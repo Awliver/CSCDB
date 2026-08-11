@@ -50,6 +50,8 @@ void BufferPoolManager::stop_cleaner() {
 void BufferPoolManager::cleaner_loop() {
     const size_t low_water = pool_size_ / 16;
     size_t next_shard = 0;
+    uint64_t cleaner_wal_barriers = 0;
+    uint64_t cleaner_pages = 0;
     while (true) {
         {
             std::unique_lock<std::mutex> lk(cleaner_mtx_);
@@ -77,8 +79,12 @@ void BufferPoolManager::cleaner_loop() {
                     freec += sh.free_frames_.size();
                     evict += sh.replacer_->Size();
                 }
-                fprintf(stderr, "[bpm-stats] pool=%zu free=%zu evictable=%zu pinned=%zu\n",
-                        (size_t)pool_size_, freec, evict, (size_t)pool_size_ - freec - evict);
+                fprintf(stderr,
+                        "[bpm-stats] pool=%zu free=%zu evictable=%zu pinned=%zu "
+                        "cleaner_wal=%llu cleaner_pages=%llu\n",
+                        (size_t)pool_size_, freec, evict, (size_t)pool_size_ - freec - evict,
+                        (unsigned long long)cleaner_wal_barriers,
+                        (unsigned long long)cleaner_pages);
             }
         }
         {
@@ -89,45 +95,70 @@ void BufferPoolManager::cleaner_loop() {
             }
             if (total_free >= low_water) continue;
         }
-        int flushed = 0;
-        for (size_t k = 0; k < BPM_NSHARDS && flushed < CLEANER_BATCH; ++k) {
+        struct CleanerSnapshot {
+            BpmShard *shard;
+            frame_id_t frame;
+            PageId pid;
+            uint32_t version;
+            std::array<char, PAGE_SIZE> data;
+            bool released = false;
+        };
+        std::vector<CleanerSnapshot> batch;
+        batch.reserve(CLEANER_BATCH);
+
+        // Pin every selected frame while collecting the batch. This keeps an
+        // evictor from flushing/reusing the same frame concurrently; ordinary
+        // readers and writers may still pin it and mod_ver_ detects updates.
+        for (size_t k = 0; k < BPM_NSHARDS && batch.size() < CLEANER_BATCH; ++k) {
             BpmShard &sh = shards_[(next_shard + k) % BPM_NSHARDS];
-            while (flushed < CLEANER_BATCH) {
-                if (cleaner_stop_) return;
-                frame_id_t target = INVALID_FRAME_ID;
-                PageId pid{-1, INVALID_PAGE_ID};
-                uint32_t snap_ver = 0;
-                char flush_buf[PAGE_SIZE];
-                {
-                    std::unique_lock<std::shared_mutex> lock(sh.latch_);
-                    for (auto &entry : sh.page_table_) {
-                        frame_id_t f = entry.second;
-                        Page &pg = pages_[f];
-                        if (pg.pin_count_ != 0 || !pg.is_dirty_) continue;
-                        if (frame_io_inflight_[f].load(std::memory_order_acquire)) continue;
-                        target = f;
-                        pid = pg.id_;
-                        snap_ver = pg.mod_ver_;
-                        memcpy(flush_buf, pg.data_, PAGE_SIZE);
-                        break;
-                    }
-                    if (target == INVALID_FRAME_ID) break;
-                }
-                if (g_log_manager) g_log_manager->flush_log_to_disk();
-                disk_manager_->write_page(pid.fd, pid.page_no, flush_buf, PAGE_SIZE);
-                {
-                    std::unique_lock<std::shared_mutex> lock(sh.latch_);
-                    Page &pg = pages_[target];
-                    // mod_ver_ 相同才能清脏标：锁外写盘期间若有新修改（写者 pin→改→
-                    // unpin(dirty) 已完成），盘上是旧快照，清标会让新修改被当作已落盘
-                    // → 页被干净淘汰 → 已提交更新丢失
-                    if (pg.pin_count_ == 0 && pg.id_ == pid && pg.is_dirty_ &&
-                        pg.mod_ver_ == snap_ver) {
-                        pg.is_dirty_ = false;
-                    }
-                }
-                ++flushed;
+            std::unique_lock<std::shared_mutex> lock(sh.latch_);
+            for (auto &entry : sh.page_table_) {
+                if (batch.size() >= CLEANER_BATCH) break;
+                frame_id_t f = entry.second;
+                Page &pg = pages_[f];
+                if (pg.pin_count_ != 0 || !pg.is_dirty_) continue;
+                if (frame_io_inflight_[f].load(std::memory_order_acquire)) continue;
+
+                sh.replacer_->pin(f);
+                pg.pin_count_++;
+                batch.push_back(CleanerSnapshot{
+                    &sh, f, pg.id_, pg.mod_ver_.load(std::memory_order_acquire), {}});
+                memcpy(batch.back().data.data(), pg.data_, PAGE_SIZE);
             }
+        }
+
+        auto release_snapshot = [this](CleanerSnapshot &snap, bool write_succeeded) {
+            std::unique_lock<std::shared_mutex> lock(snap.shard->latch_);
+            Page &pg = pages_[snap.frame];
+            assert(pg.id_ == snap.pid);
+            if (write_succeeded && pg.is_dirty_ &&
+                pg.mod_ver_.load(std::memory_order_acquire) == snap.version) {
+                pg.is_dirty_ = false;
+            }
+            assert(pg.pin_count_ > 0);
+            pg.pin_count_--;
+            if (pg.pin_count_ == 0) snap.shard->replacer_->unpin(snap.frame);
+            snap.released = true;
+        };
+
+        try {
+            if (!batch.empty() && g_log_manager) {
+                // Every snapshot was taken before this barrier, so one WAL
+                // flush is sufficient for the whole data-page batch.
+                g_log_manager->flush_log_to_disk();
+                ++cleaner_wal_barriers;
+            }
+            for (auto &snap : batch) {
+                disk_manager_->write_page(snap.pid.fd, snap.pid.page_no,
+                                          snap.data.data(), PAGE_SIZE);
+                release_snapshot(snap, true);
+                ++cleaner_pages;
+            }
+        } catch (...) {
+            for (auto &snap : batch) {
+                if (!snap.released) release_snapshot(snap, false);
+            }
+            throw;
         }
         next_shard = (next_shard + 1) % BPM_NSHARDS;
     }

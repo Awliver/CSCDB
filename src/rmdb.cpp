@@ -32,6 +32,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/output_control.h"
 #include "common/repro_ring.h"
 #include "common/wire_protocol.h"
+#include "transaction/abort_stats.h"
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -981,6 +982,46 @@ static void handle_prepare_set(int fd, const std::string &payload,
     prepared = std::move(fresh);  // 整字典原子替换：全部探测成功后才落地
 }
 
+namespace {
+constexpr size_t BATCH_OP_STATS_SLOTS = 256;
+std::atomic<uint64_t> batch_op_calls[BATCH_OP_STATS_SLOTS]{};
+std::atomic<uint64_t> batch_op_total_ns[BATCH_OP_STATS_SLOTS]{};
+std::atomic<uint64_t> batch_op_max_ns[BATCH_OP_STATS_SLOTS]{};
+std::atomic<uint64_t> batch_stats_batches{0};
+
+bool batch_op_stats_enabled() {
+    static const bool enabled = std::getenv("RMDB_BATCH_STATS") != nullptr;
+    return enabled;
+}
+
+void record_batch_op(uint16_t stmt_id, std::chrono::steady_clock::duration elapsed) {
+    if (stmt_id >= BATCH_OP_STATS_SLOTS) return;
+    uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+    batch_op_calls[stmt_id].fetch_add(1, std::memory_order_relaxed);
+    batch_op_total_ns[stmt_id].fetch_add(ns, std::memory_order_relaxed);
+    uint64_t old_max = batch_op_max_ns[stmt_id].load(std::memory_order_relaxed);
+    while (ns > old_max &&
+           !batch_op_max_ns[stmt_id].compare_exchange_weak(
+               old_max, ns, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+void maybe_report_batch_ops() {
+    uint64_t batch_no = batch_stats_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((batch_no & 2047U) != 0) return;
+    for (size_t id = 0; id < BATCH_OP_STATS_SLOTS; ++id) {
+        uint64_t calls = batch_op_calls[id].load(std::memory_order_relaxed);
+        if (calls == 0) continue;
+        uint64_t total_ns = batch_op_total_ns[id].load(std::memory_order_relaxed);
+        uint64_t max_ns = batch_op_max_ns[id].load(std::memory_order_relaxed);
+        fprintf(stderr, "[batch-op-stats] id=%zu count=%llu avg_us=%.2f max_us=%.2f\n",
+                id, (unsigned long long)calls,
+                (double)total_ns / (double)calls / 1000.0,
+                (double)max_ns / 1000.0);
+    }
+}
+}  // namespace
+
 static void handle_exec_batch(int fd, const std::string &payload,
                                std::unordered_map<uint16_t, WirePreparedStmt> &prepared, txn_id_t *txn_id,
                                IsolationLevel &sess_iso) {
@@ -1014,10 +1055,14 @@ static void handle_exec_batch(int fd, const std::string &payload,
 
         WirePreparedStmt &st = prepared.at(stmt_id);
         std::string sql = wire_substitute_params(st.sql_template, literals);
+        const bool collect_op_stats = batch_op_stats_enabled();
+        const auto op_start = collect_op_stats ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
 
         if (st.is_query) {
             BufferSink sink;
             ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, &sink, diag, /*batch_retryable=*/true);
+            if (collect_op_stats) record_batch_op(stmt_id, std::chrono::steady_clock::now() - op_start);
             if (outc != ExecOutcome::OK) {
                 status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
                 failed_op = op;
@@ -1026,6 +1071,7 @@ static void handle_exec_batch(int fd, const std::string &payload,
             results.push_back(OpResult{op, sink.row_count(), sink.rows_payload()});
         } else {
             ExecOutcome outc = run_sql_statement(sql, txn_id, sess_iso, nullptr, diag, /*batch_retryable=*/true);
+            if (collect_op_stats) record_batch_op(stmt_id, std::chrono::steady_clock::now() - op_start);
             if (outc != ExecOutcome::OK) {
                 status = (outc == ExecOutcome::ABORT) ? wire::BATCH_STATUS_TRANSACTION_ABORT : wire::BATCH_STATUS_ERROR;
                 failed_op = op;
@@ -1034,6 +1080,8 @@ static void handle_exec_batch(int fd, const std::string &payload,
         }
         executed++;
     }
+    if (batch_op_stats_enabled()) maybe_report_batch_ops();
+    maybe_report_abort_stats();
 
     // AUTO_ABORT：失败且连接存在活动（显式）事务时，必须先完成回滚再回失败响应。
     // abort 抛异常同样不能逃逸（调用方只 catch WireProtocolError → 否则 SIGABRT）
@@ -1615,6 +1663,7 @@ void start_server() {
     }
 
     // Clear
+    report_abort_stats("shutdown");
     buffer_pool_manager->stop_cleaner();  // close_db 前
     std::cout << " Try to close all client-connection.\n";
     int ret = shutdown(sockfd_server, SHUT_WR);  // shut down the all or part of a full-duplex connection.

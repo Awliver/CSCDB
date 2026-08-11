@@ -62,6 +62,7 @@ def kill_existing_server():
 
 
 def start_server(db_name):
+    os.makedirs(DB_BASE_DIR, exist_ok=True)
     db_dir = os.path.join(DB_BASE_DIR, db_name)
     if os.path.isdir(db_dir):
         shutil.rmtree(db_dir)
@@ -71,12 +72,11 @@ def start_server(db_name):
 
     kill_existing_server()
 
-    rel_db = os.path.join("test_dbs", db_name)
     last_err = None
     for attempt in range(3):
         proc = subprocess.Popen(
-            [os.path.relpath(SERVER_BIN, BUILD_DIR), rel_db],
-            cwd=BUILD_DIR,
+            [SERVER_BIN, db_name],
+            cwd=DB_BASE_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -87,7 +87,10 @@ def start_server(db_name):
             last_err = str(e)
             try:
                 proc.kill()
-                proc.wait(timeout=2)
+                _stdout, stderr = proc.communicate(timeout=2)
+                stderr_tail = stderr.decode(errors="replace")[-800:].strip()
+                if stderr_tail:
+                    last_err += "; server stderr: " + stderr_tail
             except Exception:
                 pass
             kill_existing_server()

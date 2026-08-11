@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <shared_mutex>
 
@@ -162,6 +163,11 @@ class IxNodeHandle {
 };
 
 /* B+树 */
+struct IxLeafHint {
+    page_id_t page_no = IX_NO_PAGE;
+    uint64_t structure_epoch = 0;
+};
+
 class IxIndexHandle {
     friend class IxScan;
     friend class IxManager;
@@ -180,6 +186,8 @@ class IxIndexHandle {
     // 免了一次 BPM 往返。只要叶结构没变就一直有效；分裂/删除/析构都要放掉。
     page_id_t pinned_leaf_no_ = IX_NO_PAGE;
     Page *pinned_leaf_page_ = nullptr;
+    std::atomic<uint64_t> structure_epoch_{0};
+    uint64_t cache_identity_ = 0;
     void release_pinned_leaf();
 
    public:
@@ -187,13 +195,15 @@ class IxIndexHandle {
     ~IxIndexHandle();
 
     // for search
-    bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
+    bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction,
+                   IxLeafHint *hint = nullptr);
 
     std::pair<IxNodeHandle *, bool> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
                                                  bool find_first = false);
 
     // for insert
-    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction);
+    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction,
+                           const IxLeafHint *hint = nullptr);
 
     /* 批量装载：next(key_out, rid_out) 按 key 升序（ix_compare 序）逐条产出 n 条
      * 键值对，自底向上顺序构建整棵树并直接写盘（绕过逐条 insert_entry 的全树下降

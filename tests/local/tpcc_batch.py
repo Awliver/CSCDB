@@ -270,7 +270,15 @@ def install_prepare(cli: WireClient) -> None:
 
 def _fail(br: BatchResult, prefix: str) -> Tuple[bool, str]:
     kind = "abort" if br.aborted else "error"
-    return False, "%s%s: %s" % (prefix, kind, (br.diagnostic or "")[:80])
+    # Keep the failing batch stage and operation index. The diagnostic alone is
+    # often just "deadlock prevention", which cannot identify the hot statement.
+    return False, "%s%s op=%d executed=%d: %s" % (
+        prefix,
+        kind,
+        br.failed_op,
+        br.executed,
+        (br.diagnostic or "")[:200],
+    )
 
 
 def _cell_int(rows, op_idx: int, col: int = 0) -> Optional[int]:
@@ -290,19 +298,24 @@ def _cell_float(rows, op_idx: int, col: int = 0) -> Optional[float]:
 def _pick_item(rng, scale) -> int:
     """决赛：约 25% 热点商品（用 1..100 近似 24-seed 热点集）。"""
     n = scale["items"]
+    route_rng = scale.get("_route_rng", rng)
+    hot_items = scale.get("hot_items")
+    if hot_items and route_rng.randint(1, 100) <= 25:
+        return route_rng.choice(hot_items)
     hot_n = min(100, n)
-    if hot_n > 0 and rng.randint(1, 100) <= 25:
-        return rng.randint(1, hot_n)
+    if hot_n > 0 and route_rng.randint(1, 100) <= 25:
+        return route_rng.randint(1, hot_n)
     return rng.randint(1, n)
 
 
 def _pick_supply_w(rng, scale, home_w: int) -> int:
     """决赛：约 8% 远程供货仓。"""
     wcount = scale.get("warehouses", 1)
-    if wcount > 1 and rng.randint(1, 100) <= 8:
+    route_rng = scale.get("_route_rng", rng)
+    if wcount > 1 and route_rng.randint(1, 100) <= 8:
         choices = [w for w in range(1, wcount + 1) if w != home_w]
         if choices:
-            return rng.choice(choices)
+            return route_rng.choice(choices)
     return home_w
 
 
@@ -411,7 +424,6 @@ def run_neworder_batch(cli: WireClient, rng, scale, d_id=None, c_id=None, ol_cnt
             )
         )
     ops2.append((S_COMMIT, []))
-
     br2 = cli.exec_batch(ops2)
     if not br2.ok:
         return _fail(br2, "neworder b2 ")
@@ -424,9 +436,10 @@ def run_payment_batch(cli: WireClient, rng, scale, d_id=None, c_id=None):
     c_w_id = w_id
     c_d_id = d_id
     # 决赛：约 30% 远程客户仓
-    if c_id is None and scale.get("warehouses", 1) > 1 and rng.randint(1, 100) <= 30:
-        c_w_id = rng.choice([w for w in range(1, scale["warehouses"] + 1) if w != w_id])
-        c_d_id = rng.randint(1, scale["districts"])
+    route_rng = scale.get("_route_rng", rng)
+    if c_id is None and scale.get("warehouses", 1) > 1 and route_rng.randint(1, 100) <= 30:
+        c_w_id = route_rng.choice([w for w in range(1, scale["warehouses"] + 1) if w != w_id])
+        c_d_id = route_rng.randint(1, scale["districts"])
     c_id = c_id or rng.randint(1, scale["customers_per_district"])
     amount = float("%.2f" % rng.uniform(1.0, 5000.0))
 
@@ -595,8 +608,10 @@ BATCH_RUNNERS = {
 }
 
 
-def run_txn_batch(cli: WireClient, rng, scale, txn_name: str):
+def run_txn_batch(cli: WireClient, rng, scale, txn_name: str, route=None):
     fn = BATCH_RUNNERS.get(txn_name)
     if fn is None:
         return False, "unknown txn " + txn_name
+    if route and txn_name != "delivery":
+        return fn(cli, rng, scale, d_id=route.get("d_id"))
     return fn(cli, rng, scale)

@@ -6,8 +6,8 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(_HERE, "../.."))
-BUILD = os.path.join(ROOT, "build")
-OFFICIAL = "../../src/test/performance_test/table_data"
+BUILD = os.path.abspath(os.environ.get("RMDB_TEST_BUILD", os.path.join(ROOT, "build")))
+OFFICIAL = os.path.join(ROOT, "src", "test", "performance_test", "table_data")
 
 # 决赛正式规格：50 仓、每仓 10 district、每 district 3000 客户/订单。
 # ``full`` 必须保持该规模；日常小规模调试请显式使用 ``mini``，不要把 W=5
@@ -124,9 +124,9 @@ def loads_for_scale(name):
     exp = expected_counts(name)
     if "loads" in p:
         return [(tab, path, exp[tab]) for tab, path in p["loads"]]
-    sub = p["data_subdir"]
+    data_dir = data_dir_for_scale(name)
     return [
-        (tab, "../" + sub + "/" + tab + ".csv", exp[tab])
+        (tab, os.path.join(data_dir, tab + ".csv"), exp[tab])
         for tab in TABLE_ORDER
     ]
 

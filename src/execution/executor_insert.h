@@ -71,17 +71,22 @@ class InsertExecutor : public AbstractExecutor {
 
         // 题3 唯一索引检查 + 题9 MVCC 感知：索引项可能指向本事务快照下已删(不可见)的旧记录，
         // 此时同事务可重插同键。仅当存在对本事务仍可见的同键记录才算真唯一冲突。
-        for (auto& index : tab_.indexes) {
+        std::vector<std::vector<char>> index_keys(tab_.indexes.size());
+        std::vector<IxLeafHint> index_hints(tab_.indexes.size());
+        for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {
+            auto& index = tab_.indexes[index_no];
             auto ih = sm_manager_->ihs_.at(
                 sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            std::vector<char> key(index.col_tot_len);
+            auto &key = index_keys[index_no];
+            key.resize(index.col_tot_len);
             int offset = 0;
             for (auto& idx_col : index.cols) {
                 memcpy(key.data() + offset, rec.data + idx_col.offset, idx_col.len);
                 offset += idx_col.len;
             }
             std::vector<Rid> existing;
-            if (ih->get_value(key.data(), &existing, context_ ? context_->txn_ : nullptr)) {
+            if (ih->get_value(key.data(), &existing, context_ ? context_->txn_ : nullptr,
+                              &index_hints[index_no])) {
                 bool conflict = true;
                 bool mvcc = context_ && context_->txn_mgr_ && context_->txn_ &&
                             context_->txn_mgr_->needs_versioning(context_->txn_, tab_name_);
@@ -170,13 +175,8 @@ class InsertExecutor : public AbstractExecutor {
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            std::vector<char> key(index.col_tot_len);
-            int offset = 0;
-            for (size_t j = 0; j < index.cols.size(); ++j) {
-                memcpy(key.data() + offset, rec.data + index.cols[j].offset, index.cols[j].len);
-                offset += index.cols[j].len;
-            }
-            ih->insert_entry(key.data(), rid_, context_->txn_);
+            auto &key = index_keys[i];
+            ih->insert_entry(key.data(), rid_, context_->txn_, &index_hints[i]);
         }
         }   // 题9：多行 insert 行循环结束
         return nullptr;
