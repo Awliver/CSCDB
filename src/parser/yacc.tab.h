@@ -35,8 +35,8 @@
    especially those whose name start with YY_ or yy_.  They are
    private implementation details that can be changed or removed.  */
 
-#ifndef YY_YY_HOME_SMART_WORKSPACE_2026_DB2026_SRC_PARSER_YACC_TAB_H_INCLUDED
-# define YY_YY_HOME_SMART_WORKSPACE_2026_DB2026_SRC_PARSER_YACC_TAB_H_INCLUDED
+#ifndef YY_YY_HOME_AWLIVER_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED
+# define YY_YY_HOME_AWLIVER_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED
 /* Debug traces.  */
 #ifndef YYDEBUG
 # define YYDEBUG 0
@@ -101,15 +101,21 @@ extern int yydebug;
     LIMIT = 302,                   /* LIMIT  */
     UNION = 303,                   /* UNION  */
     DISTINCT = 304,                /* DISTINCT  */
-    LEQ = 305,                     /* LEQ  */
-    NEQ = 306,                     /* NEQ  */
-    GEQ = 307,                     /* GEQ  */
-    T_EOF = 308,                   /* T_EOF  */
-    IDENTIFIER = 309,              /* IDENTIFIER  */
-    VALUE_STRING = 310,            /* VALUE_STRING  */
-    VALUE_INT = 311,               /* VALUE_INT  */
-    VALUE_FLOAT = 312,             /* VALUE_FLOAT  */
-    VALUE_BOOL = 313               /* VALUE_BOOL  */
+    LEFT = 305,                    /* LEFT  */
+    RIGHT = 306,                   /* RIGHT  */
+    INNER = 307,                   /* INNER  */
+    OUTER = 308,                   /* OUTER  */
+    CROSS = 309,                   /* CROSS  */
+    FULL = 310,                    /* FULL  */
+    LEQ = 311,                     /* LEQ  */
+    NEQ = 312,                     /* NEQ  */
+    GEQ = 313,                     /* GEQ  */
+    T_EOF = 314,                   /* T_EOF  */
+    IDENTIFIER = 315,              /* IDENTIFIER  */
+    VALUE_STRING = 316,            /* VALUE_STRING  */
+    VALUE_INT = 317,               /* VALUE_INT  */
+    VALUE_FLOAT = 318,             /* VALUE_FLOAT  */
+    VALUE_BOOL = 319               /* VALUE_BOOL  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -136,4 +142,4 @@ struct YYLTYPE
 int yyparse (void);
 
 
-#endif /* !YY_YY_HOME_SMART_WORKSPACE_2026_DB2026_SRC_PARSER_YACC_TAB_H_INCLUDED  */
+#endif /* !YY_YY_HOME_AWLIVER_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED  */

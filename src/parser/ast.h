@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 
 enum JoinType {
-    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN
+    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, CROSS_JOIN
 };
 namespace ast {
 
@@ -248,37 +248,39 @@ struct UpdateStmt : public TreeNode {
             tab_name(std::move(tab_name_)), set_clauses(std::move(set_clauses_)), conds(std::move(conds_)) {}
 };
 
-struct JoinExpr : public TreeNode {
-    std::string left;
-    std::string right;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
+struct FromExpr : TreeNode {
+    virtual ~FromExpr() = default;
+};
+
+struct TableRef : FromExpr {
+    std::string tab_name;
+    std::string alias;
+    TableRef(std::string tab_name_, std::string alias_) : tab_name(std::move(tab_name_)), alias(std::move(alias_)) {}
+};
+
+struct JoinExpr : FromExpr {
     JoinType type;
+    std::shared_ptr<FromExpr> left;
+    std::shared_ptr<FromExpr> right;
+    std::vector<std::shared_ptr<BinaryExpr>> on_conds;
 
-    JoinExpr(std::string left_, std::string right_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_, JoinType type_) :
-            left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)), type(type_) {}
-};
-
-struct TableListInfo {
-    std::vector<std::string> tabs;
-    std::vector<std::shared_ptr<BinaryExpr>> join_conds;
-};
-
-// 题4：FROM 子句里的一个表引用，带可选别名（如 customers c）
-struct JoinTableRef {
-    std::string tab_name;   // 真实表名
-    std::string alias;      // 别名，无则为空
-};
-
-// 题4：FROM 子句解析结果——表引用列表 + JOIN..ON 收集到的连接条件
-struct FromClause : public TreeNode {
-    std::vector<JoinTableRef> refs;
-    std::vector<std::shared_ptr<BinaryExpr>> join_conds;   // 来自 ON 的条件
+    JoinExpr(JoinType type_, std::shared_ptr<FromExpr> left_,
+             std::shared_ptr<FromExpr> right_,
+             std::vector<std::shared_ptr<BinaryExpr>> on_conds_)
+        : type(type_), left(std::move(left_)), right(std::move(right_)),
+          on_conds(std::move(on_conds_)) {}
 };
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Col>> cols;
     std::vector<std::shared_ptr<AggExpr>> aggs;
+    // 保真的 FROM 关系树和 WHERE 谓词。ON 谓词只存在 JoinExpr 上。
+    std::shared_ptr<FromExpr> from;
+    std::vector<std::shared_ptr<BinaryExpr>> where_conds;
+
+    // 下列字段是供现有 Analyzer/Planner 使用的兼容视图。
+    // tabs/aliases 由 from 树展开，conds 为 ON + WHERE；新代码不应依赖 conds
+    // 来判断谓词的语义位置。
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
@@ -297,6 +299,32 @@ struct SelectStmt : public TreeNode {
     bool has_limit = false;
     int limit_count = 0;
 
+    void set_from(std::shared_ptr<FromExpr> from_,
+                  std::vector<std::shared_ptr<BinaryExpr>> where_conds_) {
+        from = std::move(from_);
+        where_conds = std::move(where_conds_);
+        tabs.clear();
+        aliases.clear();
+        jointree.clear();
+        conds.clear();
+        collect_from(from);
+        conds.insert(conds.end(), where_conds.begin(), where_conds.end());
+    }
+
+    void collect_from(const std::shared_ptr<FromExpr> &node) {
+        if (auto table = std::dynamic_pointer_cast<TableRef>(node)) {
+            tabs.push_back(table->tab_name);
+            aliases.push_back(table->alias);
+            return;
+        }
+        auto join = std::dynamic_pointer_cast<JoinExpr>(node);
+        if (join == nullptr) return;
+        collect_from(join->left);
+        collect_from(join->right);
+        jointree.push_back(join);
+        conds.insert(conds.end(), join->on_conds.begin(), join->on_conds.end());
+    }
+
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
                std::vector<std::string> tabs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
@@ -306,6 +334,22 @@ struct SelectStmt : public TreeNode {
                 has_sort = (bool)order;
                 if (order) orders = {order};
             }
+
+    SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
+               std::vector<std::shared_ptr<AggExpr>> aggs_,
+               std::shared_ptr<FromExpr> from_,
+               std::vector<std::shared_ptr<BinaryExpr>> where_conds_,
+               std::vector<std::shared_ptr<Col>> group_by_cols_,
+               std::vector<std::shared_ptr<BinaryExpr>> having_conds_,
+               std::vector<std::shared_ptr<OrderBy>> orders_,
+               bool has_limit_, int limit_count_)
+        : cols(std::move(cols_)), aggs(std::move(aggs_)),
+          group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
+          orders(std::move(orders_)), has_limit(has_limit_), limit_count(limit_count_) {
+        set_from(std::move(from_), std::move(where_conds_));
+        has_sort = !orders.empty();
+        if (!orders.empty()) order = orders[0];
+    }
 
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
                std::vector<std::shared_ptr<AggExpr>> aggs_,
@@ -368,13 +412,11 @@ struct SemValue {
     bool sv_bool;
     OrderByDir sv_orderby_dir;
     std::vector<std::string> sv_strs;
-    std::shared_ptr<TableListInfo> sv_table_list;
+    std::shared_ptr<FromExpr> sv_from;
 
     std::shared_ptr<TreeNode> sv_node;
     std::shared_ptr<SelectStmt> sv_select;
     std::vector<std::shared_ptr<SelectStmt>> sv_selects;
-
-    JoinTableRef sv_table_ref;
 
     SvCompOp sv_comp_op;
 

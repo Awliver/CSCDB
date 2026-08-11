@@ -62,6 +62,17 @@ private:
         return m.at(op);
     }
 
+    static std::string join_type2str(JoinType type) {
+        static std::map<JoinType, std::string> m{
+                {INNER_JOIN, "INNER_JOIN"},
+                {LEFT_JOIN, "LEFT_JOIN"},
+                {RIGHT_JOIN, "RIGHT_JOIN"},
+                {FULL_JOIN, "FULL_JOIN"},
+                {CROSS_JOIN, "CROSS_JOIN"},
+        };
+        return m.at(type);
+    }
+
     template<typename T>
     static void print_node_list(std::vector<T> nodes, int offset) {
         std::cout << offset2string(offset);
@@ -144,11 +155,28 @@ private:
             print_val(x->tab_name, offset);
             print_node_list(x->set_clauses, offset);
             print_node_list(x->conds, offset);
+        } else if (auto x = std::dynamic_pointer_cast<TableRef>(node)) {
+            std::cout << "TABLE_REF\n";
+            print_val(x->tab_name, offset);
+            if (!x->alias.empty()) print_val("AS " + x->alias, offset);
+        } else if (auto x = std::dynamic_pointer_cast<JoinExpr>(node)) {
+            std::cout << join_type2str(x->type) << '\n';
+            print_node(x->left, offset);
+            print_node(x->right, offset);
+            print_val("ON", offset);
+            print_node_list(x->on_conds, offset + 2);
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
             print_node_list(x->cols, offset);
-            print_val_list(x->tabs, offset);
-            print_node_list(x->conds, offset);
+            if (x->from != nullptr) {
+                print_val("FROM", offset);
+                print_node(x->from, offset + 2);
+                print_val("WHERE", offset);
+                print_node_list(x->where_conds, offset + 2);
+            } else {
+                print_val_list(x->tabs, offset);
+                print_node_list(x->conds, offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

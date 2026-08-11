@@ -32,6 +32,7 @@ static std::shared_ptr<ast::Value> negate_value(const std::shared_ptr<ast::Value
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 %token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION DISTINCT
+%token LEFT RIGHT INNER OUTER CROSS FULL
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -54,9 +55,9 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_vals> valueList valueRows arith_chain
 %type <sv_str> tbName colName
 %type <sv_strs> colNameList
-%type <sv_table_list> tableList
+%type <sv_from> from_clause joined_table table_ref
 %type <sv_col> col
-%type <sv_cols> colList selector
+%type <sv_cols> colList
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition having_condition
@@ -69,7 +70,6 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_cols> opt_group_by group_by_list
 %type <sv_conds> opt_having
 %type <sv_int> opt_limit
-%type <sv_cols> select_list
 %type <sv_str> opt_alias
 %type <sv_setKnobType> set_knob_type
 
@@ -201,56 +201,40 @@ dml:
     ;
 
 select_stmt:
-        SELECT '*' FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+        SELECT '*' FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
     {
-        auto conds = $4->join_conds;
-        conds.insert(conds.end(), $5.begin(), $5.end());
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
     }
-    |   SELECT colList FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    |   SELECT colList FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
     {
-        auto conds = $4->join_conds;
-        conds.insert(conds.end(), $5.begin(), $5.end());
-        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
+        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
     }
-    |   SELECT agg_list FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    |   SELECT agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
     {
-        auto conds = $4->join_conds;
-        conds.insert(conds.end(), $5.begin(), $5.end());
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4->tabs, conds, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4, $5, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
     }
-    |   SELECT colList ',' agg_list FROM tableList optWhereClause opt_group_by opt_having opt_order_clause opt_limit
+    |   SELECT colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
     {
-        auto conds = $6->join_conds;
-        conds.insert(conds.end(), $7.begin(), $7.end());
-        $$ = std::make_shared<SelectStmt>($2, $4, $6->tabs, conds, $8, $9, $10, $11 >= 0, $11 < 0 ? 0 : $11);
+        $$ = std::make_shared<SelectStmt>($2, $4, $6, $7, $8, $9, $10, $11 >= 0, $11 < 0 ? 0 : $11);
     }
     ;
 
 union_branch:
-        SELECT '*' FROM tableList optWhereClause opt_group_by opt_having opt_limit
+        SELECT '*' FROM from_clause optWhereClause opt_group_by opt_having opt_limit
     {
-        auto conds = $4->join_conds;
-        conds.insert(conds.end(), $5.begin(), $5.end());
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
     }
-    |   SELECT colList FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    |   SELECT colList FROM from_clause optWhereClause opt_group_by opt_having opt_limit
     {
-        auto conds = $4->join_conds;
-        conds.insert(conds.end(), $5.begin(), $5.end());
-        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4->tabs, conds, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
+        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
     }
-    |   SELECT agg_list FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    |   SELECT agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_limit
     {
-        auto conds = $4->join_conds;
-        conds.insert(conds.end(), $5.begin(), $5.end());
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4->tabs, conds, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
     }
-    |   SELECT colList ',' agg_list FROM tableList optWhereClause opt_group_by opt_having opt_limit
+    |   SELECT colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_limit
     {
-        auto conds = $6->join_conds;
-        conds.insert(conds.end(), $7.begin(), $7.end());
-        $$ = std::make_shared<SelectStmt>($2, $4, $6->tabs, conds, $8, $9, std::vector<std::shared_ptr<OrderBy>>{}, $10 >= 0, $10 < 0 ? 0 : $10);
+        $$ = std::make_shared<SelectStmt>($2, $4, $6, $7, $8, $9, std::vector<std::shared_ptr<OrderBy>>{}, $10 >= 0, $10 < 0 ? 0 : $10);
     }
     ;
 
@@ -576,43 +560,76 @@ opt_alias:
     }
     ;
 
-selector:
-        '*'
+from_clause:
+    joined_table
     {
-        $$ = {};
+        $$ = $1;
     }
-    |   colList
     ;
 
-select_list:
-        colList
-    |   colList ',' agg_list
-    |   agg_list
+table_ref:
+    tbName opt_alias
+    {
+        $$ = std::make_shared<TableRef>($1, $2);
+    }
+    | '(' joined_table ')'
+    {
+        $$ = $2;
+    }
     ;
 
-tableList:
-        tbName
-    {
-        $$ = std::make_shared<TableListInfo>();
-        $$->tabs.push_back($1);
-    }
-    |   tableList ',' tbName
+joined_table:
+    table_ref
     {
         $$ = $1;
-        $$->tabs.push_back($3);
     }
-    |   tableList JOIN tbName
+    | joined_table JOIN table_ref ON whereClause
     {
-        $$ = $1;
-        $$->tabs.push_back($3);
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $3, $5);
     }
-    |   tableList JOIN tbName ON whereClause
+    | joined_table JOIN table_ref
     {
-        $$ = $1;
-        $$->tabs.push_back($3);
-        $$->join_conds.insert($$->join_conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<JoinExpr>(
+            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{});
+    }
+    | joined_table INNER JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $4, $6);
+    }
+    | joined_table LEFT opt_outer JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_JOIN, $1, $5, $7);
+    }
+    | joined_table RIGHT opt_outer JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_JOIN, $1, $5, $7);
+    }
+    | joined_table FULL opt_outer JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            FULL_JOIN, $1, $5, $7);
+    }
+    | joined_table CROSS JOIN table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            CROSS_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{});
+    }
+    | joined_table ',' table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{});
     }
     ;
+
+opt_outer:
+    /* empty */
+    | OUTER
+    ;
+
 
 opt_group_by:
         /* epsilon */

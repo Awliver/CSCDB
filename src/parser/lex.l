@@ -96,6 +96,12 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "INDEX" { return INDEX; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
+"LEFT" { return LEFT; }
+"RIGHT" { return RIGHT; }
+"INNER" { return INNER; }
+"OUTER" { return OUTER; }
+"CROSS" { return CROSS; }
+"FULL" { return FULL; }
 "ON" { return ON; }
 "EXPLAIN" { return EXPLAIN; }
 "ANALYZE" { return ANALYZE; }

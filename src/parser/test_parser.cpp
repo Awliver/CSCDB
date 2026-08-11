@@ -30,6 +30,10 @@ int main() {
         "select * from tb where x <> 2 and y >= 3. and z <= '123' and b < tb.a;",
         "select x.a, y.b from x, y where x.a = y.b and c = d;",
         "select x.a, y.b from x join y where x.a = y.b and c = d;",
+        "select * from a left join b on a.id = b.id where b.enabled = 1;",
+        "select * from a right outer join b on a.id = b.id;",
+        "select * from a full join b on a.id = b.id;",
+        "select * from a cross join b;",
         "exit;",
         "help;",
         "",
@@ -45,6 +49,21 @@ int main() {
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
+    }
+
+    {
+        YY_BUFFER_STATE buf = yy_scan_string(
+            "select * from a left join b on a.id = b.id where b.enabled = 1;");
+        assert(yyparse() == 0);
+        auto select = std::dynamic_pointer_cast<ast::SelectStmt>(ast::parse_tree);
+        assert(select != nullptr);
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->type == LEFT_JOIN);
+        assert(join->on_conds.size() == 1);
+        assert(select->where_conds.size() == 1);
+        assert(select->tabs == std::vector<std::string>({"a", "b"}));
+        assert(select->conds.size() == 2);  // legacy Analyzer compatibility view
+        yy_delete_buffer(buf);
     }
     ast::parse_tree.reset();
     return 0;
