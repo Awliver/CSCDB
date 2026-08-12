@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 struct AggregateInfo {
     ast::AggType type = ast::AGG_COUNT;
     TabCol col;
+    std::vector<TabCol> arguments;
     std::string alias;
     bool is_star = false;
     ColType arg_type = TYPE_INT;
@@ -33,7 +34,16 @@ struct AggregateInfo {
     bool distinct = false;
 
     std::string to_string() const {
-        return ast::format_aggregate_call(type, col.col_name, is_star, distinct);
+        std::string argument;
+        if (arguments.empty() && !is_star) {
+            argument = col.col_name;
+        } else {
+            for (size_t i = 0; i < arguments.size(); ++i) {
+                if (i != 0) argument += ", ";
+                argument += arguments[i].col_name;
+            }
+        }
+        return ast::format_aggregate_call(type, argument, is_star, distinct);
     }
 
     ColType output_type() const { return ast::aggregate_result_type(type, arg_type); }
@@ -119,10 +129,14 @@ public:
     bool has_limit = false;
     int limit_count = 0;
     int limit = -1;
+    bool has_offset = false;
+    int offset_count = 0;
+    bool distinct = false;
     std::vector<std::string> sel_captions;
 
     std::shared_ptr<Query> union_left;
     std::shared_ptr<Query> union_right;
+    ast::SetOpType set_op = ast::SetOpType::UNION;
     bool union_all = false;
     std::vector<ColMeta> union_output_cols;
     std::shared_ptr<Query> group_child;
@@ -198,7 +212,7 @@ private:
 
     ColType get_col_type(const std::vector<ColMeta> &all_cols, const TabCol &col);
     AggregateInfo analyze_aggregate(ast::AggType type,
-                                    const std::shared_ptr<ast::Col> &column,
+                                    const std::vector<std::shared_ptr<ast::Col>> &arguments,
                                     bool is_star, bool distinct,
                                     const std::string &alias,
                                     const AnalyzeScope &scope);

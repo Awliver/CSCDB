@@ -125,6 +125,8 @@ inline bool compare_operands(const CorrelatedTupleContext::Operand &lhs,
         case OP_LE: return cmp <= 0;
         case OP_GE: return cmp >= 0;
         case OP_LIKE: return false;
+        case OP_IS_NULL:
+        case OP_IS_NOT_NULL: return false;
     }
     return false;
 }
@@ -181,6 +183,9 @@ class CorrelatedFilterExecutor : public AbstractExecutor {
     TruthValue evaluate(const Condition &predicate, const RmRecord &record,
                         const std::vector<bool> &nulls) const {
         const auto lhs = find_operand(predicate.lhs_col, record, nulls);
+        if (is_null_test_op(predicate.op)) {
+            return evaluate_null_test(lhs.is_null, predicate.op);
+        }
         if (lhs.is_null) return TruthValue::UNKNOWN_VALUE;
 
         CorrelatedTupleContext::Operand rhs;

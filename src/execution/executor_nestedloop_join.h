@@ -158,6 +158,8 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             case OP_LE: return cmp <= 0;
             case OP_GE: return cmp >= 0;
             case OP_LIKE: return false;
+            case OP_IS_NULL:
+            case OP_IS_NOT_NULL: return false;
         }
         return false;
     }
@@ -199,6 +201,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                               const RmRecord *right_rec, size_t right_index) const {
         const auto lhs = find_operand(cond.lhs_col, left_rec, right_rec, right_index);
         if (!lhs.found) throw ColumnNotFoundError(cond.lhs_col.col_name);
+        if (is_null_test_op(cond.op)) return evaluate_null_test(lhs.is_null, cond.op);
         if (lhs.is_null) return TruthValue::UNKNOWN_VALUE;
 
         const char *rhs_data = nullptr;

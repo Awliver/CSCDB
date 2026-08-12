@@ -65,8 +65,8 @@ enum class AggregateUpdateRule : uint8_t {
     X(COUNT, "count", AGG_INPUT_ANY,     true,  true,  FIXED_INT,        COUNT)     \
     X(MAX,   "max",   AGG_INPUT_ANY,     false, false, SAME_AS_ARGUMENT, SUMMARY)   \
     X(MIN,   "min",   AGG_INPUT_ANY,     false, false, SAME_AS_ARGUMENT, SUMMARY)   \
-    X(SUM,   "sum",   AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, SUMMARY)   \
-    X(AVG,   "avg",   AGG_INPUT_NUMERIC, false, false, FIXED_FLOAT,      SUMMARY)   \
+    X(SUM,   "sum",   AGG_INPUT_NUMERIC, false, true,  SAME_AS_ARGUMENT, SUMMARY)   \
+    X(AVG,   "avg",   AGG_INPUT_NUMERIC, false, true,  FIXED_FLOAT,      SUMMARY)   \
     X(RANGE, "range", AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, SUMMARY)   \
     X(PRODUCT, "product", AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, CUSTOM) \
     X(VARIANCE, "variance", AGG_INPUT_NUMERIC, false, false, FIXED_FLOAT, CUSTOM)    \

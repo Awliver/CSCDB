@@ -59,6 +59,8 @@ private:
                 {SV_OP_LE, "<="},
                 {SV_OP_GE, ">="},
                 {SV_OP_LIKE, "LIKE"},
+                {SV_OP_IS_NULL, "IS NULL"},
+                {SV_OP_IS_NOT_NULL, "IS NOT NULL"},
         };
         return m.at(op);
     }
@@ -196,7 +198,10 @@ private:
             if (x->lateral) print_val("LATERAL", offset);
             print_node(x->left, offset);
             print_node(x->right, offset);
-            if (!x->natural) {
+            if (!x->using_cols.empty()) {
+                print_val("USING", offset);
+                print_val_list(x->using_cols, offset + 2);
+            } else if (!x->natural) {
                 print_val("ON", offset);
                 if (x->on_true) {
                     print_val("TRUE", offset + 2);
@@ -205,7 +210,7 @@ private:
                 }
             }
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
-            std::cout << "SELECT\n";
+            std::cout << (x->distinct ? "SELECT_DISTINCT\n" : "SELECT\n");
             print_node_list(x->cols, offset);
             print_val("FROM", offset);
             print_node(x->from, offset + 2);
@@ -223,7 +228,9 @@ private:
             std::cout << "QUERY_GROUP\n";
             print_node(x->child, offset);
         } else if (auto x = std::dynamic_pointer_cast<UnionStmt>(node)) {
-            std::cout << (x->all ? "UNION_ALL\n" : "UNION_DISTINCT\n");
+            const char *name = x->op == SetOpType::UNION ? "UNION" :
+                               x->op == SetOpType::INTERSECT ? "INTERSECT" : "EXCEPT";
+            std::cout << name << (x->all ? "_ALL\n" : "_DISTINCT\n");
             print_node(x->left, offset);
             print_node(x->right, offset);
         } else if (auto x = std::dynamic_pointer_cast<ExplainStmt>(node)) {

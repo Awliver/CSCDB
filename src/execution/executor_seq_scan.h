@@ -117,6 +117,11 @@ class SeqScanExecutor : public AbstractExecutor {
         cc.lhs_type = lhs_it->type;
         cc.op = cond.op;
         cc.is_rhs_val = cond.is_rhs_val;
+        if (is_null_test_op(cond.op)) {
+            cc.rhs_val_data = nullptr;
+            cc.rhs_offset = -1;
+            return cc;
+        }
         if (cond.is_rhs_val) {
             if (cond.rhs_val.raw == nullptr) {
                 throw InternalError("Scan predicate literal has no raw value");
@@ -155,6 +160,8 @@ class SeqScanExecutor : public AbstractExecutor {
     bool eval_compiled(const char *data) const {
         const TruthValue result = evaluate_bool_expr(
             compiled_predicate_, [&](const CompiledCond &cc) {
+            // Base-table tuples currently have no persistent NULL bitmap.
+            if (is_null_test_op(cc.op)) return evaluate_null_test(false, cc.op);
             const char *lhs = data + cc.lhs_offset;
             const char *rhs = cc.is_rhs_val ? cc.rhs_val_data : data + cc.rhs_offset;
             return compare_value(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)
@@ -241,6 +248,8 @@ class SeqScanExecutor : public AbstractExecutor {
             case OP_LE: return cmp <= 0;
             case OP_GE: return cmp >= 0;
             case OP_LIKE: return false;
+            case OP_IS_NULL:
+            case OP_IS_NOT_NULL: return false;
         }
         return false;
     }

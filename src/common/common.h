@@ -116,7 +116,14 @@ struct Value {
     }
 };
 
-enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE, OP_LIKE };
+enum CompOp {
+    OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE, OP_LIKE,
+    OP_IS_NULL, OP_IS_NOT_NULL
+};
+
+inline bool is_null_test_op(CompOp op) {
+    return op == OP_IS_NULL || op == OP_IS_NOT_NULL;
+}
 
 enum class ConditionKind {
     COMPARISON,
@@ -137,6 +144,11 @@ struct Condition {
     // with parameters from each outer row.
     std::shared_ptr<Query> subquery;
 };
+
+inline bool is_subquery_condition(const Condition &condition) {
+    return condition.kind == ConditionKind::EXISTS_SUBQUERY ||
+           condition.kind == ConditionKind::IN_SUBQUERY;
+}
 
 // SQL LIKE matcher for zero-padded CHAR storage. '%' matches any byte sequence,
 // '_' matches one byte, and '\\' quotes the following wildcard character.
@@ -194,6 +206,11 @@ enum class TruthValue {
     TRUE_VALUE,
     UNKNOWN_VALUE,
 };
+
+inline TruthValue evaluate_null_test(bool is_null, CompOp op) {
+    const bool matches = op == OP_IS_NULL ? is_null : !is_null;
+    return matches ? TruthValue::TRUE_VALUE : TruthValue::FALSE_VALUE;
+}
 
 inline TruthValue truth_not(TruthValue value) {
     if (value == TruthValue::TRUE_VALUE) return TruthValue::FALSE_VALUE;

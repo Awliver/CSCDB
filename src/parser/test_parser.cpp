@@ -107,18 +107,22 @@ int main() {
     }
     {
         YY_BUFFER_STATE buf = yy_scan_string(
-            "select k, count(distinct v), avg(v) from t group by k "
-            "having count(distinct v) > 1;");
+            "select k, count(distinct v, w), sum(distinct v), avg(distinct v) "
+            "from t group by k having count(distinct (v, w)) > 1;");
         assert(yyparse() == 0);
         auto select = std::dynamic_pointer_cast<ast::SelectStmt>(ast::parse_tree);
         assert(select != nullptr);
-        assert(select->aggs.size() == 2);
+        assert(select->aggs.size() == 3);
         assert(select->aggs[0]->agg_type == ast::AGG_COUNT);
         assert(select->aggs[0]->distinct);
-        assert(select->aggs[0]->to_string() == "count(distinct v)");
+        assert(select->aggs[0]->arguments.size() == 2);
+        assert(select->aggs[0]->to_string() == "count(distinct v, w)");
+        assert(select->aggs[1]->agg_type == ast::AGG_SUM && select->aggs[1]->distinct);
+        assert(select->aggs[2]->agg_type == ast::AGG_AVG && select->aggs[2]->distinct);
         auto having = as_atom(select->having_expr);
         assert(having->lhs_agg != nullptr);
         assert(having->lhs_agg->distinct);
+        assert(having->lhs_agg->arguments.size() == 2);
         yy_delete_buffer(buf);
     }
     {
@@ -333,12 +337,72 @@ int main() {
     }
 
     {
+        ast::parse_tree.reset();
+        YY_BUFFER_STATE buf = yy_scan_string(
+            "select v from a except select v from b intersect all select v from c;");
+        assert(yyparse() == 0);
+        auto root = std::dynamic_pointer_cast<ast::UnionStmt>(ast::parse_tree);
+        assert(root != nullptr && root->op == ast::SetOpType::EXCEPT && !root->all);
+        // SQL precedence: a EXCEPT (b INTERSECT ALL c).
+        auto intersect = std::dynamic_pointer_cast<ast::UnionStmt>(root->right);
+        assert(intersect != nullptr && intersect->op == ast::SetOpType::INTERSECT &&
+               intersect->all);
+        yy_delete_buffer(buf);
+    }
+
+    {
+        ast::parse_tree.reset();
+        YY_BUFFER_STATE buf = yy_scan_string(
+            "(select v from a except all select v from b) intersect select v from c;");
+        assert(yyparse() == 0);
+        auto root = std::dynamic_pointer_cast<ast::UnionStmt>(ast::parse_tree);
+        assert(root != nullptr && root->op == ast::SetOpType::INTERSECT && !root->all);
+        auto left_group = std::dynamic_pointer_cast<ast::QueryGroup>(root->left);
+        assert(left_group != nullptr);
+        auto except = std::dynamic_pointer_cast<ast::UnionStmt>(left_group->child);
+        assert(except != nullptr && except->op == ast::SetOpType::EXCEPT && except->all);
+        yy_delete_buffer(buf);
+    }
+
+    {
         auto select = parse_select(
             "select d.v from (select v from a union all select v from b) d "
             "where d.v > 0;");
         auto derived = std::dynamic_pointer_cast<ast::DerivedTableRef>(select->from);
         assert(derived != nullptr && derived->alias == "d");
         assert(std::dynamic_pointer_cast<ast::UnionStmt>(derived->subquery) != nullptr);
+    }
+
+    {
+        auto select = parse_select(
+            "select distinct a, b from t order by a limit 2 offset 1;");
+        assert(select->distinct);
+        assert(select->has_limit && select->limit_count == 2);
+        assert(select->has_offset && select->offset_count == 1);
+    }
+
+    {
+        auto select = parse_select(
+            "select a from t order by a offset 9 limit 4;");
+        assert(select->has_limit && select->limit_count == 4);
+        assert(select->has_offset && select->offset_count == 9);
+    }
+
+    {
+        auto select = parse_select(
+            "select * from a left outer join b using (id, k);");
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->type == LEFT_JOIN && !join->natural);
+        assert(join->using_cols == std::vector<std::string>({"id", "k"}));
+        assert(join->on_expr == nullptr);
+    }
+
+    {
+        auto select = parse_select(
+            "select * from t where a is null or b is not null;");
+        auto root = as_logical(select->where_expr, ast::LogicalOp::OR);
+        assert(as_atom(root->left)->op == ast::SV_OP_IS_NULL);
+        assert(as_atom(root->right)->op == ast::SV_OP_IS_NOT_NULL);
     }
 
     {

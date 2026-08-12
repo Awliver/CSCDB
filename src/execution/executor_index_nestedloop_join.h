@@ -48,6 +48,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             case OP_LE: return OP_GE;
             case OP_GE: return OP_LE;
             case OP_LIKE: return OP_LIKE;
+            case OP_IS_NULL: return OP_IS_NULL;
+            case OP_IS_NOT_NULL: return OP_IS_NOT_NULL;
         }
         return op;
     }
@@ -124,7 +126,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
             case BoolExprType::ATOM: {
                 const Condition &cond = expr->atom;
                 const bool lhs_right = cond.lhs_col.tab_name == right_binding_;
-                const bool rhs_right = !cond.is_rhs_val &&
+                const bool rhs_right = !is_null_test_op(cond.op) && !cond.is_rhs_val &&
                                        cond.rhs_col.tab_name == right_binding_;
                 if (!lhs_right && !rhs_right) {
                     std::vector<char> joined(len_, 0);
@@ -237,7 +239,9 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         });
         if (lhs_it == cols_.end()) throw ColumnNotFoundError(cond.lhs_col.col_name);
         const size_t lhs_index = static_cast<size_t>(lhs_it - cols_.begin());
-        if (lhs_index < left_nulls_.size() && left_nulls_[lhs_index]) {
+        const bool lhs_is_null = lhs_index < left_nulls_.size() && left_nulls_[lhs_index];
+        if (is_null_test_op(cond.op)) return evaluate_null_test(lhs_is_null, cond.op);
+        if (lhs_is_null) {
             return TruthValue::UNKNOWN_VALUE;
         }
         const char *lhs = data + lhs_it->offset;

@@ -29,10 +29,29 @@ static std::shared_ptr<ast::AggExpr> make_aggregate_expr(
                                           is_star, distinct);
 }
 
-static std::shared_ptr<ast::QueryExpr> append_union_operand(
-    std::shared_ptr<ast::QueryExpr> left, bool all,
+static std::shared_ptr<ast::AggExpr> make_aggregate_expr(
+    const std::string &name, std::vector<std::shared_ptr<ast::Col>> arguments,
+    std::string alias, bool distinct) {
+    ast::AggType type;
+    if (!ast::aggregate_type_from_name(name, type)) return nullptr;
+    return std::make_shared<ast::AggExpr>(type, std::move(arguments), std::move(alias),
+                                          false, distinct);
+}
+
+static std::shared_ptr<ast::QueryExpr> append_set_operand(
+    std::shared_ptr<ast::QueryExpr> left, ast::SetOpType op, bool all,
     std::shared_ptr<ast::QueryExpr> right) {
-    return std::make_shared<ast::UnionStmt>(std::move(left), std::move(right), all);
+    // INTERSECT binds more tightly than UNION and EXCEPT. QueryGroup is not a
+    // UnionStmt, so explicit parentheses remain an association boundary.
+    if (op == ast::SetOpType::INTERSECT) {
+        if (auto root = std::dynamic_pointer_cast<ast::UnionStmt>(left);
+            root != nullptr && root->op != ast::SetOpType::INTERSECT) {
+            root->right = append_set_operand(std::move(root->right), op, all,
+                                             std::move(right));
+            return left;
+        }
+    }
+    return std::make_shared<ast::UnionStmt>(std::move(left), std::move(right), op, all);
 }
 
 static bool is_lateral_ref(const std::shared_ptr<ast::FromExpr> &from) {
@@ -83,7 +102,8 @@ static std::shared_ptr<ast::BoolExpr> make_in_list_expr(
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
-%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION ALL DISTINCT
+%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT OFFSET ALL DISTINCT USING IS NULL_T
+%token <sv_set_op> UNION
 %token LIKE BETWEEN EXISTS IN
 %token LEFT RIGHT INNER OUTER CROSS FULL NATURAL SEMI ANTI LATERAL
 // non-keywords
@@ -110,7 +130,7 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON 
 %type <sv_strs> colNameList
 %type <sv_from> from_clause joined_table table_ref
 %type <sv_col> col
-%type <sv_cols> colList
+%type <sv_cols> colList agg_col_list
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_bool_expr> condition whereClause where_or_expr where_and_expr where_not_expr
@@ -123,7 +143,8 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON 
 %type <sv_agg_exprs> agg_list
 %type <sv_str> agg_name
 %type <sv_cols> opt_group_by group_by_list
-%type <sv_int> opt_limit
+%type <sv_limit_offset> limit_offset_clause
+%type <sv_bool> opt_select_distinct
 %type <sv_bool> union_quantifier
 %type <sv_str> opt_alias required_alias
 %type <sv_setKnobType> set_knob_type
@@ -252,9 +273,9 @@ dml:
     ;
 
 query_expression:
-        union_expression opt_order_clause opt_limit
+        union_expression opt_order_clause limit_offset_clause
     {
-        $1->set_tail($2, $3);
+        $1->set_tail($2, $3.first, $3.second);
         $$ = $1;
     }
     ;
@@ -266,12 +287,12 @@ union_expression:
     }
     |   union_expression UNION union_quantifier query_primary
     {
-        $$ = append_union_operand($1, $3, $4);
+        $$ = append_set_operand($1, $2, $3, $4);
     }
     ;
 
 union_quantifier:
-        /* UNION defaults to DISTINCT */
+        /* All SQL set operators default to DISTINCT. */
     {
         $$ = false;
     }
@@ -297,22 +318,27 @@ query_primary:
     ;
 
 select_core:
-        SELECT '*' FROM from_clause optWhereClause opt_group_by opt_having
+        SELECT opt_select_distinct '*' FROM from_clause optWhereClause opt_group_by opt_having
     {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $5, $6, $7, $8, std::vector<std::shared_ptr<OrderBy>>{}, false, 0, $2);
     }
-    |   SELECT colList FROM from_clause optWhereClause opt_group_by opt_having
+    |   SELECT opt_select_distinct colList FROM from_clause optWhereClause opt_group_by opt_having
     {
-        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+        $$ = std::make_shared<SelectStmt>($3, std::vector<std::shared_ptr<AggExpr>>{}, $5, $6, $7, $8, std::vector<std::shared_ptr<OrderBy>>{}, false, 0, $2);
     }
-    |   SELECT agg_list FROM from_clause optWhereClause opt_group_by opt_having
+    |   SELECT opt_select_distinct agg_list FROM from_clause optWhereClause opt_group_by opt_having
     {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $3, $5, $6, $7, $8, std::vector<std::shared_ptr<OrderBy>>{}, false, 0, $2);
     }
-    |   SELECT colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having
+    |   SELECT opt_select_distinct colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $6, $7, $8, $9, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+        $$ = std::make_shared<SelectStmt>($3, $5, $7, $8, $9, $10, std::vector<std::shared_ptr<OrderBy>>{}, false, 0, $2);
     }
+    ;
+
+opt_select_distinct:
+        /* empty */ { $$ = false; }
+    |   DISTINCT    { $$ = true; }
     ;
 
 fieldList:
@@ -445,6 +471,14 @@ condition:
     {
         $$ = std::make_shared<SubqueryPredicate>(SubqueryPredicateType::EXISTS,
                                                  nullptr, $3);
+    }
+    |   col IS NULL_T
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_IS_NULL, nullptr);
+    }
+    |   col IS NOT NULL_T
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_IS_NOT_NULL, nullptr);
     }
     ;
 
@@ -649,6 +683,17 @@ agg_list:
     }
     ;
 
+agg_col_list:
+        col
+    {
+        $$ = std::vector<std::shared_ptr<Col>>{$1};
+    }
+    |   agg_col_list ',' col
+    {
+        $$.push_back($3);
+    }
+    ;
+
 agg_func:
         agg_name '(' '*' ')' opt_alias
     {
@@ -660,16 +705,15 @@ agg_func:
         $$ = make_aggregate_expr($1, $3, $5);
         if ($$ == nullptr) YYERROR;
     }
-    |   agg_name '(' DISTINCT col ')' opt_alias
+    |   agg_name '(' DISTINCT agg_col_list ')' opt_alias
     {
-        /* 决赛：原生 COUNT(DISTINCT col) */
-        $$ = make_aggregate_expr($1, $4, $6, false, true);
+        $$ = make_aggregate_expr($1, std::move($4), $6, true);
         if ($$ == nullptr) YYERROR;
     }
-    |   agg_name '(' DISTINCT '(' col ')' ')' opt_alias
+    |   agg_name '(' DISTINCT '(' agg_col_list ')' ')' opt_alias
     {
-        /* 决赛：COUNT(DISTINCT (col)) 括号变体 */
-        $$ = make_aggregate_expr($1, $5, $8, false, true);
+        /* PostgreSQL/MySQL-compatible parenthesized DISTINCT argument list. */
+        $$ = make_aggregate_expr($1, std::move($5), $8, true);
         if ($$ == nullptr) YYERROR;
     }
     ;
@@ -758,6 +802,11 @@ joined_table:
             INNER_JOIN, $1, $3, nullptr,
             false, is_lateral_ref($3), true);
     }
+    | joined_table JOIN table_ref USING '(' colNameList ')'
+    {
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $3, nullptr, false, is_lateral_ref($3), false, $6);
+    }
     | joined_table JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
@@ -776,6 +825,11 @@ joined_table:
             INNER_JOIN, $1, $4, nullptr,
             false, is_lateral_ref($4), true);
     }
+    | joined_table INNER JOIN table_ref USING '(' colNameList ')'
+    {
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $4, nullptr, false, is_lateral_ref($4), false, $7);
+    }
     | joined_table LEFT opt_outer JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
@@ -787,6 +841,11 @@ joined_table:
         $$ = std::make_shared<JoinExpr>(
             LEFT_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
+    }
+    | joined_table LEFT opt_outer JOIN table_ref USING '(' colNameList ')'
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_JOIN, $1, $5, nullptr, false, is_lateral_ref($5), false, $8);
     }
     | joined_table RIGHT opt_outer JOIN table_ref ON whereClause
     {
@@ -800,6 +859,11 @@ joined_table:
             RIGHT_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
+    | joined_table RIGHT opt_outer JOIN table_ref USING '(' colNameList ')'
+    {
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_JOIN, $1, $5, nullptr, false, is_lateral_ref($5), false, $8);
+    }
     | joined_table FULL opt_outer JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
@@ -811,6 +875,11 @@ joined_table:
         $$ = std::make_shared<JoinExpr>(
             FULL_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
+    }
+    | joined_table FULL opt_outer JOIN table_ref USING '(' colNameList ')'
+    {
+        $$ = std::make_shared<JoinExpr>(
+            FULL_JOIN, $1, $5, nullptr, false, is_lateral_ref($5), false, $8);
     }
     | joined_table CROSS JOIN table_ref
     {
@@ -965,6 +1034,22 @@ having_condition:
     {
         $$ = std::make_shared<BinaryExpr>($1, $2, $3);
     }
+    |   col IS NULL_T
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_IS_NULL, nullptr);
+    }
+    |   col IS NOT NULL_T
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_IS_NOT_NULL, nullptr);
+    }
+    |   agg_func IS NULL_T
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_IS_NULL, nullptr);
+    }
+    |   agg_func IS NOT NULL_T
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_IS_NOT_NULL, nullptr);
+    }
     ;
 
 having_clause:
@@ -1061,17 +1146,32 @@ opt_asc_desc:
     |       { $$ = OrderBy_DEFAULT; }
     ;
 
-opt_limit:
+limit_offset_clause:
         /* epsilon */
     {
-        $$ = -1;
+        $$ = {-1, -1};
     }
     |   LIMIT VALUE_INT
     {
         if ($2 < 0) YYERROR;
-        $$ = $2;
+        $$ = {$2, -1};
     }
-    ;    
+    |   OFFSET VALUE_INT
+    {
+        if ($2 < 0) YYERROR;
+        $$ = {-1, $2};
+    }
+    |   LIMIT VALUE_INT OFFSET VALUE_INT
+    {
+        if ($2 < 0 || $4 < 0) YYERROR;
+        $$ = {$2, $4};
+    }
+    |   OFFSET VALUE_INT LIMIT VALUE_INT
+    {
+        if ($2 < 0 || $4 < 0) YYERROR;
+        $$ = {$4, $2};
+    }
+    ;
 
 set_knob_type:
     ENABLE_NESTLOOP { $$ = EnableNestLoop; }

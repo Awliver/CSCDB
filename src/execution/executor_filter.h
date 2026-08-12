@@ -21,7 +21,13 @@ class FilterExecutor : public AbstractExecutor {
         auto lhs = get_col(cols, cond.lhs_col);
         const auto *child_nulls = child_->null_mask();
         const auto lhs_index = static_cast<size_t>(lhs - cols.begin());
-        if (child_nulls != nullptr && lhs_index < child_nulls->size() && (*child_nulls)[lhs_index]) {
+        const bool lhs_is_null = child_nulls != nullptr &&
+                                 lhs_index < child_nulls->size() &&
+                                 (*child_nulls)[lhs_index];
+        if (is_null_test_op(cond.op)) {
+            return evaluate_null_test(lhs_is_null, cond.op);
+        }
+        if (lhs_is_null) {
             return TruthValue::UNKNOWN_VALUE;
         }
 

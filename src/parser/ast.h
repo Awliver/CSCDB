@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 #include <string>
 #include <memory>
+#include <utility>
 
 #include "common/aggregate_defs.h"
 
@@ -29,7 +30,8 @@ enum SvType {
 };
 
 enum SvCompOp {
-    SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE, SV_OP_LIKE
+    SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE, SV_OP_LIKE,
+    SV_OP_IS_NULL, SV_OP_IS_NOT_NULL
 };
 
 enum class LogicalOp {
@@ -45,6 +47,12 @@ enum OrderByDir {
 
 enum SetKnobType {
     EnableNestLoop, EnableSortMerge
+};
+
+enum class SetOpType {
+    UNION,
+    INTERSECT,
+    EXCEPT,
 };
 
 // Base class for tree nodes
@@ -177,14 +185,28 @@ struct Col : public Expr {
 struct AggExpr : public Expr {
     AggType agg_type;
     std::shared_ptr<Col> col;
+    // Keep col as the first argument for compatibility with the existing
+    // single-argument aggregate path; COUNT(DISTINCT ...) may carry more.
+    std::vector<std::shared_ptr<Col>> arguments;
     std::string alias;
     bool is_star;
     bool distinct;    // 支持 COUNT(DISTINCT col) / COUNT(DISTINCT (col))
     AggExpr(AggType t, std::shared_ptr<Col> c, std::string a, bool star = false, bool dist = false)
-        : agg_type(t), col(std::move(c)), alias(std::move(a)), is_star(star), distinct(dist) {}
+        : agg_type(t), col(std::move(c)), alias(std::move(a)), is_star(star), distinct(dist) {
+        if (col != nullptr) arguments.push_back(col);
+    }
+    AggExpr(AggType t, std::vector<std::shared_ptr<Col>> args, std::string a,
+            bool star = false, bool dist = false)
+        : agg_type(t), col(args.empty() ? nullptr : args.front()), arguments(std::move(args)),
+          alias(std::move(a)), is_star(star), distinct(dist) {}
 
     std::string to_string() const {
-        return format_aggregate_call(agg_type, col ? col->col_name : "", is_star, distinct);
+        std::string argument;
+        for (size_t i = 0; i < arguments.size(); ++i) {
+            if (i != 0) argument += ", ";
+            argument += arguments[i]->col_name;
+        }
+        return format_aggregate_call(agg_type, argument, is_star, distinct);
     }
 };
 
@@ -272,14 +294,19 @@ struct QueryExpr : public TreeNode {
     int limit = -1;
     bool has_limit = false;
     int limit_count = 0;
+    bool has_offset = false;
+    int offset_count = 0;
 
-    void set_tail(std::vector<std::shared_ptr<OrderBy>> orders_, int limit_) {
+    void set_tail(std::vector<std::shared_ptr<OrderBy>> orders_, int limit_,
+                  int offset_ = -1) {
         orders = std::move(orders_);
         has_sort = !orders.empty();
         order = orders.empty() ? nullptr : orders.front();
         limit = limit_;
         has_limit = limit_ >= 0;
         limit_count = has_limit ? limit_ : 0;
+        has_offset = offset_ >= 0;
+        offset_count = has_offset ? offset_ : 0;
     }
 };
 
@@ -363,17 +390,20 @@ struct JoinExpr : FromExpr {
     bool natural = false;
     bool lateral = false;
     bool on_true = false;  // 显式 ON TRUE；空 on_expr 本身仍表示“未写 ON”。
+    std::vector<std::string> using_cols;  // JOIN ... USING (c1, c2, ...)
 
     JoinExpr(JoinType type_, std::shared_ptr<FromExpr> left_,
              std::shared_ptr<FromExpr> right_,
              std::shared_ptr<BoolExpr> on_expr_,
-             bool natural_ = false, bool lateral_ = false, bool on_true_ = false)
+             bool natural_ = false, bool lateral_ = false, bool on_true_ = false,
+             std::vector<std::string> using_cols_ = {})
         : type(type_), left(std::move(left_)), right(std::move(right_)),
           on_expr(std::move(on_expr_)), natural(natural_), lateral(lateral_),
-          on_true(on_true_) {}
+          on_true(on_true_), using_cols(std::move(using_cols_)) {}
 }; // 定义专门的连接表达式结构
 
 struct SelectStmt : public QueryExpr {
+    bool distinct = false;
     std::vector<std::shared_ptr<Col>> cols;
     std::vector<std::shared_ptr<AggExpr>> aggs;
     // 将 FROM 后的 ON 条件与 WHERE 后的 WHERE 条件区分
@@ -389,8 +419,8 @@ struct SelectStmt : public QueryExpr {
                std::vector<std::shared_ptr<Col>> group_by_cols_,
                std::shared_ptr<BoolExpr> having_expr_,
                std::vector<std::shared_ptr<OrderBy>> orders_,
-               bool has_limit_, int limit_count_)
-        : cols(std::move(cols_)), aggs(std::move(aggs_)), from(std::move(from_)),
+               bool has_limit_, int limit_count_, bool distinct_ = false)
+        : distinct(distinct_), cols(std::move(cols_)), aggs(std::move(aggs_)), from(std::move(from_)),
           where_expr(std::move(where_expr_)),
           group_by_cols(std::move(group_by_cols_)), having_expr(std::move(having_expr_)) {
         set_tail(std::move(orders_), has_limit_ ? limit_count_ : -1);
@@ -408,12 +438,21 @@ struct ExplainStmt : public TreeNode {
 struct UnionStmt : public QueryExpr {
     std::shared_ptr<QueryExpr> left;
     std::shared_ptr<QueryExpr> right;
-    // true is UNION ALL; false is UNION DISTINCT (including bare UNION).
+    SetOpType op = SetOpType::UNION;
+    // true is the ALL variant; false is DISTINCT (including a bare operator).
     bool all = false;
 
+    UnionStmt(std::shared_ptr<QueryExpr> left_, std::shared_ptr<QueryExpr> right_,
+              SetOpType op_, bool all_)
+        : left(std::move(left_)), right(std::move(right_)), op(op_), all(all_) {}
+
     UnionStmt(std::shared_ptr<QueryExpr> left_, std::shared_ptr<QueryExpr> right_, bool all_)
-        : left(std::move(left_)), right(std::move(right_)), all(all_) {}
+        : UnionStmt(std::move(left_), std::move(right_), SetOpType::UNION, all_) {}
 };
+
+// Preferred generic name; UnionStmt remains the compatibility name used by
+// the existing UNION pipeline.
+using SetOperationStmt = UnionStmt;
 
 // set enable_nestloop
 struct SetStmt : public TreeNode {
@@ -430,6 +469,8 @@ struct SemValue {
     float sv_float = 0.0F;
     std::string sv_str;
     bool sv_bool = false;
+    std::pair<int, int> sv_limit_offset = {-1, -1};
+    SetOpType sv_set_op = SetOpType::UNION;
     OrderByDir sv_orderby_dir = OrderBy_DEFAULT;
     std::vector<std::string> sv_strs;
     std::shared_ptr<FromExpr> sv_from;

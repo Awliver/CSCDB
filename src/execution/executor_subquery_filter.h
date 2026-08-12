@@ -134,6 +134,9 @@ class SubqueryFilterExecutor : public AbstractExecutor {
         }
 
         const auto lhs = outer_operand(condition.lhs_col, record, nulls);
+        if (is_null_test_op(condition.op)) {
+            return evaluate_null_test(lhs.is_null, condition.op);
+        }
         if (lhs.is_null) return TruthValue::UNKNOWN_VALUE;
         CorrelatedTupleContext::Operand rhs;
         if (condition.is_rhs_val) {
@@ -193,7 +196,7 @@ class SubqueryFilterExecutor : public AbstractExecutor {
         }
         size_t index = 0;
         visit_bool_atoms(predicate_, [&](Condition &condition) {
-            if (condition.kind == ConditionKind::COMPARISON) return;
+            if (!is_subquery_condition(condition)) return;
             if (index >= subquery_executors.size()) {
                 throw InternalError("Missing predicate subquery executor");
             }

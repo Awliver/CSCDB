@@ -28,7 +28,9 @@ BUILD = Path(os.environ.get("RMDB_BUILD_DIR", str(ROOT / "build"))).resolve()
 SERVER = BUILD / "bin" / "rmdb"
 DB_REL = Path("test_dbs") / "union_query_expression_gate_db"
 DB_DIR = BUILD / DB_REL
-UPSTREAM_COMMIT_FILE = ROOT / "tests" / "postgresql_regress" / "UPSTREAM_COMMIT"
+UPSTREAM_COMMIT_FILE = (
+    ROOT / "tests" / "postgresql_regress" / "UNION_UPSTREAM_COMMIT"
+)
 DEFAULT_ROWS = 1_000_000
 MIN_ROWS = 10_000
 MAX_ROWS = 5_000_000

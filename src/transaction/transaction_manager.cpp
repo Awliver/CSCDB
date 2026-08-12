@@ -1093,6 +1093,8 @@ static bool ser_cmp(const char *a, const char *b, int len, ColType type, CompOp 
         case OP_LE: return cmp <= 0;
         case OP_GE: return cmp >= 0;
         case OP_LIKE: return false;
+        case OP_IS_NULL:
+        case OP_IS_NOT_NULL: return false;
     }
     return false;
 }
@@ -1158,6 +1160,12 @@ bool TransactionManager::ser_compile_pred(const std::string &tab,
                 cc.op = cond.op;
                 cc.rhs_is_val = cond.is_rhs_val;
                 cc.rhs_off = -1;
+                if (is_null_test_op(cond.op)) {
+                    // Persistent base-table rows have no NULL bitmap.  The
+                    // compiled match routine handles this as a constant test.
+                    node->atom = std::move(cc);
+                    break;
+                }
                 if (cond.is_rhs_val) {
                     cc.rhs_val.assign(cond.rhs_val.raw->data, it->len);
                 } else {
@@ -1196,6 +1204,7 @@ bool TransactionManager::ser_compiled_match(const char *data,
     const TruthValue result = evaluate_bool_expr(
         predicate, [data](const SerCompiledCond &c) {
         if (data == nullptr) return TruthValue::FALSE_VALUE;
+        if (is_null_test_op(c.op)) return evaluate_null_test(false, c.op);
         const char *rhs = c.rhs_is_val ? c.rhs_val.data() : data + c.rhs_off;
         return ser_cmp(data + c.lhs_off, rhs, c.lhs_len, c.type, c.op)
                    ? TruthValue::TRUE_VALUE

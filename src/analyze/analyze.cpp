@@ -70,6 +70,8 @@ IntFloatRewrite rewrite_int_col_float_val(Condition &cond) {
             cond.rhs_val.set_int(fl + 1);
             return IntFloatRewrite::CONVERTED;
         case OP_LIKE:
+        case OP_IS_NULL:
+        case OP_IS_NOT_NULL:
             return IntFloatRewrite::ALWAYS_FALSE;
     }
     return IntFloatRewrite::ALWAYS_FALSE;
@@ -142,6 +144,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         auto from_result = analyze_from(x->from);
         query->from = from_result.node;
         query->select_all = x->cols.empty() && x->aggs.empty();
+        query->distinct = x->distinct;
 
         // Analyzer 之后列限定符始终是 binding_name。物理表名只保存在
         // AnalyzedFrom 的叶节点中，由 ScanPlan 在访问存储时使用。
@@ -170,7 +173,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 遍历 SELECT 中的每一个聚合函数，并将语法层的 AggExpr 转换成语义层的 AggregateInfo
         for (auto &sv_agg : x->aggs) {
             AggregateInfo agg = analyze_aggregate(
-                sv_agg->agg_type, sv_agg->col, sv_agg->is_star,
+                sv_agg->agg_type, sv_agg->arguments, sv_agg->is_star,
                 sv_agg->distinct, sv_agg->alias, from_result.scope);
             query->aggs.push_back(agg);
             query->sel_captions.push_back(agg.alias.empty() ? agg.to_string() : agg.alias);
@@ -230,6 +233,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         query->limit = query->has_limit ? query->limit_count : x->limit;
         if (query->has_limit && query->limit_count < 0) {
             throw InternalError("LIMIT must not be negative");
+        }
+        query->has_offset = x->has_offset;
+        query->offset_count = x->offset_count;
+        if (query->has_offset && query->offset_count < 0) {
+            throw InternalError("OFFSET must not be negative");
         }
 
         for (auto &sel_col : query->cols) {
@@ -466,6 +474,11 @@ std::shared_ptr<Query> Analyze::analyze_query_group(
     if (query->has_limit && query->limit_count < 0) {
         throw InternalError("LIMIT must not be negative");
     }
+    query->has_offset = group->has_offset;
+    query->offset_count = group->offset_count;
+    if (query->has_offset && query->offset_count < 0) {
+        throw InternalError("OFFSET must not be negative");
+    }
     query->parse = group;
     return query;
 }
@@ -479,6 +492,7 @@ std::shared_ptr<Query> Analyze::analyze_union_expr(
     auto query = std::make_shared<Query>();
     query->union_left = analyze_query_expr(set_op->left, correlation_scope);
     query->union_right = analyze_query_expr(set_op->right, correlation_scope);
+    query->set_op = set_op->op;
     query->union_all = set_op->all;
     std::vector<ColMeta> common_cols = query->union_left->output_cols;
     if (common_cols.empty() || query->union_right->output_cols.size() != common_cols.size()) {
@@ -506,7 +520,7 @@ std::shared_ptr<Query> Analyze::analyze_union_expr(
             index = static_cast<size_t>(sv_order->ordinal - 1);
         } else {
             if (!sv_order->cols->tab_name.empty()) {
-                throw InternalError("UNION ORDER BY cannot use a table qualifier");
+                throw InternalError("Set operation ORDER BY cannot use a table qualifier");
             }
             size_t matches = 0;
             for (size_t i = 0; i < query->union_output_cols.size(); ++i) {
@@ -527,6 +541,11 @@ std::shared_ptr<Query> Analyze::analyze_union_expr(
     query->limit = set_op->has_limit ? set_op->limit_count : -1;
     if (query->has_limit && query->limit_count < 0) {
         throw InternalError("LIMIT must not be negative");
+    }
+    query->has_offset = set_op->has_offset;
+    query->offset_count = set_op->offset_count;
+    if (query->has_offset && query->offset_count < 0) {
+        throw InternalError("OFFSET must not be negative");
     }
     query->output_cols = query->union_output_cols;
     query->parse = set_op;
@@ -611,17 +630,18 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
     if (join->type == CROSS_JOIN && join->on_expr != nullptr) {
         throw InternalError("CROSS JOIN cannot have an ON clause");
     }
-    if (!join->natural && join->type != CROSS_JOIN && join->on_expr == nullptr && !join->on_true) {
+    const bool coalescing_join = join->natural || !join->using_cols.empty();
+    if (!coalescing_join && join->type != CROSS_JOIN && join->on_expr == nullptr && !join->on_true) {
         throw InternalError("JOIN requires an ON clause");
     }
-    if (join->natural && join->on_expr != nullptr) {
-        throw InternalError("NATURAL JOIN cannot have an ON clause");
+    if (coalescing_join && (join->on_expr != nullptr || join->on_true)) {
+        throw InternalError("NATURAL/USING JOIN cannot have an ON clause");
     }
-    if (join->natural && join->type == CROSS_JOIN) {
-        throw InternalError("NATURAL CROSS JOIN is not supported");
+    if (coalescing_join && join->type == CROSS_JOIN) {
+        throw InternalError("NATURAL/USING CROSS JOIN is not supported");
     }
-    if (join->lateral && join->natural) {
-        throw InternalError("NATURAL LATERAL JOIN is not supported");
+    if (join->lateral && coalescing_join) {
+        throw InternalError("NATURAL/USING LATERAL JOIN is not supported");
     }
     if (join->lateral && join->type != INNER_JOIN && join->type != CROSS_JOIN &&
         join->type != LEFT_JOIN) {
@@ -631,29 +651,55 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
     result.node = std::make_shared<AnalyzedFrom>();
     result.node->is_table = false;
     result.node->join_type = join->type;
+    // NATURAL and USING share the same coalesced-column execution contract,
+    // but retain the actual NATURAL marker so EXPLAIN can distinguish them.
     result.node->natural = join->natural;
     result.node->lateral = join->lateral;
     result.node->left = left.node;
     result.node->right = right.node;
     result.node->all_bindings = all_bindings;
 
-    if (join->natural) {
-        // NATURAL 只比较左右公开 row type。公共名在任一侧重复时没有唯一
-        // 对应列，按歧义处理。
+    if (coalescing_join) {
+        // NATURAL compares every shared public name; USING compares only its
+        // explicit list.  A key must identify exactly one public column on
+        // each side.
         std::map<std::string, std::vector<ColMeta>> left_by_name;
         std::map<std::string, std::vector<ColMeta>> right_by_name;
         for (const auto &col : left.scope.output_cols) left_by_name[col.name].push_back(col);
         for (const auto &col : right.scope.output_cols) right_by_name[col.name].push_back(col);
 
         std::set<std::string> common_names;
-        const std::string synthetic_binding = "\x1f" "natural_" + std::to_string(++natural_id_);
-        for (const auto &left_col : left.scope.output_cols) {
-            auto found = right_by_name.find(left_col.name);
-            if (found == right_by_name.end() || common_names.count(left_col.name) != 0) continue;
-            if (left_by_name[left_col.name].size() != 1 || found->second.size() != 1) {
-                throw AmbiguousColumnError(left_col.name);
+        std::vector<std::string> merge_names;
+        if (join->natural) {
+            for (const auto &left_col : left.scope.output_cols) {
+                if (right_by_name.count(left_col.name) != 0 &&
+                    common_names.insert(left_col.name).second) {
+                    merge_names.push_back(left_col.name);
+                }
             }
-            const auto &right_col = found->second.front();
+            common_names.clear();
+        } else {
+            for (const auto &name : join->using_cols) {
+                if (!common_names.insert(name).second) {
+                    throw InternalError("duplicate column in USING: " + name);
+                }
+                merge_names.push_back(name);
+            }
+            common_names.clear();
+        }
+
+        const std::string synthetic_binding = "\x1f" "natural_" + std::to_string(++natural_id_);
+        for (const auto &name : merge_names) {
+            auto left_found = left_by_name.find(name);
+            auto right_found = right_by_name.find(name);
+            if (left_found == left_by_name.end() || right_found == right_by_name.end()) {
+                throw ColumnNotFoundError(name);
+            }
+            if (left_found->second.size() != 1 || right_found->second.size() != 1) {
+                throw AmbiguousColumnError(name);
+            }
+            const auto &left_col = left_found->second.front();
+            const auto &right_col = right_found->second.front();
             if (left_col.type != right_col.type ||
                 (left_col.type != TYPE_STRING && left_col.len != right_col.len)) {
                 throw IncompatibleTypeError(coltype2str(left_col.type), coltype2str(right_col.type));
@@ -682,7 +728,7 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
                                        left_col.type, output.len};
             result.node->coalesced_cols.push_back(std::move(merged));
             result.scope.output_cols.push_back(output);
-            common_names.insert(left_col.name);
+            common_names.insert(name);
         }
 
         for (const auto &col : left.scope.output_cols) {
@@ -1065,6 +1111,10 @@ void Analyze::check_condition_types(const AnalyzeScope &scope,
     for (auto &cond : conds) {
         const auto &lhs_col = find_col(cond.lhs_col);
         const ColType lhs_type = lhs_col.type;
+        if (is_null_test_op(cond.op)) {
+            kept.push_back(std::move(cond));
+            continue;
+        }
         ColType rhs_type;
         if (cond.is_rhs_val) {
             bool rewritten_to_self = false;
@@ -1237,6 +1287,10 @@ Condition Analyze::convert_condition_atom(
     Condition cond;
     cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
     cond.op = convert_sv_comp_op(expr->op);
+    if (is_null_test_op(cond.op)) {
+        cond.is_rhs_val = true;  // unary predicate; only lhs participates in binding
+        return cond;
+    }
     if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs)) {
         cond.is_rhs_val = true;
         cond.rhs_val = convert_sv_value(rhs_val);
@@ -1271,6 +1325,8 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         {ast::SV_OP_EQ, OP_EQ}, {ast::SV_OP_NE, OP_NE}, {ast::SV_OP_LT, OP_LT},
         {ast::SV_OP_GT, OP_GT}, {ast::SV_OP_LE, OP_LE}, {ast::SV_OP_GE, OP_GE},
         {ast::SV_OP_LIKE, OP_LIKE},
+        {ast::SV_OP_IS_NULL, OP_IS_NULL},
+        {ast::SV_OP_IS_NOT_NULL, OP_IS_NOT_NULL},
     };
     return m.at(op);
 }
@@ -1285,14 +1341,15 @@ ColType Analyze::get_col_type(const std::vector<ColMeta> &all_cols, const TabCol
 }
 
 AggregateInfo Analyze::analyze_aggregate(ast::AggType type,
-                                         const std::shared_ptr<ast::Col> &column,
+                                         const std::vector<std::shared_ptr<ast::Col>> &arguments,
                                          bool is_star, bool distinct,
                                          const std::string &alias,
                                          const AnalyzeScope &scope) {
     const auto *spec = ast::aggregate_spec(type);
-    if (spec == nullptr || is_star != (column == nullptr) ||
+    if (spec == nullptr || is_star != arguments.empty() ||
         (is_star && (!spec->accepts_star || distinct)) ||
-        (distinct && !spec->accepts_distinct)) {
+        (distinct && !spec->accepts_distinct) ||
+        (arguments.size() > 1 && (type != ast::AGG_COUNT || !distinct))) {
         throw InternalError("failure");
     }
 
@@ -1310,16 +1367,22 @@ AggregateInfo Analyze::analyze_aggregate(ast::AggType type,
         return agg;
     }
 
-    agg.col = resolve_column(
-        scope, {.tab_name = column->tab_name, .col_name = column->col_name});
-    const auto col_it = std::find_if(scope.cols.begin(), scope.cols.end(), [&](const ColMeta &meta) {
-        return meta.tab_name == agg.col.tab_name && meta.name == agg.col.col_name;
-    });
-    if (col_it == scope.cols.end() || !ast::aggregate_accepts_argument(type, col_it->type)) {
-        throw InternalError("failure");
+    for (const auto &argument : arguments) {
+        TabCol resolved = resolve_column(
+            scope, {.tab_name = argument->tab_name, .col_name = argument->col_name});
+        const auto col_it = std::find_if(scope.cols.begin(), scope.cols.end(), [&](const ColMeta &meta) {
+            return meta.tab_name == resolved.tab_name && meta.name == resolved.col_name;
+        });
+        if (col_it == scope.cols.end() || !ast::aggregate_accepts_argument(type, col_it->type)) {
+            throw InternalError("failure");
+        }
+        agg.arguments.push_back(std::move(resolved));
+        if (agg.arguments.size() == 1) {
+            agg.col = agg.arguments.front();
+            agg.arg_type = col_it->type;
+            agg.arg_len = col_it->len;
+        }
     }
-    agg.arg_type = col_it->type;
-    agg.arg_len = col_it->len;
     return agg;
 }
 
@@ -1387,10 +1450,18 @@ HavingExprPtr Analyze::analyze_having_clause(
     if (expr == nullptr) throw InternalError("Unexpected HAVING expression node");
 
     auto same_aggregate = [](const AggregateInfo &left, const AggregateInfo &right) {
-        return left.type == right.type && left.is_star == right.is_star &&
-               left.distinct == right.distinct &&
-               left.col.tab_name == right.col.tab_name &&
-               left.col.col_name == right.col.col_name;
+        if (left.type != right.type || left.is_star != right.is_star ||
+            left.distinct != right.distinct ||
+            left.arguments.size() != right.arguments.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < left.arguments.size(); ++i) {
+            if (left.arguments[i].tab_name != right.arguments[i].tab_name ||
+                left.arguments[i].col_name != right.arguments[i].col_name) {
+                return false;
+            }
+        }
+        return true;
     };
     auto result_type = [&](const HavingCondition &cond) {
         if (cond.source == HavingSource::AGGREGATE) {
@@ -1401,20 +1472,19 @@ HavingExprPtr Analyze::analyze_having_clause(
     };
 
         auto rhs = std::dynamic_pointer_cast<ast::Value>(expr->rhs);
-        if (rhs == nullptr) {
+        HavingCondition cond;
+        cond.op = convert_sv_comp_op(expr->op);
+        if (rhs == nullptr && !is_null_test_op(cond.op)) {
             // 执行器只支持已经解析的标量右操作数。这里直接拒绝列，比旧路径先
             // 接受、执行时再读取未初始化 rhs_val 更安全。
             throw InternalError("failure");
         }
-
-        HavingCondition cond;
-        cond.op = convert_sv_comp_op(expr->op);
-        cond.rhs = convert_sv_value(rhs);
+        if (!is_null_test_op(cond.op)) cond.rhs = convert_sv_value(rhs);
 
         if (expr->lhs_agg != nullptr) {
             const auto &syntax = expr->lhs_agg;
             AggregateInfo resolved = analyze_aggregate(
-                syntax->agg_type, syntax->col, syntax->is_star,
+                syntax->agg_type, syntax->arguments, syntax->is_star,
                 syntax->distinct, "", scope);
             auto found = std::find_if(aggs.begin(), aggs.end(), [&](const AggregateInfo &candidate) {
                 return same_aggregate(candidate, resolved);
@@ -1461,6 +1531,10 @@ HavingExprPtr Analyze::analyze_having_clause(
             }
         } else {
             throw InternalError("failure");
+        }
+
+        if (is_null_test_op(cond.op)) {
+            return make_bool_atom<HavingCondition>(std::move(cond));
         }
 
         const ColType lhs_type = result_type(cond);

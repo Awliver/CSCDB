@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <climits>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,7 +71,8 @@ private:
     std::vector<TabCol> group_cols_;
     std::vector<size_t> group_col_idxs_;
     std::vector<AggregateInfo> agg_exprs_;
-    std::vector<int> argument_col_idxs_;  // 星号参数记为 -1；只绑定一次，不逐输入行查找
+    // One bound input slot per aggregate argument. COUNT(*) has an empty list.
+    std::vector<std::vector<size_t>> argument_col_idxs_;
     HavingExprPtr having_expr_;
     std::vector<ColMeta> cols_;
     size_t len_;
@@ -89,9 +91,9 @@ private:
     inline bool satisfy_having(const std::vector<AggState> &states, const std::string &key);
     inline void build_cur();
     inline void advance_to_valid();
-    inline const ColMeta *find_argument_col(const AggregateInfo &agg) const;
     inline void update_state(const AggregateInfo &agg, AggState &state,
-                             const RmRecord &record, const ColMeta *argument_col);
+                             const RmRecord &record,
+                             const std::vector<size_t> &argument_col_idxs);
     inline Value finalize(const AggregateInfo &agg, const AggState &state) const;
     inline void write_finalized_value(const Value &value, size_t output_col_idx);
     inline Value get_group_col_value(size_t group_idx, const std::string &key);
@@ -158,16 +160,21 @@ AggExecutor::AggExecutor(std::unique_ptr<AbstractExecutor> prev,
     }
     argument_col_idxs_.reserve(agg_exprs_.size());
     for (const auto &agg : agg_exprs_) {
-        if (agg.is_star) {
-            argument_col_idxs_.push_back(-1);
-            continue;
+        std::vector<size_t> bound_arguments;
+        const std::vector<TabCol> fallback_arguments =
+            agg.arguments.empty() && !agg.is_star && !agg.col.col_name.empty()
+                ? std::vector<TabCol>{agg.col}
+                : agg.arguments;
+        bound_arguments.reserve(fallback_arguments.size());
+        for (const auto &argument : fallback_arguments) {
+            auto col = std::find_if(input_cols.begin(), input_cols.end(), [&](const ColMeta &candidate) {
+                return candidate.name == argument.col_name &&
+                       (argument.tab_name.empty() || candidate.tab_name == argument.tab_name);
+            });
+            if (col == input_cols.end()) throw ColumnNotFoundError(argument.col_name);
+            bound_arguments.push_back(static_cast<size_t>(col - input_cols.begin()));
         }
-        auto col = std::find_if(input_cols.begin(), input_cols.end(), [&](const ColMeta &candidate) {
-            return candidate.name == agg.col.col_name &&
-                   (agg.col.tab_name.empty() || candidate.tab_name == agg.col.tab_name);
-        });
-        if (col == input_cols.end()) throw ColumnNotFoundError(agg.col.col_name);
-        argument_col_idxs_.push_back(static_cast<int>(col - input_cols.begin()));
+        argument_col_idxs_.push_back(std::move(bound_arguments));
     }
 
 }
@@ -221,25 +228,43 @@ bool AggExecutor::is_null(size_t input_col_idx) const {
     return mask != nullptr && input_col_idx < mask->size() && (*mask)[input_col_idx];
 }
 
-const ColMeta *AggExecutor::find_argument_col(const AggregateInfo &agg) const {
-    const size_t agg_idx = static_cast<size_t>(&agg - agg_exprs_.data());
-    if (agg_idx >= argument_col_idxs_.size() || argument_col_idxs_[agg_idx] < 0) return nullptr;
-    return &prev_->cols().at(static_cast<size_t>(argument_col_idxs_[agg_idx]));
-}
-
 void AggExecutor::update_state(const AggregateInfo &agg, AggState &st,
-                               const RmRecord &record, const ColMeta *argument_col) {
+                               const RmRecord &record,
+                               const std::vector<size_t> &argument_col_idxs) {
     const auto *spec = ast::aggregate_spec(agg.type);
     if (spec == nullptr) throw InternalError("Unknown aggregate function");
+    const auto &input_cols = prev_->cols();
+    const ColMeta *argument_col = argument_col_idxs.empty()
+                                      ? nullptr
+                                      : &input_cols.at(argument_col_idxs.front());
 
     // 统一的 SQL 输入策略：带参数的聚合忽略 NULL，DISTINCT 在状态转移前过滤
     // 物理值相同的输入。新增简单聚合会自动继承这两项规则，无需再写函数分支。
     if (!agg.is_star) {
         if (argument_col == nullptr) throw InternalError("Aggregate argument is not bound");
-        const size_t input_col_idx = static_cast<size_t>(argument_col - prev_->cols().data());
-        if (is_null(input_col_idx)) return;
+        for (size_t input_col_idx : argument_col_idxs) {
+            // SQL tuple DISTINCT ignores a row if any argument is NULL.
+            if (is_null(input_col_idx)) return;
+        }
         if (agg.distinct) {
-            std::string distinct_key(record.data + argument_col->offset, argument_col->len);
+            std::string distinct_key;
+            size_t key_len = 0;
+            for (size_t input_col_idx : argument_col_idxs) key_len += input_cols[input_col_idx].len;
+            distinct_key.reserve(key_len);
+            for (size_t input_col_idx : argument_col_idxs) {
+                const ColMeta &col = input_cols[input_col_idx];
+                if (col.type == TYPE_FLOAT) {
+                    float value = load_unaligned<float>(record.data + col.offset);
+                    if (value == 0.0F) {
+                        value = 0.0F;
+                    } else if (std::isnan(value)) {
+                        value = std::numeric_limits<float>::quiet_NaN();
+                    }
+                    distinct_key.append(reinterpret_cast<const char *>(&value), sizeof(value));
+                } else {
+                    distinct_key.append(record.data + col.offset, col.len);
+                }
+            }
             if (st.distinct_seen == nullptr) {
                 st.distinct_seen = std::make_unique<std::unordered_set<std::string>>();
             }
@@ -469,19 +494,21 @@ Value AggExecutor::get_group_col_value(size_t group_idx, const std::string &key)
 bool AggExecutor::satisfy_having(const std::vector<AggState> &states, const std::string &key) {
     const TruthValue result = evaluate_bool_expr(having_expr_, [&](const HavingCondition &cond) {
         Value lhs;
+        bool lhs_is_null = false;
         if (cond.source == HavingSource::GROUP_COLUMN) {
             if (cond.index >= group_cols_.size()) return TruthValue::FALSE_VALUE;
-            const bool is_null =
+            lhs_is_null =
                 (static_cast<unsigned char>(key[cond.index / 8]) &
                  (1U << (cond.index % 8))) != 0;
-            if (is_null) return TruthValue::UNKNOWN_VALUE;
-            lhs = get_group_col_value(cond.index, key);
+            if (!lhs_is_null) lhs = get_group_col_value(cond.index, key);
         } else {
             if (cond.index >= agg_exprs_.size() || cond.index >= states.size()) {
                 return TruthValue::FALSE_VALUE;
             }
             lhs = finalize(agg_exprs_[cond.index], states[cond.index]);
         }
+        if (is_null_test_op(cond.op)) return evaluate_null_test(lhs_is_null, cond.op);
+        if (lhs_is_null) return TruthValue::UNKNOWN_VALUE;
         return evaluate_condition(lhs, cond.rhs, cond.op)
                    ? TruthValue::TRUE_VALUE
                    : TruthValue::FALSE_VALUE;
@@ -529,7 +556,7 @@ void AggExecutor::beginTuple() {
         for (size_t i = 0; i < agg_exprs_.size(); ++i) {
             auto &agg = agg_exprs_[i];
             auto &st = states[i];
-            update_state(agg, st, *rec, find_argument_col(agg));
+            update_state(agg, st, *rec, argument_col_idxs_[i]);
         }
 
         // NULL 行不置 has_value，须继续找首个非 NULL 值才能停

@@ -49,6 +49,7 @@ typedef enum PlanTag{
     T_Projection,
     T_Aggregation, // 聚合计划节点标签
     T_Limit,
+    T_Distinct,
     T_Union,
     T_Rename,
     T_CorrelatedFilter,
@@ -162,6 +163,16 @@ class ProjectionPlan : public Plan
         
 };
 
+class DistinctPlan : public Plan
+{
+    public:
+        explicit DistinctPlan(std::shared_ptr<Plan> subplan)
+            : subplan_(std::move(subplan)) {
+            Plan::tag = T_Distinct;
+        }
+        std::shared_ptr<Plan> subplan_;
+};
+
 // 派生表只改变输出限定符/列名，不改变记录布局。
 class RenamePlan : public Plan
 {
@@ -251,34 +262,45 @@ class AggPlan : public Plan
 class LimitPlan : public Plan
 {
     public:
-        LimitPlan(PlanTag tag, std::shared_ptr<Plan> subplan, size_t limit)
+        LimitPlan(PlanTag tag, std::shared_ptr<Plan> subplan, size_t limit,
+                  size_t offset = 0)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
             limit_ = limit;
+            offset_ = offset;
         }
         ~LimitPlan(){}
         std::shared_ptr<Plan> subplan_;
         size_t limit_;
+        size_t offset_ = 0;
 };
 
 class UnionPlan : public Plan
 {
     public:
         UnionPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
-                  std::vector<ColMeta> output_cols, bool all)
+                  std::vector<ColMeta> output_cols, ast::SetOpType op, bool all)
         {
             Plan::tag = tag;
             subplans_.push_back(std::move(left));
             subplans_.push_back(std::move(right));
             output_cols_ = std::move(output_cols);
+            op_ = op;
             all_ = all;
         }
+        UnionPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                  std::vector<ColMeta> output_cols, bool all)
+            : UnionPlan(tag, std::move(left), std::move(right),
+                        std::move(output_cols), ast::SetOpType::UNION, all) {}
         ~UnionPlan(){}
         std::vector<std::shared_ptr<Plan>> subplans_;
         std::vector<ColMeta> output_cols_;
+        ast::SetOpType op_ = ast::SetOpType::UNION;
         bool all_ = false;
 };
+
+using SetOperationPlan = UnionPlan;
 
 // dml语句，包括insert; delete; update; select语句　
 class ExplainPlan : public Plan

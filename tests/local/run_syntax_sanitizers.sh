@@ -8,6 +8,8 @@ gate_rows=${RMDB_SANITIZER_GATE_ROWS:-10000}
 diff_rows=${RMDB_SANITIZER_DIFF_ROWS:-500}
 diff_cases=${RMDB_SANITIZER_DIFF_CASES:-25}
 union_diff_cases=${RMDB_SANITIZER_UNION_DIFF_CASES:-8}
+extended_rows=${RMDB_SANITIZER_EXTENDED_ROWS:-1000000}
+extended_diff_rounds=${RMDB_SANITIZER_EXTENDED_ROUNDS:-1}
 
 cmake -S "${repo_root}" -B "${sanitizer_build}" \
     -DCMAKE_BUILD_TYPE=Debug \
@@ -23,4 +25,6 @@ RMDB_BUILD_DIR="${sanitizer_build}" \
     python3 -B "${repo_root}/tests/syntax_functional_test.py" \
     --predicate-rows "${gate_rows}" --union-rows "${gate_rows}" \
     --diff-rows "${diff_rows}" --cases-per-seed "${diff_cases}" --seeds 42 \
-    --union-cases-per-seed "${union_diff_cases}" --union-seeds 42
+    --union-cases-per-seed "${union_diff_cases}" --union-seeds 42 \
+    --extended-rows "${extended_rows}" --extended-rounds "${extended_diff_rounds}" \
+    --extended-seeds 42

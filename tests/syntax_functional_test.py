@@ -22,6 +22,9 @@ DEFAULT_DIFF_CASES = 100
 DEFAULT_SEEDS = "78,91,11451419"
 DEFAULT_UNION_DIFF_CASES = 40
 DEFAULT_UNION_SEEDS = "42,99,20260812"
+DEFAULT_EXTENDED_ROWS = 1_000_000
+DEFAULT_EXTENDED_ROUNDS = 8
+DEFAULT_EXTENDED_SEEDS = "42,99,20260813"
 QUICK_PREDICATE_ROWS = 10_000
 QUICK_UNION_ROWS = 10_000
 QUICK_DIFF_ROWS = 500
@@ -29,6 +32,9 @@ QUICK_DIFF_CASES = 25
 QUICK_SEEDS = "42"
 QUICK_UNION_DIFF_CASES = 8
 QUICK_UNION_SEEDS = "42"
+QUICK_EXTENDED_ROWS = 10_000
+QUICK_EXTENDED_ROUNDS = 1
+QUICK_EXTENDED_SEEDS = "42"
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,9 @@ def parse_args() -> argparse.Namespace:
             "parser",
             "boolean",
             "union",
+            "extended",
+            "extended-index",
+            "extended-differential",
             "union-differential",
             "predicates",
             "differential",
@@ -65,6 +74,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds")
     parser.add_argument("--union-cases-per-seed", type=int)
     parser.add_argument("--union-seeds")
+    parser.add_argument("--extended-rows", type=int)
+    parser.add_argument("--extended-rounds", type=int)
+    parser.add_argument("--extended-seeds")
     parser.add_argument(
         "--postgres-dsn",
         default=os.environ.get("RMDB_POSTGRES_DSN", ""),
@@ -98,6 +110,16 @@ def parse_args() -> argparse.Namespace:
         )
     if args.union_seeds is None:
         args.union_seeds = QUICK_UNION_SEEDS if args.quick else DEFAULT_UNION_SEEDS
+    if args.extended_rows is None:
+        args.extended_rows = QUICK_EXTENDED_ROWS if args.quick else DEFAULT_EXTENDED_ROWS
+    if args.extended_rounds is None:
+        args.extended_rounds = (
+            QUICK_EXTENDED_ROUNDS if args.quick else DEFAULT_EXTENDED_ROUNDS
+        )
+    if args.extended_seeds is None:
+        args.extended_seeds = (
+            QUICK_EXTENDED_SEEDS if args.quick else DEFAULT_EXTENDED_SEEDS
+        )
 
     if args.predicate_rows < 10_000:
         parser.error("--predicate-rows must be at least 10000")
@@ -111,6 +133,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cases-per-seed must be positive")
     if args.union_cases_per_seed < 1:
         parser.error("--union-cases-per-seed must be positive")
+    if not 10_000 <= args.extended_rows <= 5_000_000:
+        parser.error("--extended-rows must be in [10000, 5000000]")
+    if args.extended_rounds < 1:
+        parser.error("--extended-rounds must be positive")
     return args
 
 
@@ -133,6 +159,38 @@ def build_components(args: argparse.Namespace) -> list[Component]:
                 str(LOCAL / "union_query_expression_gate.py"),
                 "--rows",
                 str(args.union_rows),
+            ),
+        ),
+        Component(
+            "PostgreSQL-derived extended SQL syntax",
+            (
+                python,
+                "-B",
+                str(LOCAL / "postgresql_extended_syntax_gate.py"),
+            ),
+        ),
+        Component(
+            "extended SQL sequential/index access paths",
+            (
+                python,
+                "-B",
+                str(LOCAL / "extended_syntax_index_gate.py"),
+                "--rows",
+                str(args.extended_rows),
+            ),
+        ),
+        Component(
+            "random extended SQL/PostgreSQL four-way differential gate",
+            (
+                python,
+                "-B",
+                str(LOCAL / "postgresql_extended_syntax_differential.py"),
+                "--rows",
+                str(args.extended_rows),
+                "--rounds",
+                str(args.extended_rounds),
+                "--seeds",
+                args.extended_seeds,
             ),
         ),
         Component(
@@ -175,7 +233,7 @@ def build_components(args: argparse.Namespace) -> list[Component]:
         ),
     ]
     if args.postgres_dsn:
-        for index in (3, 5):
+        for index in (5, 6, 8):
             differential = components[index]
             components[index] = Component(
                 differential.name,
@@ -187,9 +245,12 @@ def build_components(args: argparse.Namespace) -> list[Component]:
         "parser": 0,
         "boolean": 1,
         "union": 2,
-        "union-differential": 3,
-        "predicates": 4,
-        "differential": 5,
+        "extended": 3,
+        "extended-index": 4,
+        "extended-differential": 5,
+        "union-differential": 6,
+        "predicates": 7,
+        "differential": 8,
     }[args.component]
     return [components[index]]
 

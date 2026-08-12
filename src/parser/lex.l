@@ -14,6 +14,7 @@
 
 #include "ast.h"
 #include "yacc.tab.h"
+#include <cctype>
 #include <cmath>
 #include <iostream>
 
@@ -86,6 +87,9 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "SUM" { return SUM; }
 "AVG" { return AVG; }
 "DISTINCT" { return DISTINCT; }
+"USING" { return USING; }
+"IS" { return IS; }
+"NULL" { return NULL_T; }
 "LIKE" { return LIKE; }
 "BETWEEN" { return BETWEEN; }
 "EXISTS" { return EXISTS; }
@@ -93,7 +97,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "AS" { return AS; }
 "GROUP" { return GROUP; }
 "HAVING" { return HAVING; }
-"UNION" { return UNION; }
+"UNION" { yylval->sv_set_op = ast::SetOpType::UNION; return UNION; }
 "ALL" { return ALL; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
@@ -120,6 +124,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "HELP" { return HELP; }
 "ORDER" { return ORDER; }
 "LIMIT" { return LIMIT; }
+"OFFSET" { return OFFSET; }
 "BY" {  return BY;  }
 "ASC" { return ASC; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
@@ -150,6 +155,18 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
     /* id */
 {identifier} {
     yylval->sv_str = yytext;
+    // INTERSECT and EXCEPT reuse the existing set-operator parser token.  The
+    // semantic value retains the actual operation without changing the DFA.
+    std::string keyword = yytext;
+    for (char &ch : keyword) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    if (keyword == "INTERSECT") {
+        yylval->sv_set_op = ast::SetOpType::INTERSECT;
+        return UNION;
+    }
+    if (keyword == "EXCEPT") {
+        yylval->sv_set_op = ast::SetOpType::EXCEPT;
+        return UNION;
+    }
     return IDENTIFIER;
 }
     /* literals */

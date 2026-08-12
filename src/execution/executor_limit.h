@@ -17,15 +17,22 @@ class LimitExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
     size_t limit_;
+    size_t offset_;
     size_t count_ = 0;
 
 public:
-    LimitExecutor(std::unique_ptr<AbstractExecutor> prev, size_t limit)
-        : prev_(std::move(prev)), limit_(limit) {}
+    LimitExecutor(std::unique_ptr<AbstractExecutor> prev, size_t limit,
+                  size_t offset = 0)
+        : prev_(std::move(prev)), limit_(limit), offset_(offset) {}
 
     void beginTuple() override {
         prev_->beginTuple();
         count_ = 0;
+        size_t skipped = 0;
+        while (skipped < offset_ && !prev_->is_end()) {
+            prev_->nextTuple();
+            ++skipped;
+        }
     }
 
     void nextTuple() override {

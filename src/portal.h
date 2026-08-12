@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_abstract.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_projection.h"
+#include "execution/executor_distinct.h"
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_nestedloop_join.h"
@@ -134,22 +135,10 @@ class Portal
         switch(portal->tag) {
             case PORTAL_ONE_SELECT:
             {
-                int limit = -1;
-                if (auto dp = std::dynamic_pointer_cast<DMLPlan>(portal->plan)) {
-                    std::shared_ptr<Plan> cur = dp->subplan_;
-                    while (cur) {
-                        if (auto l = std::dynamic_pointer_cast<LimitPlan>(cur)) {
-                            limit = (int)l->limit_;
-                            break;
-                        }
-                        if (auto p = std::dynamic_pointer_cast<ProjectionPlan>(cur)) {
-                            cur = p->subplan_;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                ql->select_from(std::move(portal->root), std::move(portal->sel_cols), context, limit);
+                // LIMIT/OFFSET are physical executors.  Applying a second
+                // row-count cap here used to be harmless for LIMIT alone but
+                // becomes incorrect once OFFSET can skip input rows.
+                ql->select_from(std::move(portal->root), std::move(portal->sel_cols), context, -1);
                 break;
             }
 
@@ -185,6 +174,9 @@ class Portal
         if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)){
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                         x->sel_cols_);
+        } else if (auto x = std::dynamic_pointer_cast<DistinctPlan>(plan)) {
+            return std::make_unique<DistinctExecutor>(
+                convert_plan_executor(x->subplan_, context, correlated));
         } else if (auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
             return std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                     x->predicate_);
@@ -257,13 +249,14 @@ class Portal
                                                  x->having_expr_, x->output_cols_);
         } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
             return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context, correlated),
-                                                   x->limit_);
+                                                   x->limit_, x->offset_);
         } else if(auto x = std::dynamic_pointer_cast<UnionPlan>(plan)) {
             std::vector<std::unique_ptr<AbstractExecutor>> children;
             for (auto &subplan : x->subplans_) {
                 children.push_back(convert_plan_executor(subplan, context, correlated));
             }
-            return std::make_unique<UnionExecutor>(std::move(children), x->output_cols_, x->all_);
+            return std::make_unique<UnionExecutor>(std::move(children), x->output_cols_,
+                                                   x->op_, x->all_);
         }
         return nullptr;
     }

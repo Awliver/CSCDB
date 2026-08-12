@@ -47,13 +47,16 @@ python3 tests/local/bench_tpcc_neworder.py --quick
 ## SQL 语法功能专项正确性测试
 
 统一入口为 `tests/syntax_functional_test.py`。该测试面向 Parser、Expression Tree 及谓词
-语法，依次运行六个内部组件，并以任一组件失败作为整体失败：
+语法，依次运行九个内部组件，并以任一组件失败作为整体失败：
 
 | 组件 | 主要覆盖 |
 |------|----------|
 | Parser / AST | 关键字 token、语法树结构、优先级和非法语法拒绝 |
 | Boolean Expression Tree | `AND` / `OR` / `NOT` 优先级与括号，`WHERE`、`ON`、`HAVING`、`UPDATE`、`DELETE`，三值逻辑及索引残余谓词 |
 | UNION Query Expression | `UNION [ALL\|DISTINCT]`、混合链与括号、全局/分支 `ORDER BY` 和 `LIMIT`、派生表、相关子查询、类型提升与错误恢复 |
+| PostgreSQL 扩展语法回归 | 从官方 `select_distinct.sql`、`join.sql`、`limit.sql`、`aggregates.sql`、`union.sql`、`groupingsets.sql` 适配 31 项确定性断言 |
+| 扩展语法索引双路径 | 百万行上对本次六组语法逐项验证 SeqScan/IndexScan 计划切换、结果和列元数据不变 |
+| 扩展语法 PostgreSQL 随机差分 | 固定 seed 随机组合 DISTINCT、USING、OFFSET、DISTINCT 聚合、INTERSECT/EXCEPT 和 NULL 测试，并执行两引擎×两访问路径四路比较 |
 | UNION PostgreSQL 随机差分 | 固定 seed 生成二元/混合/括号/分支排序限制等随机 UNION，对比 RMDB 与 PostgreSQL，并分别验证无索引和有索引计划 |
 | 确定性谓词门禁 | `LIKE` / `NOT LIKE`、`BETWEEN` / `NOT BETWEEN`、值列表及子查询 `IN` / `NOT IN`、相关和非相关 `EXISTS` / `NOT EXISTS` |
 | PostgreSQL 随机差分 | 固定 seed 生成深度不超过 3 的随机布尔树，比较 RMDB 与真实 PostgreSQL 的结果，并验证无索引与有索引路径结果一致 |
@@ -64,6 +67,8 @@ python3 tests/local/bench_tpcc_neworder.py --quick
 RMDB/PostgreSQL × 无索引/有索引四条路径，并用 `EXPLAIN` 确认 RMDB 的分支确实从
 顺序扫描切换到索引扫描。谓词随机差分则默认使用 3 个 seed 各 100 条 SQL，加 15 条
 固定边界及回归用例。
+扩展语法索引门禁和随机差分的主表默认也固定为 1,000,000 行；随机差分默认使用
+3 个 seed、每个 seed 8 轮，每轮生成 8 条 SQL，共 192 条 SQL、768 次引擎执行。
 
 ```bash
 # 完整语法功能正确性测试（推荐提交前运行）
@@ -80,6 +85,9 @@ python3 -B tests/syntax_functional_test.py --quick
 python3 -B tests/syntax_functional_test.py --component parser
 python3 -B tests/syntax_functional_test.py --component boolean
 python3 -B tests/syntax_functional_test.py --component union
+python3 -B tests/syntax_functional_test.py --component extended
+python3 -B tests/syntax_functional_test.py --component extended-index
+python3 -B tests/syntax_functional_test.py --component extended-differential
 python3 -B tests/syntax_functional_test.py --component union-differential
 python3 -B tests/syntax_functional_test.py --component predicates
 python3 -B tests/syntax_functional_test.py --component differential
@@ -95,6 +103,10 @@ python3 -B tests/syntax_functional_test.py \
 # 扩展 UNION 随机差分覆盖（仍在百万行数据上执行）
 python3 -B tests/syntax_functional_test.py --component union-differential \
   --union-seeds 42,99,123,456 --union-cases-per-seed 100 --union-rows 1000000
+
+# 本次扩展语法随机差分（默认行数也是 100 万）
+python3 -B tests/syntax_functional_test.py --component extended-differential \
+  --extended-rows 1000000 --extended-seeds 42,99,20260813 --extended-rounds 8
 
 # 复用已有 PostgreSQL 实例
 python3 -B tests/syntax_functional_test.py \
@@ -129,8 +141,10 @@ tests/local/run_syntax_sanitizers.sh
 越界和悬空访问检查以及 UndefinedBehaviorSanitizer 仍保持启用。可通过
 `RMDB_SANITIZER_BUILD_DIR` 指定独立构建目录，通过
 `RMDB_SANITIZER_GATE_ROWS`、`RMDB_SANITIZER_DIFF_ROWS` 和
-`RMDB_SANITIZER_DIFF_CASES` 调整测试规模；UNION 随机差分条数可由
-`RMDB_SANITIZER_UNION_DIFF_CASES` 单独调整。
+`RMDB_SANITIZER_DIFF_CASES` 调整原有测试规模；UNION 随机差分条数可由
+`RMDB_SANITIZER_UNION_DIFF_CASES` 单独调整。本次扩展语法的 sanitizer 门禁仍默认
+使用 1,000,000 行，可通过 `RMDB_SANITIZER_EXTENDED_ROWS` 和
+`RMDB_SANITIZER_EXTENDED_ROUNDS` 显式调整。
 
 ## 初赛 / 开发期性能测试对齐（历史题意模拟）
 

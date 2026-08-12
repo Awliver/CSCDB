@@ -55,6 +55,7 @@ bool Planner::get_index_cols(const std::string &tab_name,
             bool found_eq = false;
             bool found_range = false;
             for (auto& cond : curr_conds) {
+                if (cond.kind != ConditionKind::COMPARISON || is_null_test_op(cond.op)) continue;
                 if (!cond.is_rhs_val) continue;
                 if (cond.lhs_col.tab_name != condition_table) continue;
                 if (cond.lhs_col.col_name != idx_col.name) continue;
@@ -90,6 +91,7 @@ bool Planner::get_index_cols(const std::string &tab_name,
             for (size_t ci = 1; ci < index.cols.size(); ci++) {
                 bool found_eq = false;
                 for (auto& cond : curr_conds) {
+                    if (cond.kind != ConditionKind::COMPARISON || is_null_test_op(cond.op)) continue;
                     if (cond.is_rhs_val && cond.op == OP_EQ &&
                         cond.lhs_col.tab_name == condition_table &&
                         cond.lhs_col.col_name == index.cols[ci].name) {
@@ -103,6 +105,7 @@ bool Planner::get_index_cols(const std::string &tab_name,
             // 首列自身不得有条件（有条件则常规匹配早已命中）
             bool first_has_cond = false;
             for (auto& cond : curr_conds) {
+                if (cond.kind != ConditionKind::COMPARISON || is_null_test_op(cond.op)) continue;
                 if (cond.is_rhs_val && cond.lhs_col.tab_name == condition_table &&
                     cond.lhs_col.col_name == index.cols[0].name) {
                     first_has_cond = true;
@@ -135,6 +138,7 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::str
 
     auto is_join_eq_on_col = [&](const std::string &col_name) {
         for (auto &cond : join_conds) {
+            if (cond.kind != ConditionKind::COMPARISON || is_null_test_op(cond.op)) continue;
             if (cond.op != OP_EQ || cond.is_rhs_val) continue;
             if ((cond.lhs_col.tab_name == right_binding && cond.lhs_col.col_name == col_name) ||
                 (cond.rhs_col.tab_name == right_binding && cond.rhs_col.col_name == col_name)) {
@@ -151,6 +155,7 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::str
         for (auto &idx_col : index.cols) {
             bool matched = false;
             for (auto &cond : scan_conds) {
+                if (cond.kind != ConditionKind::COMPARISON || is_null_test_op(cond.op)) continue;
                 if (!cond.is_rhs_val || cond.op != OP_EQ) continue;
                 if (cond.lhs_col.tab_name != right_binding) continue;
                 if (cond.lhs_col.col_name != idx_col.name) continue;
@@ -185,12 +190,13 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
                                               JoinType join_type, Context *context,
                                               bool natural, bool lateral,
                                               std::vector<CoalescedJoinColumn> coalesced_cols) {
+    const bool coalescing_join = natural || !coalesced_cols.empty();
     auto right_scan = std::dynamic_pointer_cast<ScanPlan>(right);
     auto right_projection = std::dynamic_pointer_cast<ProjectionPlan>(right);
     if (right_scan == nullptr && right_projection != nullptr) {
         right_scan = std::dynamic_pointer_cast<ScanPlan>(right_projection->subplan_);
     }
-    if (join_type == INNER_JOIN && !natural && !lateral && right_scan != nullptr &&
+    if (join_type == INNER_JOIN && !coalescing_join && !lateral && right_scan != nullptr &&
         !mvcc_force_seqscan(context, right_scan->tab_name_, 2,
                             right_scan->access_conditions_)) {
         // 只有 INNER JOIN 才选择 INLJ
@@ -231,6 +237,9 @@ namespace {
 std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan) {
     if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         return projection->sel_cols_;
+    }
+    if (auto distinct = std::dynamic_pointer_cast<DistinctPlan>(plan)) {
+        return plan_output_cols(distinct->subplan_);
     }
     if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
         std::vector<TabCol> cols;
@@ -346,7 +355,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         visit_bool_atoms(expr, [&](const Condition &cond) {
             if (cond.kind == ConditionKind::EXISTS_SUBQUERY) return;
             result.insert(cond.lhs_col.tab_name);
-            if (cond.kind == ConditionKind::COMPARISON && !cond.is_rhs_val) {
+            if (cond.kind == ConditionKind::COMPARISON &&
+                !is_null_test_op(cond.op) && !cond.is_rhs_val) {
                 result.insert(cond.rhs_col.tab_name);
             }
         });
@@ -356,7 +366,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     auto contains_subquery = [](const ConditionExprPtr &expr) {
         bool found = false;
         visit_bool_atoms(expr, [&](const Condition &cond) {
-            found = found || cond.kind != ConditionKind::COMPARISON;
+            found = found || is_subquery_condition(cond);
         });
         return found;
     };
@@ -370,7 +380,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     is_inner_group = [&](const std::shared_ptr<AnalyzedFrom> &node) {
         if (node->is_table) return true;
         if (node->is_subquery) return false;
-        if (node->natural || node->lateral) return false;
+        if (node->natural || !node->coalesced_cols.empty() || node->lateral) return false;
         if (node->join_type != INNER_JOIN && node->join_type != CROSS_JOIN) return false;
         return is_inner_group(node->left) && is_inner_group(node->right);
     };
@@ -479,7 +489,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     require_predicate = [&](const ConditionExprPtr &expr) {
         visit_bool_atoms(expr, [&](const Condition &cond) {
             if (cond.kind != ConditionKind::EXISTS_SUBQUERY) require_col(cond.lhs_col);
-            if (cond.kind == ConditionKind::COMPARISON && !cond.is_rhs_val) {
+            if (cond.kind == ConditionKind::COMPARISON &&
+                !is_null_test_op(cond.op) && !cond.is_rhs_val) {
                 require_col(cond.rhs_col);
             }
             // EXISTS has no outer lhs column of its own, while both EXISTS
@@ -502,7 +513,9 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     };
     for (const auto &col : query->cols) require_col(col);
     for (const auto &col : query->group_by_cols) require_col(col);
-    for (const auto &agg : query->aggs) if (!agg.is_star) require_col(agg.col);
+    for (const auto &agg : query->aggs) {
+        for (const auto &argument : agg.arguments) require_col(argument);
+    }
     for (const auto &order : query->orders) require_col(order.first);
     for (const auto &[_, predicates] : scan_filters) {
         for (const auto &predicate : predicates) require_predicate(predicate);
@@ -743,7 +756,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         if (contains_subquery(predicate)) {
             std::vector<std::shared_ptr<Plan>> subquery_plans;
             visit_bool_atoms(predicate, [&](const Condition &condition) {
-                if (condition.kind == ConditionKind::COMPARISON) return;
+                if (!is_subquery_condition(condition)) return;
                 if (condition.subquery == nullptr) {
                     throw InternalError("Predicate subquery was not analyzed");
                 }
@@ -845,9 +858,18 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot),
                                                     std::move(sel_cols));
 
-    // LIMIT
-    if (query->has_limit) {
-        plannerRoot = std::make_shared<LimitPlan>(T_Limit, std::move(plannerRoot), query->limit_count);
+    if (query->distinct) {
+        plannerRoot = std::make_shared<DistinctPlan>(std::move(plannerRoot));
+    }
+
+    // LIMIT/OFFSET
+    if (query->has_limit || query->has_offset) {
+        const size_t limit = query->has_limit
+                                 ? static_cast<size_t>(query->limit_count)
+                                 : std::numeric_limits<size_t>::max();
+        plannerRoot = std::make_shared<LimitPlan>(
+            T_Limit, std::move(plannerRoot), limit,
+            static_cast<size_t>(query->offset_count));
     }
 
     return plannerRoot;
@@ -867,7 +889,7 @@ std::shared_ptr<Plan> Planner::generate_query_plan(std::shared_ptr<Query> query,
             T_Union,
             generate_query_plan(query->union_left, context),
             generate_query_plan(query->union_right, context),
-            query->union_output_cols, query->union_all);
+            query->union_output_cols, query->set_op, query->union_all);
     } else if (std::dynamic_pointer_cast<ast::QueryGroup>(query->parse)) {
         if (query->group_child == nullptr) throw InternalError("Invalid parenthesized query");
         plan = generate_query_plan(query->group_child, context);
@@ -882,8 +904,12 @@ std::shared_ptr<Plan> Planner::generate_query_plan(std::shared_ptr<Query> query,
         }
         plan = std::make_shared<SortPlan>(T_Sort, std::move(plan), std::move(sort_cols));
     }
-    if (query->has_limit) {
-        plan = std::make_shared<LimitPlan>(T_Limit, std::move(plan), query->limit_count);
+    if (query->has_limit || query->has_offset) {
+        const size_t limit = query->has_limit
+                                 ? static_cast<size_t>(query->limit_count)
+                                 : std::numeric_limits<size_t>::max();
+        plan = std::make_shared<LimitPlan>(T_Limit, std::move(plan), limit,
+                                           static_cast<size_t>(query->offset_count));
     }
     return plan;
 }
