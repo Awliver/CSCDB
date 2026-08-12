@@ -86,10 +86,15 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "SUM" { return SUM; }
 "AVG" { return AVG; }
 "DISTINCT" { return DISTINCT; }
+"LIKE" { return LIKE; }
+"BETWEEN" { return BETWEEN; }
+"EXISTS" { return EXISTS; }
+"IN" { return IN; }
 "AS" { return AS; }
 "GROUP" { return GROUP; }
 "HAVING" { return HAVING; }
 "UNION" { return UNION; }
+"ALL" { return ALL; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }

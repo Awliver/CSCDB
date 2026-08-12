@@ -51,7 +51,8 @@ typedef enum PlanTag{
     T_Limit,
     T_Union,
     T_Rename,
-    T_CorrelatedFilter
+    T_CorrelatedFilter,
+    T_SubqueryFilter
 } PlanTag;
 
 // 查询执行计划
@@ -186,6 +187,24 @@ class CorrelatedFilterPlan : public Plan
         ConditionExprPtr predicate_;
 };
 
+// A WHERE filter containing EXISTS or IN(subquery).  Subqueries are kept in
+// atom visitation order so the Portal can build one restartable executor per
+// predicate leaf while retaining the enclosing boolean-expression tree.
+class SubqueryFilterPlan : public Plan
+{
+    public:
+        SubqueryFilterPlan(std::shared_ptr<Plan> subplan,
+                           ConditionExprPtr predicate,
+                           std::vector<std::shared_ptr<Plan>> subquery_plans)
+            : subplan_(std::move(subplan)), predicate_(std::move(predicate)),
+              subquery_plans_(std::move(subquery_plans)) {
+            Plan::tag = T_SubqueryFilter;
+        }
+        std::shared_ptr<Plan> subplan_;
+        ConditionExprPtr predicate_;
+        std::vector<std::shared_ptr<Plan>> subquery_plans_;
+};
+
 class SortPlan : public Plan
 {
     public:
@@ -246,15 +265,19 @@ class LimitPlan : public Plan
 class UnionPlan : public Plan
 {
     public:
-        UnionPlan(PlanTag tag, std::vector<std::shared_ptr<Plan>> subplans, std::vector<ColMeta> output_cols)
+        UnionPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                  std::vector<ColMeta> output_cols, bool all)
         {
             Plan::tag = tag;
-            subplans_ = std::move(subplans);
+            subplans_.push_back(std::move(left));
+            subplans_.push_back(std::move(right));
             output_cols_ = std::move(output_cols);
+            all_ = all;
         }
         ~UnionPlan(){}
         std::vector<std::shared_ptr<Plan>> subplans_;
         std::vector<ColMeta> output_cols_;
+        bool all_ = false;
 };
 
 // dml语句，包括insert; delete; update; select语句　

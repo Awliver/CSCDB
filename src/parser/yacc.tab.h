@@ -35,8 +35,8 @@
    especially those whose name start with YY_ or yy_.  They are
    private implementation details that can be changed or removed.  */
 
-#ifndef YY_YY_YACC_TAB_H_INCLUDED
-# define YY_YY_YACC_TAB_H_INCLUDED
+#ifndef YY_YY_ROOT_CSC_DB_LEARN_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED
+# define YY_YY_ROOT_CSC_DB_LEARN_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED
 /* Debug traces.  */
 #ifndef YYDEBUG
 # define YYDEBUG 0
@@ -102,26 +102,31 @@ extern int yydebug;
     HAVING = 303,                  /* HAVING  */
     LIMIT = 304,                   /* LIMIT  */
     UNION = 305,                   /* UNION  */
-    DISTINCT = 306,                /* DISTINCT  */
-    LEFT = 307,                    /* LEFT  */
-    RIGHT = 308,                   /* RIGHT  */
-    INNER = 309,                   /* INNER  */
-    OUTER = 310,                   /* OUTER  */
-    CROSS = 311,                   /* CROSS  */
-    FULL = 312,                    /* FULL  */
-    NATURAL = 313,                 /* NATURAL  */
-    SEMI = 314,                    /* SEMI  */
-    ANTI = 315,                    /* ANTI  */
-    LATERAL = 316,                 /* LATERAL  */
-    LEQ = 317,                     /* LEQ  */
-    NEQ = 318,                     /* NEQ  */
-    GEQ = 319,                     /* GEQ  */
-    T_EOF = 320,                   /* T_EOF  */
-    IDENTIFIER = 321,              /* IDENTIFIER  */
-    VALUE_STRING = 322,            /* VALUE_STRING  */
-    VALUE_INT = 323,               /* VALUE_INT  */
-    VALUE_FLOAT = 324,             /* VALUE_FLOAT  */
-    VALUE_BOOL = 325               /* VALUE_BOOL  */
+    ALL = 306,                     /* ALL  */
+    DISTINCT = 307,                /* DISTINCT  */
+    LIKE = 308,                    /* LIKE  */
+    BETWEEN = 309,                 /* BETWEEN  */
+    EXISTS = 310,                  /* EXISTS  */
+    IN = 311,                      /* IN  */
+    LEFT = 312,                    /* LEFT  */
+    RIGHT = 313,                   /* RIGHT  */
+    INNER = 314,                   /* INNER  */
+    OUTER = 315,                   /* OUTER  */
+    CROSS = 316,                   /* CROSS  */
+    FULL = 317,                    /* FULL  */
+    NATURAL = 318,                 /* NATURAL  */
+    SEMI = 319,                    /* SEMI  */
+    ANTI = 320,                    /* ANTI  */
+    LATERAL = 321,                 /* LATERAL  */
+    LEQ = 322,                     /* LEQ  */
+    NEQ = 323,                     /* NEQ  */
+    GEQ = 324,                     /* GEQ  */
+    T_EOF = 325,                   /* T_EOF  */
+    IDENTIFIER = 326,              /* IDENTIFIER  */
+    VALUE_STRING = 327,            /* VALUE_STRING  */
+    VALUE_INT = 328,               /* VALUE_INT  */
+    VALUE_FLOAT = 329,             /* VALUE_FLOAT  */
+    VALUE_BOOL = 330               /* VALUE_BOOL  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -148,4 +153,4 @@ struct YYLTYPE
 int yyparse (void);
 
 
-#endif /* !YY_YY_YACC_TAB_H_INCLUDED  */
+#endif /* !YY_YY_ROOT_CSC_DB_LEARN_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED  */

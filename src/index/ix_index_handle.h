@@ -24,13 +24,17 @@ static const bool binary_search = false;
 inline int ix_compare(const char *a, const char *b, ColType type, int col_len) {
     switch (type) {
         case TYPE_INT: {
-            int ia = *(int *)a;
-            int ib = *(int *)b;
+            int ia = 0;
+            int ib = 0;
+            memcpy(&ia, a, sizeof(ia));
+            memcpy(&ib, b, sizeof(ib));
             return (ia < ib) ? -1 : ((ia > ib) ? 1 : 0);
         }
         case TYPE_FLOAT: {
-            float fa = *(float *)a;
-            float fb = *(float *)b;
+            float fa = 0.0F;
+            float fb = 0.0F;
+            memcpy(&fa, a, sizeof(fa));
+            memcpy(&fb, b, sizeof(fb));
             return (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);
         }
         case TYPE_STRING:
@@ -79,7 +83,11 @@ class IxNodeHandle {
 
     int get_min_size() { return get_max_size() / 2; }
 
-    int key_at(int i) { return *(int *)get_key(i); }
+    int key_at(int i) {
+        int value = 0;
+        memcpy(&value, get_key(i), sizeof(value));
+        return value;
+    }
 
     /* 得到第i个孩子结点的page_no */
     page_id_t value_at(int i) { return get_rid(i)->page_no; }

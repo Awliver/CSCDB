@@ -19,10 +19,12 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "executor_filter.h"
+#include "executor_subquery_filter.h"
 #include "executor_correlated_filter.h"
 #include "executor_lateral_join.h"
 #include "executor_rename.h"
 #include "executor_limit.h"
+#include "executor_union.h"
 #include "execution_sort.h"
 #include "index/ix.h"
 #include <algorithm>
@@ -59,6 +61,10 @@ const char *help_info = "Supported SQL syntax:\n"
                    "  (precedence: NOT, AND, OR)\n"
                    "condition:\n"
                    "  column op {column | value}\n"
+                   "  column [NOT] LIKE value\n"
+                   "  column [NOT] BETWEEN expr AND expr\n"
+                   "  column [NOT] IN (value [, value ...] | SELECT ...)\n"
+                   "  [NOT] EXISTS (SELECT ...)\n"
                    "column:\n"
                    "  [table_name.]column_name\n"
                    "op:\n"
@@ -183,6 +189,7 @@ std::string join_op_to_string(CompOp op) {
         case OP_GT: return ">";
         case OP_LE: return "<=";
         case OP_GE: return ">=";
+        case OP_LIKE: return " LIKE ";
     }
     return "";
 }
@@ -208,6 +215,10 @@ std::string display_col(const TabCol &col) {
 
 std::string cond_to_string(const Condition &cond) {
     std::ostringstream os;
+    if (cond.kind == ConditionKind::EXISTS_SUBQUERY) return "EXISTS(subquery)";
+    if (cond.kind == ConditionKind::IN_SUBQUERY) {
+        return display_col(cond.lhs_col) + " IN(subquery)";
+    }
     os << display_col(cond.lhs_col) << join_op_to_string(cond.op);
     if (!cond.is_rhs_val) {
         os << display_col(cond.rhs_col);
@@ -294,12 +305,16 @@ void collect_plan_bindings(const std::shared_ptr<Plan> &plan, std::set<std::stri
         collect_plan_bindings(proj->subplan_, bindings);
     } else if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
         collect_plan_bindings(filter->subplan_, bindings);
+    } else if (auto filter = std::dynamic_pointer_cast<SubqueryFilterPlan>(plan)) {
+        collect_plan_bindings(filter->subplan_, bindings);
     } else if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         collect_plan_bindings(sort->subplan_, bindings);
     } else if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
         collect_plan_bindings(limit->subplan_, bindings);
     } else if (auto agg = std::dynamic_pointer_cast<AggPlan>(plan)) {
         collect_plan_bindings(agg->subplan_, bindings);
+    } else if (auto set_op = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        for (const auto &child : set_op->subplans_) collect_plan_bindings(child, bindings);
     } else if (auto rename = std::dynamic_pointer_cast<RenamePlan>(plan)) {
         if (!rename->output_cols_.empty()) bindings.insert(rename->output_cols_.front().tab_name);
     } else if (auto correlated = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
@@ -319,6 +334,22 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
         auto child = make_explain_executor(sm_manager, filter->subplan_, correlated);
         if (child == nullptr) return nullptr;
         return std::make_unique<FilterExecutor>(std::move(child), filter->predicate_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<SubqueryFilterPlan>(plan)) {
+        auto child = make_explain_executor(sm_manager, filter->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        std::vector<std::unique_ptr<AbstractExecutor>> subqueries;
+        std::vector<std::shared_ptr<CorrelatedTupleContext>> contexts;
+        for (const auto &subplan : filter->subquery_plans_) {
+            auto subquery_context = std::make_shared<CorrelatedTupleContext>();
+            auto executor = make_explain_executor(sm_manager, subplan, subquery_context);
+            if (executor == nullptr) return nullptr;
+            subqueries.push_back(std::move(executor));
+            contexts.push_back(std::move(subquery_context));
+        }
+        return std::make_unique<SubqueryFilterExecutor>(
+            std::move(child), filter->predicate_, std::move(subqueries),
+            std::move(contexts));
     }
     if (auto filter = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
         if (correlated == nullptr) return nullptr;
@@ -362,6 +393,16 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
             std::move(child), agg->group_cols_, agg->agg_exprs_,
             agg->having_expr_, agg->output_cols_);
     }
+    if (auto set_op = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        std::vector<std::unique_ptr<AbstractExecutor>> children;
+        for (const auto &subplan : set_op->subplans_) {
+            auto child = make_explain_executor(sm_manager, subplan, correlated);
+            if (child == nullptr) return nullptr;
+            children.push_back(std::move(child));
+        }
+        return std::make_unique<UnionExecutor>(
+            std::move(children), set_op->output_cols_, set_op->all_);
+    }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         auto child = make_explain_executor(sm_manager, sort->subplan_, correlated);
         if (child == nullptr) return nullptr;
@@ -370,17 +411,7 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
                                                   sort->sort_cols_[0].first,
                                                   sort->sort_cols_[0].second);
         }
-        std::vector<std::pair<ColMeta, bool>> columns;
-        for (const auto &[target, desc] : sort->sort_cols_) {
-            auto it = std::find_if(child->cols().begin(), child->cols().end(),
-                                   [&](const ColMeta &col) {
-                                       return col.name == target.col_name &&
-                                              (target.tab_name.empty() || col.tab_name == target.tab_name);
-                                   });
-            if (it == child->cols().end()) throw ColumnNotFoundError(target.col_name);
-            columns.emplace_back(*it, desc);
-        }
-        return std::make_unique<SortExecutor>(std::move(child), columns);
+        return std::make_unique<SortExecutor>(std::move(child), sort->sort_cols_);
     }
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
         auto child = make_explain_executor(sm_manager, limit->subplan_, correlated);
@@ -454,10 +485,7 @@ size_t count_plan_output(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         return materialize_plan_output(sm_manager, plan, outer_rows).size();
     }
     if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
-        if (outer_rows != nullptr) return materialize_plan_output(sm_manager, plan, outer_rows).size();
-        size_t rows = 0;
-        for (const auto &child : union_plan->subplans_) rows += count_plan_output(sm_manager, child);
-        return rows;
+        return materialize_plan_output(sm_manager, plan, outer_rows).size();
     }
     if (outer_rows != nullptr) return materialize_plan_output(sm_manager, plan, outer_rows).size();
     auto executor = make_explain_executor(sm_manager, plan);
@@ -514,6 +542,13 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
                             forced_rows, false, lines, correlated_rows);
         return;
     }
+    if (auto filter = std::dynamic_pointer_cast<SubqueryFilterPlan>(plan)) {
+        lines.push_back(std::string(depth, '\t') + "SubqueryFilter(condition=[" +
+                        predicate_list_to_string(filter->predicate_) + "])");
+        render_explain_plan(sm_manager, filter->subplan_, depth + 1, outer_rows,
+                            forced_rows, false, lines, correlated_rows);
+        return;
+    }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         std::vector<std::string> cols;
         for (const auto &[col, desc] : sort->sort_cols_) {
@@ -541,6 +576,16 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
                         std::to_string(count_plan_output(sm_manager, plan, correlated_rows)) + ")");
         render_explain_plan(sm_manager, agg->subplan_, depth + 1, outer_rows, forced_rows,
                             false, lines, correlated_rows);
+        return;
+    }
+    if (auto set_op = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        lines.push_back(std::string(depth, '\t') +
+                        (set_op->all_ ? "UnionAll(rows=" : "UnionDistinct(rows=") +
+                        std::to_string(count_plan_output(sm_manager, plan, correlated_rows)) + ")");
+        for (const auto &child : set_op->subplans_) {
+            render_explain_plan(sm_manager, child, depth + 1, outer_rows, forced_rows,
+                                false, lines, correlated_rows);
+        }
         return;
     }
     std::string indent(depth, '\t');
@@ -695,9 +740,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
                 ci++;
                 char *p = Tuple->data + col.offset;
                 if (col.type == TYPE_INT) {
-                    cell.int_val = *(int *)p;
+                    cell.int_val = load_unaligned<int>(p);
                 } else if (col.type == TYPE_FLOAT) {
-                    cell.float_val = *(float *)p;
+                    cell.float_val = load_unaligned<float>(p);
                 } else {
                     std::string s((char *)p, col.len);
                     s.resize(strlen(s.c_str()));
@@ -744,9 +789,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             if (nulls != nullptr && column_index < nulls->size() && (*nulls)[column_index]) {
                 col_str = "NULL";
             } else if (col.type == TYPE_INT) {
-                col_str = std::to_string(*(int *)rec_buf);
+                col_str = std::to_string(load_unaligned<int>(rec_buf));
             } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(*(float *)rec_buf);
+                col_str = std::to_string(load_unaligned<float>(rec_buf));
             } else if (col.type == TYPE_STRING) {
                 col_str = std::string((char *)rec_buf, col.len);
                 col_str.resize(strlen(col_str.c_str()));
@@ -895,9 +940,10 @@ void QlManager::run_load(const std::string &file_path, const std::string &tab_na
         for (size_t i = 0; i < tab.cols.size(); ++i) {
             auto &col = tab.cols[i];
             if (col.type == TYPE_INT) {
-                *(int *)(rec.data + col.offset) = std::atoi(fields[i].data);
+                store_unaligned(rec.data + col.offset, std::atoi(fields[i].data));
             } else if (col.type == TYPE_FLOAT) {
-                *(float *)(rec.data + col.offset) = static_cast<float>(std::atof(fields[i].data));
+                const float value = static_cast<float>(std::atof(fields[i].data));
+                store_unaligned(rec.data + col.offset, value);
             } else {
                 size_t cpy = std::min(fields[i].size, static_cast<size_t>(col.len));
                 memcpy(rec.data + col.offset, fields[i].data, cpy);

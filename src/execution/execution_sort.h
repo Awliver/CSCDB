@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <cmath>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -29,12 +31,20 @@ class SortExecutor : public AbstractExecutor {
 
     int compare_single(const char *a, const char *b, const ColMeta &col) {
         if (col.type == TYPE_INT) {
-            int ia = *reinterpret_cast<const int *>(a);
-            int ib = *reinterpret_cast<const int *>(b);
+            int ia = load_unaligned<int>(a);
+            int ib = load_unaligned<int>(b);
             return (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
         } else if (col.type == TYPE_FLOAT) {
-            float fa = *reinterpret_cast<const float *>(a);
-            float fb = *reinterpret_cast<const float *>(b);
+            float fa = load_unaligned<float>(a);
+            float fb = load_unaligned<float>(b);
+            const bool a_nan = std::isnan(fa);
+            const bool b_nan = std::isnan(fb);
+            if (a_nan || b_nan) {
+                if (a_nan && b_nan) return 0;
+                // Give NaN a stable position after every non-NaN value.  The
+                // DESC inversion in compare_records naturally puts it first.
+                return a_nan ? 1 : -1;
+            }
             return (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
         } else {
             return memcmp(a, b, col.len);
@@ -64,11 +74,17 @@ class SortExecutor : public AbstractExecutor {
     SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
         prev_ = std::move(prev);
         auto &input_cols = prev_->cols();
-        auto it = std::find_if(input_cols.begin(), input_cols.end(),
-            [&](const ColMeta &c) {
-                return c.name == sel_cols.col_name &&
-                       (sel_cols.tab_name.empty() || c.tab_name == sel_cols.tab_name);
-            });
+        auto it = input_cols.end();
+        if (sel_cols.output_index >= 0 &&
+            static_cast<size_t>(sel_cols.output_index) < input_cols.size()) {
+            it = input_cols.begin() + sel_cols.output_index;
+        } else {
+            it = std::find_if(input_cols.begin(), input_cols.end(),
+                [&](const ColMeta &c) {
+                    return c.name == sel_cols.col_name &&
+                           (sel_cols.tab_name.empty() || c.tab_name == sel_cols.tab_name);
+                });
+        }
         if (it == input_cols.end()) throw ColumnNotFoundError(sel_cols.col_name);
         sort_cols_.emplace_back(*it, is_desc);
         sort_col_indexes_.push_back(static_cast<size_t>(it - input_cols.begin()));
@@ -85,6 +101,29 @@ class SortExecutor : public AbstractExecutor {
                 return col.name == sort_col.name && col.tab_name == sort_col.tab_name;
             });
             if (it == input_cols.end()) throw ColumnNotFoundError(sort_col.name);
+            sort_col_indexes_.push_back(static_cast<size_t>(it - input_cols.begin()));
+        }
+        idx_ = 0;
+    }
+
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev,
+                 const std::vector<std::pair<TabCol, bool>> &sort_cols) {
+        prev_ = std::move(prev);
+        const auto &input_cols = prev_->cols();
+        for (const auto &[target, is_desc] : sort_cols) {
+            auto it = input_cols.end();
+            if (target.output_index >= 0 &&
+                static_cast<size_t>(target.output_index) < input_cols.size()) {
+                it = input_cols.begin() + target.output_index;
+            } else {
+                it = std::find_if(input_cols.begin(), input_cols.end(),
+                    [&](const ColMeta &col) {
+                        return col.name == target.col_name &&
+                               (target.tab_name.empty() || col.tab_name == target.tab_name);
+                    });
+            }
+            if (it == input_cols.end()) throw ColumnNotFoundError(target.col_name);
+            sort_cols_.emplace_back(*it, is_desc);
             sort_col_indexes_.push_back(static_cast<size_t>(it - input_cols.begin()));
         }
         idx_ = 0;

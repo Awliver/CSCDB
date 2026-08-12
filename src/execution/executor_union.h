@@ -4,7 +4,9 @@ RMDB is licensed under Mulan PSL v2. */
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <set>
 #include <vector>
@@ -24,10 +26,11 @@ class UnionExecutor : public AbstractExecutor {
     };
     std::vector<BufferedRow> rows_;
     size_t idx_ = 0;
+    bool all_ = false;
 
     void write_value(char *dest, const ColMeta &dst_col, const char *src, const ColMeta &src_col) {
         if (dst_col.type == TYPE_FLOAT && src_col.type == TYPE_INT) {
-            float v = static_cast<float>(*reinterpret_cast<const int *>(src));
+            float v = static_cast<float>(load_unaligned<int>(src));
             memcpy(dest, &v, sizeof(float));
         } else if (dst_col.type == TYPE_INT && src_col.type == TYPE_INT) {
             memcpy(dest, src, sizeof(int));
@@ -42,9 +45,14 @@ class UnionExecutor : public AbstractExecutor {
     }
 
    public:
-    UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> children, std::vector<ColMeta> output_cols) {
+    UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> children,
+                  std::vector<ColMeta> output_cols, bool all = false) {
         children_ = std::move(children);
         cols_ = std::move(output_cols);
+        all_ = all;
+        if (children_.size() != 2 || cols_.empty()) {
+            throw InternalError("UnionExecutor requires two non-empty query inputs");
+        }
         len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
     }
 
@@ -75,8 +83,17 @@ class UnionExecutor : public AbstractExecutor {
                                 src->data + child_cols[i].offset, child_cols[i]);
                 }
                 std::string key(out->data, len_);
+                // SQL set equality is numeric rather than bitwise.  Canonical
+                // keys make +0/-0 equal and collapse NaN payload variants.
+                for (const auto &col : cols_) {
+                    if (col.type != TYPE_FLOAT) continue;
+                    float value = load_unaligned<float>(out->data + col.offset);
+                    if (value == 0.0F) value = 0.0F;
+                    else if (std::isnan(value)) value = std::numeric_limits<float>::quiet_NaN();
+                    memcpy(key.data() + col.offset, &value, sizeof(value));
+                }
                 for (bool is_null : out_nulls) key.push_back(is_null ? '\1' : '\0');
-                if (seen.insert(key).second) {
+                if (all_ || seen.insert(key).second) {
                     rows_.push_back({std::move(out), std::move(out_nulls)});
                 }
             }

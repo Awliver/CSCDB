@@ -257,10 +257,19 @@ std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan) {
         for (const auto &col : rename->output_cols_) cols.push_back({col.tab_name, col.name});
         return cols;
     }
+    if (auto set_op = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        std::vector<TabCol> cols;
+        cols.reserve(set_op->output_cols_.size());
+        for (const auto &col : set_op->output_cols_) cols.push_back({col.tab_name, col.name});
+        return cols;
+    }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         return plan_output_cols(sort->subplan_);
     }
     if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        return plan_output_cols(filter->subplan_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<SubqueryFilterPlan>(plan)) {
         return plan_output_cols(filter->subplan_);
     }
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
@@ -335,11 +344,21 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     auto condition_bindings = [](const ConditionExprPtr &expr) {
         BindingSet result;
         visit_bool_atoms(expr, [&](const Condition &cond) {
+            if (cond.kind == ConditionKind::EXISTS_SUBQUERY) return;
             result.insert(cond.lhs_col.tab_name);
-            if (!cond.is_rhs_val) result.insert(cond.rhs_col.tab_name);
+            if (cond.kind == ConditionKind::COMPARISON && !cond.is_rhs_val) {
+                result.insert(cond.rhs_col.tab_name);
+            }
         });
         result.erase("");
         return result;
+    };
+    auto contains_subquery = [](const ConditionExprPtr &expr) {
+        bool found = false;
+        visit_bool_atoms(expr, [&](const Condition &cond) {
+            found = found || cond.kind != ConditionKind::COMPARISON;
+        });
+        return found;
     };
     auto node_bindings = [](const std::shared_ptr<AnalyzedFrom> &node) {
         BindingSet result;
@@ -350,7 +369,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     std::function<bool(const std::shared_ptr<AnalyzedFrom> &)> is_inner_group;
     is_inner_group = [&](const std::shared_ptr<AnalyzedFrom> &node) {
         if (node->is_table) return true;
-        if (node->is_lateral_subquery) return false;
+        if (node->is_subquery) return false;
         if (node->natural || node->lateral) return false;
         if (node->join_type != INNER_JOIN && node->join_type != CROSS_JOIN) return false;
         return is_inner_group(node->left) && is_inner_group(node->right);
@@ -371,7 +390,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     */
     std::function<void(const std::shared_ptr<AnalyzedFrom> &)> prepare_on; 
     prepare_on = [&](const std::shared_ptr<AnalyzedFrom> &node) {
-        if (node->is_table || node->is_lateral_subquery) return; // 叶节点返回
+        if (node->is_table || node->is_subquery) return; // 叶节点返回
         prepare_on(node->left); // 递归处理左子树
         prepare_on(node->right); // 递归处理右子树
         const auto left_names = node_bindings(node->left);
@@ -404,7 +423,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     */
     std::function<bool(const std::shared_ptr<AnalyzedFrom> &, const std::string &)> where_pushable;
     where_pushable = [&](const std::shared_ptr<AnalyzedFrom> &node, const std::string &binding) {
-        if (node->is_table || node->is_lateral_subquery) {
+        if (node->is_table || node->is_subquery) {
             return node->table.binding_name == binding;
         }
         const auto left_names = node_bindings(node->left);
@@ -424,6 +443,10 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     std::vector<ConditionExprPtr> where_conjuncts;
     split_top_level_and(query->where_expr, where_conjuncts);
     for (const auto &predicate : where_conjuncts) { // 最终分类
+        if (contains_subquery(predicate)) {
+            post_join_filters.push_back(predicate);
+            continue;
+        }
         const auto names = condition_bindings(predicate);
         if (names.size() == 1 && where_pushable(query->from, *names.begin())) {
             scan_filters[*names.begin()].push_back(predicate); // 只涉及到一张表，且路径安全，则可下推
@@ -451,11 +474,31 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     auto require_col = [&](const TabCol &col) {
         if (!col.tab_name.empty() && !col.col_name.empty()) required_cols[col.tab_name].insert(col.col_name);
     };
-    auto require_predicate = [&](const ConditionExprPtr &expr) {
+    std::function<void(const ConditionExprPtr &)> require_predicate;
+    std::function<void(const std::shared_ptr<Query> &)> require_correlated_query;
+    require_predicate = [&](const ConditionExprPtr &expr) {
         visit_bool_atoms(expr, [&](const Condition &cond) {
-            require_col(cond.lhs_col);
-            if (!cond.is_rhs_val) require_col(cond.rhs_col);
+            if (cond.kind != ConditionKind::EXISTS_SUBQUERY) require_col(cond.lhs_col);
+            if (cond.kind == ConditionKind::COMPARISON && !cond.is_rhs_val) {
+                require_col(cond.rhs_col);
+            }
+            // EXISTS has no outer lhs column of its own, while both EXISTS
+            // and IN may reference outer columns from the subquery's
+            // correlated filter.  Those columns must survive projection
+            // pruning on the outer scan.  Without this recursive dependency,
+            // a complex predicate that otherwise needs only name/score can
+            // prune id before a.id = outer.id is evaluated at runtime.
+            if (cond.subquery != nullptr) {
+                require_correlated_query(cond.subquery);
+            }
         });
+    };
+    require_correlated_query = [&](const std::shared_ptr<Query> &subquery) {
+        if (subquery == nullptr) return;
+        require_predicate(subquery->correlated_expr);
+        require_correlated_query(subquery->group_child);
+        require_correlated_query(subquery->union_left);
+        require_correlated_query(subquery->union_right);
     };
     for (const auto &col : query->cols) require_col(col);
     for (const auto &col : query->group_by_cols) require_col(col);
@@ -472,8 +515,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     std::function<void(const std::shared_ptr<AnalyzedFrom> &)> require_natural_sources;
     require_natural_sources = [&](const std::shared_ptr<AnalyzedFrom> &node) {
         if (node == nullptr || node->is_table) return;
-        if (node->is_lateral_subquery) {
-            require_predicate(node->subquery->correlated_expr);
+        if (node->is_subquery) {
+            require_correlated_query(node->subquery);
             return;
         }
         for (const auto &merged : node->coalesced_cols) {
@@ -539,8 +582,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     std::function<BuildResult(const std::shared_ptr<AnalyzedFrom> &)> build;
     build = [&](const std::shared_ptr<AnalyzedFrom> &node) -> BuildResult {
         if (node->is_table) return make_scan(node->table);
-        if (node->is_lateral_subquery) {
-            std::shared_ptr<Plan> plan = generate_select_plan(node->subquery, context);
+        if (node->is_subquery) {
+            std::shared_ptr<Plan> plan = generate_query_plan(node->subquery, context);
             plan = std::make_shared<RenamePlan>(std::move(plan), node->output_cols);
             auto local_predicate = combine_with_and(scan_filters[node->table.binding_name]);
             if (local_predicate != nullptr) {
@@ -696,8 +739,23 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
 
     auto result = build(query->from);
     if (!post_join_filters.empty()) {
-        result.plan = std::make_shared<FilterPlan>(T_Filter, std::move(result.plan),
-                                                   combine_with_and(post_join_filters));
+        auto predicate = combine_with_and(post_join_filters);
+        if (contains_subquery(predicate)) {
+            std::vector<std::shared_ptr<Plan>> subquery_plans;
+            visit_bool_atoms(predicate, [&](const Condition &condition) {
+                if (condition.kind == ConditionKind::COMPARISON) return;
+                if (condition.subquery == nullptr) {
+                    throw InternalError("Predicate subquery was not analyzed");
+                }
+                subquery_plans.push_back(generate_query_plan(condition.subquery, context));
+            });
+            result.plan = std::make_shared<SubqueryFilterPlan>(
+                std::move(result.plan), std::move(predicate),
+                std::move(subquery_plans));
+        } else {
+            result.plan = std::make_shared<FilterPlan>(T_Filter, std::move(result.plan),
+                                                       std::move(predicate));
+        }
     }
     if (query->correlated_expr != nullptr) {
         result.plan = std::make_shared<CorrelatedFilterPlan>(std::move(result.plan),
@@ -795,6 +853,41 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     return plannerRoot;
 }
 
+std::shared_ptr<Plan> Planner::generate_query_plan(std::shared_ptr<Query> query, Context *context) {
+    if (std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
+        return generate_select_plan(std::move(query), context);
+    }
+
+    std::shared_ptr<Plan> plan;
+    if (std::dynamic_pointer_cast<ast::UnionStmt>(query->parse)) {
+        if (query->union_left == nullptr || query->union_right == nullptr) {
+            throw InternalError("Invalid UNION query tree");
+        }
+        plan = std::make_shared<UnionPlan>(
+            T_Union,
+            generate_query_plan(query->union_left, context),
+            generate_query_plan(query->union_right, context),
+            query->union_output_cols, query->union_all);
+    } else if (std::dynamic_pointer_cast<ast::QueryGroup>(query->parse)) {
+        if (query->group_child == nullptr) throw InternalError("Invalid parenthesized query");
+        plan = generate_query_plan(query->group_child, context);
+    } else {
+        throw InternalError("Expected a query expression");
+    }
+
+    if (!query->orders.empty()) {
+        std::vector<std::pair<TabCol, bool>> sort_cols;
+        for (const auto &order : query->orders) {
+            sort_cols.emplace_back(order.first, order.second == ast::OrderBy_DESC);
+        }
+        plan = std::make_shared<SortPlan>(T_Sort, std::move(plan), std::move(sort_cols));
+    }
+    if (query->has_limit) {
+        plan = std::make_shared<LimitPlan>(T_Limit, std::move(plan), query->limit_count);
+    }
+    return plan;
+}
+
 // 生成DDL语句和DML语句的查询执行计划
 std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context *context)
 {
@@ -878,32 +971,11 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         plannerRoot = std::make_shared<DMLPlan>(T_Update, table_scan_executors, x->tab_name,
                                                 std::vector<Value>(), query->set_clauses);
     } else if (auto x = std::dynamic_pointer_cast<ast::ExplainStmt>(query->parse)) {
-        auto select_plan = generate_select_plan(query->explain_query, context);
+        auto select_plan = generate_query_plan(query->explain_query, context);
         plannerRoot = std::make_shared<ExplainPlan>(select_plan, query->explain_query, query->explain_analyze);
-    } else if (auto x = std::dynamic_pointer_cast<ast::UnionStmt>(query->parse)) {
-        std::vector<std::shared_ptr<Plan>> subplans;
-        for (auto &child : query->union_queries) {
-            subplans.push_back(generate_select_plan(child, context));
-        }
-        std::shared_ptr<Plan> union_plan =
-            std::make_shared<UnionPlan>(T_Union, std::move(subplans), query->union_output_cols);
-        if (!query->orders.empty()) {
-            std::vector<std::pair<TabCol, bool>> sort_cols;
-            for (auto &order : query->orders) {
-                sort_cols.emplace_back(order.first, order.second == ast::OrderBy_DESC);
-            }
-            union_plan = std::make_shared<SortPlan>(T_Sort, std::move(union_plan), sort_cols);
-        }
-        if (query->has_limit) {
-            union_plan = std::make_shared<LimitPlan>(T_Limit, std::move(union_plan), query->limit_count);
-        }
-        plannerRoot = std::make_shared<DMLPlan>(T_select, union_plan, std::string(), std::vector<Value>(),
-                                                std::vector<SetClause>());
-    } else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
-
-        // 生成select语句的查询执行计划
-        std::shared_ptr<Plan> projection = generate_select_plan(std::move(query), context);
-        plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
+    } else if (std::dynamic_pointer_cast<ast::QueryExpr>(query->parse)) {
+        std::shared_ptr<Plan> query_plan = generate_query_plan(std::move(query), context);
+        plannerRoot = std::make_shared<DMLPlan>(T_select, query_plan, std::string(), std::vector<Value>(),
                                                 std::vector<SetClause>());
     } else {
         throw InternalError("Unexpected AST root");

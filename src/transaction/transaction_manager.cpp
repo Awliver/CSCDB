@@ -1072,6 +1072,9 @@ bool TransactionManager::is_ser(Transaction *txn) {
 }
 
 static bool ser_cmp(const char *a, const char *b, int len, ColType type, CompOp op) {
+    if (op == OP_LIKE) {
+        return type == TYPE_STRING && sql_like_match(a, len, b, len);
+    }
     int cmp;
     if (type == TYPE_INT) {
         int ia = *reinterpret_cast<const int *>(a), ib = *reinterpret_cast<const int *>(b);
@@ -1089,6 +1092,7 @@ static bool ser_cmp(const char *a, const char *b, int len, ColType type, CompOp 
         case OP_GT: return cmp > 0;
         case OP_LE: return cmp <= 0;
         case OP_GE: return cmp >= 0;
+        case OP_LIKE: return false;
     }
     return false;
 }

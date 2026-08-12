@@ -220,15 +220,15 @@ class UpdateExecutor : public AbstractExecutor {
                         const auto &p = patches[0];
                         if (p.type == TYPE_INT && p.len == (int)sizeof(int) &&
                             (int)p.abs_value.size() >= p.len) {
-                            int o = *reinterpret_cast<const int *>(visible.data() + p.offset);
-                            int n = *reinterpret_cast<const int *>(p.abs_value.data());
+                            int o = load_unaligned<int>(visible.data() + p.offset);
+                            int n = load_unaligned<int>(p.abs_value.data());
                             write_result = context_->txn_mgr_->mvcc_write_col_delta(
                                 context_->txn_, tab_name_, rid, visible.data(), record_size_,
                                 p.offset, TYPE_INT, 0.f, n - o, &mvcc_effective);
                         } else if (p.type == TYPE_FLOAT && p.len == (int)sizeof(float) &&
                                    (int)p.abs_value.size() >= p.len) {
-                            float o = *reinterpret_cast<const float *>(visible.data() + p.offset);
-                            float n = *reinterpret_cast<const float *>(p.abs_value.data());
+                            float o = load_unaligned<float>(visible.data() + p.offset);
+                            float n = load_unaligned<float>(p.abs_value.data());
                             write_result = context_->txn_mgr_->mvcc_write_col_delta(
                                 context_->txn_, tab_name_, rid, visible.data(), record_size_,
                                 p.offset, TYPE_FLOAT, n - o, 0, &mvcc_effective);

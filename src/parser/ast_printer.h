@@ -58,6 +58,7 @@ private:
                 {SV_OP_GT, ">"},
                 {SV_OP_LE, "<="},
                 {SV_OP_GE, ">="},
+                {SV_OP_LIKE, "LIKE"},
         };
         return m.at(op);
     }
@@ -159,6 +160,12 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<NotExpr>(node)) {
             std::cout << "NOT\n";
             print_node(x->child, offset);
+        } else if (auto x = std::dynamic_pointer_cast<SubqueryPredicate>(node)) {
+            std::cout << (x->type == SubqueryPredicateType::EXISTS
+                              ? "EXISTS\n"
+                              : "IN_SUBQUERY\n");
+            if (x->lhs != nullptr) print_node(x->lhs, offset);
+            print_node(x->subquery, offset);
         } else if (auto x = std::dynamic_pointer_cast<InsertStmt>(node)) {
             std::cout << "INSERT\n";
             print_val(x->tab_name, offset);
@@ -176,6 +183,10 @@ private:
             std::cout << "TABLE_REF\n";
             print_val(x->tab_name, offset);
             if (!x->alias.empty()) print_val("AS " + x->alias, offset);
+        } else if (auto x = std::dynamic_pointer_cast<DerivedTableRef>(node)) {
+            std::cout << "DERIVED_TABLE_REF\n";
+            print_val("AS " + x->alias, offset);
+            print_node(x->subquery, offset);
         } else if (auto x = std::dynamic_pointer_cast<LateralRef>(node)) {
             std::cout << "LATERAL_REF\n";
             print_val("AS " + x->alias, offset);
@@ -208,6 +219,16 @@ private:
                 print_val("HAVING", offset);
                 print_node(x->having_expr, offset + 2);
             }
+        } else if (auto x = std::dynamic_pointer_cast<QueryGroup>(node)) {
+            std::cout << "QUERY_GROUP\n";
+            print_node(x->child, offset);
+        } else if (auto x = std::dynamic_pointer_cast<UnionStmt>(node)) {
+            std::cout << (x->all ? "UNION_ALL\n" : "UNION_DISTINCT\n");
+            print_node(x->left, offset);
+            print_node(x->right, offset);
+        } else if (auto x = std::dynamic_pointer_cast<ExplainStmt>(node)) {
+            std::cout << (x->analyze ? "EXPLAIN_ANALYZE\n" : "EXPLAIN\n");
+            print_node(x->query, offset);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

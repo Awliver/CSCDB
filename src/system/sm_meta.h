@@ -23,10 +23,10 @@ See the Mulan PSL v2 for more details. */
 struct ColMeta {
     std::string tab_name;   // 字段所属表名称
     std::string name;       // 字段名称
-    ColType type;           // 字段类型
-    int len;                // 字段长度
-    int offset;             // 字段位于记录中的偏移量
-    bool index;             /** unused */
+    ColType type = TYPE_INT;  // Column type
+    int len = 0;              // Column length
+    int offset = 0;           // Column offset within the record
+    bool index = false;       /** unused */
 
     friend std::ostream &operator<<(std::ostream &os, const ColMeta &col) {
         // ColMeta中有各个基本类型的变量，然后调用重载的这些变量的操作符<<（具体实现逻辑在defs.h）
@@ -42,8 +42,8 @@ struct ColMeta {
 /* 索引元数据 */
 struct IndexMeta {
     std::string tab_name;           // 索引所属表名称
-    int col_tot_len;                // 索引字段长度总和
-    int col_num;                    // 索引字段数量
+    int col_tot_len = 0;            // Total length of indexed columns
+    int col_num = 0;                // Number of indexed columns
     std::vector<ColMeta> cols;      // 索引包含的字段
 
     friend std::ostream &operator<<(std::ostream &os, const IndexMeta &index) {

@@ -165,8 +165,9 @@ int main() {
         assert(as_atom(join->on_expr) != nullptr);
         auto lateral = std::dynamic_pointer_cast<ast::LateralRef>(join->right);
         assert(lateral != nullptr && lateral->alias == "x");
-        assert(lateral->subquery != nullptr);
-        assert(as_atom(lateral->subquery->where_expr) != nullptr);
+        auto lateral_select = std::dynamic_pointer_cast<ast::SelectStmt>(lateral->subquery);
+        assert(lateral_select != nullptr);
+        assert(as_atom(lateral_select->where_expr) != nullptr);
     }
 
     {
@@ -266,6 +267,92 @@ int main() {
         assert(select->where_expr == nullptr && select->having_expr == nullptr);
     }
 
+    {
+        auto select = parse_select("select * from t where name not like 'A%';");
+        auto negated = std::dynamic_pointer_cast<ast::NotExpr>(select->where_expr);
+        assert(negated != nullptr);
+        assert(as_atom(negated->child)->op == ast::SV_OP_LIKE);
+    }
+
+    {
+        auto select = parse_select(
+            "select * from t where score between 10 and 20 and id in (1,3,5);");
+        auto root = as_logical(select->where_expr, ast::LogicalOp::AND);
+        auto between = as_logical(root->left, ast::LogicalOp::AND);
+        assert(as_atom(between->left)->op == ast::SV_OP_GE);
+        assert(as_atom(between->right)->op == ast::SV_OP_LE);
+        auto in_list = as_logical(root->right, ast::LogicalOp::OR);
+        assert(as_logical(in_list->left, ast::LogicalOp::OR) != nullptr);
+        assert(as_atom(in_list->right)->op == ast::SV_OP_EQ);
+    }
+
+    {
+        auto select = parse_select(
+            "select * from t where exists (select id from u where u.id=t.id) "
+            "or id in (select id from v);");
+        auto root = as_logical(select->where_expr, ast::LogicalOp::OR);
+        auto exists = std::dynamic_pointer_cast<ast::SubqueryPredicate>(root->left);
+        auto in_subquery = std::dynamic_pointer_cast<ast::SubqueryPredicate>(root->right);
+        assert(exists != nullptr &&
+               exists->type == ast::SubqueryPredicateType::EXISTS &&
+               exists->lhs == nullptr);
+        assert(in_subquery != nullptr &&
+               in_subquery->type == ast::SubqueryPredicateType::IN &&
+               in_subquery->lhs->col_name == "id");
+    }
+
+    {
+        ast::parse_tree.reset();
+        YY_BUFFER_STATE buf = yy_scan_string(
+            "select v from a union all select v from b union distinct "
+            "select v from c order by 1 desc limit 2;");
+        assert(yyparse() == 0);
+        auto root = std::dynamic_pointer_cast<ast::UnionStmt>(ast::parse_tree);
+        assert(root != nullptr && !root->all);
+        auto left = std::dynamic_pointer_cast<ast::UnionStmt>(root->left);
+        assert(left != nullptr && left->all);
+        assert(root->orders.size() == 1 && root->orders[0]->is_ordinal &&
+               root->orders[0]->ordinal == 1);
+        assert(root->orders[0]->orderby_dir == ast::OrderBy_DESC);
+        assert(root->has_limit && root->limit_count == 2);
+        yy_delete_buffer(buf);
+    }
+
+    {
+        ast::parse_tree.reset();
+        YY_BUFFER_STATE buf = yy_scan_string(
+            "select v from a union all (select v from b union select v from c);");
+        assert(yyparse() == 0);
+        auto root = std::dynamic_pointer_cast<ast::UnionStmt>(ast::parse_tree);
+        assert(root != nullptr && root->all);
+        auto right_group = std::dynamic_pointer_cast<ast::QueryGroup>(root->right);
+        assert(right_group != nullptr);
+        auto right_union = std::dynamic_pointer_cast<ast::UnionStmt>(right_group->child);
+        assert(right_union != nullptr && !right_union->all);
+        yy_delete_buffer(buf);
+    }
+
+    {
+        auto select = parse_select(
+            "select d.v from (select v from a union all select v from b) d "
+            "where d.v > 0;");
+        auto derived = std::dynamic_pointer_cast<ast::DerivedTableRef>(select->from);
+        assert(derived != nullptr && derived->alias == "d");
+        assert(std::dynamic_pointer_cast<ast::UnionStmt>(derived->subquery) != nullptr);
+    }
+
+    {
+        auto select = parse_select(
+            "select a.v,x.v from a cross join lateral "
+            "(select v from b where b.v=a.v union all "
+            "select v from c where c.v=a.v) x;");
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->lateral && join->type == CROSS_JOIN);
+        auto lateral = std::dynamic_pointer_cast<ast::LateralRef>(join->right);
+        assert(lateral != nullptr && lateral->alias == "x");
+        assert(std::dynamic_pointer_cast<ast::UnionStmt>(lateral->subquery) != nullptr);
+    }
+
     auto assert_parse_error = [](const std::string &sql) {
         ast::parse_tree.reset();
         YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
@@ -277,6 +364,8 @@ int main() {
     assert_parse_error("select * from a semi join b;");
     assert_parse_error("select * from a cross join lateral (select * from b);");
     assert_parse_error("select * from a left join lateral (select * from b) x on false;");
+    assert_parse_error("select v from a union all distinct select v from b;");
+    assert_parse_error("select v from a order by v union all select v from b;");
 
     ast::parse_tree.reset();
     return 0;

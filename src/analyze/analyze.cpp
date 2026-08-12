@@ -69,6 +69,8 @@ IntFloatRewrite rewrite_int_col_float_val(Condition &cond) {
             cond.op = OP_GE;
             cond.rhs_val.set_int(fl + 1);
             return IntFloatRewrite::CONVERTED;
+        case OP_LIKE:
+            return IntFloatRewrite::ALWAYS_FALSE;
     }
     return IntFloatRewrite::ALWAYS_FALSE;
 }
@@ -125,57 +127,15 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     if (auto e = std::dynamic_pointer_cast<ast::ExplainStmt>(parse))
     {
         query->explain_analyze = e->analyze;
-        query->explain_query = do_analyze(e->select);
+        query->explain_query = do_analyze(e->query);
+    }
+    else if (auto group = std::dynamic_pointer_cast<ast::QueryGroup>(parse))
+    {
+        query = analyze_query_group(group, nullptr);
     }
     else if (auto u = std::dynamic_pointer_cast<ast::UnionStmt>(parse))
     {
-        if (u->selects.size() < 2) {
-            throw InternalError("failure");
-        }
-        query->union_alias = u->alias;
-        for (auto &sel : u->selects) {
-            auto child = do_analyze(sel);
-            query->union_queries.push_back(child);
-        }
-
-        std::vector<ColMeta> common_cols = infer_select_output_cols(query->union_queries[0]);
-        if (common_cols.empty()) throw InternalError("failure");
-        for (size_t i = 1; i < query->union_queries.size(); i++) {
-            auto cols = infer_select_output_cols(query->union_queries[i]);
-            if (cols.size() != common_cols.size()) {
-                throw InternalError("failure");
-            }
-            for (size_t j = 0; j < common_cols.size(); j++) {
-                common_cols[j] = promote_union_col(common_cols[j], cols[j]);
-            }
-        }
-
-        int offset = 0;
-        for (auto &col : common_cols) {
-            col.tab_name = query->union_alias;
-            col.offset = offset;
-            offset += col.len;
-            query->union_output_cols.push_back(col);
-            query->cols.push_back({query->union_alias, col.name});
-            query->sel_captions.push_back(col.name);
-        }
-
-        for (auto &sv_order : u->orders) {
-            TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
-            bool found = false;
-            for (auto &col : query->union_output_cols) {
-                if (col.name == order_col.col_name &&
-                    (order_col.tab_name.empty() || order_col.tab_name == query->union_alias)) {
-                    found = true;
-                    order_col.tab_name = query->union_alias;
-                    break;
-                }
-            }
-            if (!found) throw InternalError("failure");
-            query->orders.emplace_back(order_col, sv_order->orderby_dir);
-        }
-        query->has_limit = u->has_limit;
-        query->limit_count = u->limit_count;
+        query = analyze_union_expr(u, nullptr);
     }
     else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
@@ -229,33 +189,54 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 
         if (!x->orders.empty()) {
             for (auto &sv_order : x->orders) {
-                TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
-                if (!order_col.tab_name.empty()) {
-                    order_col = resolve_column(from_result.scope, std::move(order_col));
+                TabCol order_col;
+                if (sv_order->is_ordinal) {
+                    if (sv_order->ordinal <= 0) {
+                        throw InternalError("ORDER BY position is out of range");
+                    }
+                    size_t ordinal = static_cast<size_t>(sv_order->ordinal);
+                    if (ordinal <= query->cols.size()) {
+                        order_col = query->cols[ordinal - 1];
+                    } else {
+                        size_t position = query->cols.size();
+                        bool found = false;
+                        for (const auto &agg : query->aggs) {
+                            if (!agg.in_output) continue;
+                            if (++position != ordinal) continue;
+                            order_col = {agg.is_star ? "" : agg.col.tab_name,
+                                         agg.alias.empty() ? agg.to_string() : agg.alias};
+                            found = true;
+                            break;
+                        }
+                        if (!found) throw InternalError("ORDER BY position is out of range");
+                    }
+                } else {
+                    order_col = {.tab_name = sv_order->cols->tab_name,
+                                 .col_name = sv_order->cols->col_name};
+                    if (!order_col.tab_name.empty()) {
+                        order_col = resolve_column(from_result.scope, std::move(order_col));
+                    }
+                    order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
+                                                     query->aggs, from_result.scope.output_cols);
                 }
-                order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
-                                                 query->aggs, from_result.scope.output_cols);
                 query->orders.emplace_back(order_col, sv_order->orderby_dir);
             }
         } else if (x->order) {
-            TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
-            if (!order_col.tab_name.empty()) {
-                order_col = resolve_column(from_result.scope, std::move(order_col));
-            }
-            order_col = resolve_order_column(order_col, query->cols, query->group_by_cols,
-                                             query->aggs, from_result.scope.output_cols);
-            query->orders.emplace_back(order_col, x->order->orderby_dir);
+            throw InternalError("inconsistent ORDER BY representation");
         }
 
         query->has_limit = x->has_limit || x->limit >= 0;
         query->limit_count = x->has_limit ? x->limit_count : (x->limit >= 0 ? x->limit : 0);
         query->limit = query->has_limit ? query->limit_count : x->limit;
+        if (query->has_limit && query->limit_count < 0) {
+            throw InternalError("LIMIT must not be negative");
+        }
 
         for (auto &sel_col : query->cols) {
             query->sel_captions.push_back(sel_col.alias.empty() ? sel_col.col_name : sel_col.alias);
         }
 
-        query->where_expr = analyze_conditions(x->where_expr, from_result.scope);
+        query->where_expr = analyze_conditions(x->where_expr, from_result.scope, true);
         check_where_no_aggregate(x->where_expr);
 } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
     // 处理 SET 子句
@@ -409,6 +390,149 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     return query;
 }
 
+std::shared_ptr<Query> Analyze::analyze_correlated_select(
+    const std::shared_ptr<ast::SelectStmt> &select,
+    const AnalyzeScope &outer_scope) {
+    if (select == nullptr) throw InternalError("Invalid correlated SELECT");
+    // Predicate subqueries and LATERAL operands share local-first name
+    // resolution.  The wrapper is internal only; its alias never enters the
+    // surrounding row type.
+    auto wrapper = std::make_shared<ast::LateralRef>(
+        select, "\x1f" "correlated_query");
+    auto analyzed = analyze_lateral_ref(wrapper, &outer_scope);
+    if (analyzed.node == nullptr || analyzed.node->subquery == nullptr) {
+        throw InternalError("Failed to analyze correlated SELECT");
+    }
+    return analyzed.node->subquery;
+}
+
+std::shared_ptr<Query> Analyze::analyze_query_expr(
+    const std::shared_ptr<ast::QueryExpr> &expr,
+    const AnalyzeScope *correlation_scope) {
+    if (expr == nullptr) throw InternalError("Invalid query expression");
+    if (correlation_scope == nullptr) return do_analyze(expr);
+
+    if (auto select = std::dynamic_pointer_cast<ast::SelectStmt>(expr)) {
+        return analyze_correlated_select(select, *correlation_scope);
+    }
+    if (auto group = std::dynamic_pointer_cast<ast::QueryGroup>(expr)) {
+        return analyze_query_group(group, correlation_scope);
+    }
+    if (auto set_op = std::dynamic_pointer_cast<ast::UnionStmt>(expr)) {
+        return analyze_union_expr(set_op, correlation_scope);
+    }
+    throw InternalError("Expected a query expression");
+}
+
+std::shared_ptr<Query> Analyze::analyze_query_group(
+    const std::shared_ptr<ast::QueryGroup> &group,
+    const AnalyzeScope *correlation_scope) {
+    if (group == nullptr || group->child == nullptr) {
+        throw InternalError("Invalid parenthesized query");
+    }
+    auto query = std::make_shared<Query>();
+    query->group_child = analyze_query_expr(group->child, correlation_scope);
+    query->output_cols = query->group_child->output_cols;
+    for (auto &sv_order : group->orders) {
+        const size_t column_count = query->output_cols.size();
+        size_t index = column_count;
+        if (sv_order->is_ordinal) {
+            if (sv_order->ordinal <= 0 ||
+                static_cast<size_t>(sv_order->ordinal) > column_count) {
+                throw InternalError("ORDER BY position is out of range");
+            }
+            index = static_cast<size_t>(sv_order->ordinal - 1);
+        } else {
+            if (!sv_order->cols->tab_name.empty()) {
+                throw InternalError("query ORDER BY cannot use a table qualifier");
+            }
+            size_t matches = 0;
+            for (size_t i = 0; i < column_count; ++i) {
+                if (query->output_cols[i].name == sv_order->cols->col_name) {
+                    index = i;
+                    ++matches;
+                }
+            }
+            if (matches == 0) throw ColumnNotFoundError(sv_order->cols->col_name);
+            if (matches > 1) throw AmbiguousColumnError(sv_order->cols->col_name);
+        }
+        TabCol order_col{"", query->output_cols[index].name};
+        order_col.output_index = static_cast<int>(index);
+        query->orders.emplace_back(std::move(order_col), sv_order->orderby_dir);
+    }
+    query->has_limit = group->has_limit;
+    query->limit_count = group->limit_count;
+    query->limit = group->has_limit ? group->limit_count : -1;
+    if (query->has_limit && query->limit_count < 0) {
+        throw InternalError("LIMIT must not be negative");
+    }
+    query->parse = group;
+    return query;
+}
+
+std::shared_ptr<Query> Analyze::analyze_union_expr(
+    const std::shared_ptr<ast::UnionStmt> &set_op,
+    const AnalyzeScope *correlation_scope) {
+    if (set_op == nullptr || set_op->left == nullptr || set_op->right == nullptr) {
+        throw InternalError("Invalid UNION query tree");
+    }
+    auto query = std::make_shared<Query>();
+    query->union_left = analyze_query_expr(set_op->left, correlation_scope);
+    query->union_right = analyze_query_expr(set_op->right, correlation_scope);
+    query->union_all = set_op->all;
+    std::vector<ColMeta> common_cols = query->union_left->output_cols;
+    if (common_cols.empty() || query->union_right->output_cols.size() != common_cols.size()) {
+        throw InternalError("failure");
+    }
+    for (size_t i = 0; i < common_cols.size(); ++i) {
+        common_cols[i] = promote_union_col(common_cols[i], query->union_right->output_cols[i]);
+    }
+    int offset = 0;
+    for (auto &col : common_cols) {
+        col.tab_name.clear();
+        col.index = false;
+        col.offset = offset;
+        offset += col.len;
+        query->union_output_cols.push_back(col);
+        query->sel_captions.push_back(col.name);
+    }
+    for (auto &sv_order : set_op->orders) {
+        size_t index = query->union_output_cols.size();
+        if (sv_order->is_ordinal) {
+            if (sv_order->ordinal <= 0 ||
+                static_cast<size_t>(sv_order->ordinal) > query->union_output_cols.size()) {
+                throw InternalError("ORDER BY position is out of range");
+            }
+            index = static_cast<size_t>(sv_order->ordinal - 1);
+        } else {
+            if (!sv_order->cols->tab_name.empty()) {
+                throw InternalError("UNION ORDER BY cannot use a table qualifier");
+            }
+            size_t matches = 0;
+            for (size_t i = 0; i < query->union_output_cols.size(); ++i) {
+                if (query->union_output_cols[i].name == sv_order->cols->col_name) {
+                    index = i;
+                    ++matches;
+                }
+            }
+            if (matches == 0) throw ColumnNotFoundError(sv_order->cols->col_name);
+            if (matches > 1) throw AmbiguousColumnError(sv_order->cols->col_name);
+        }
+        TabCol order_col{"", query->union_output_cols[index].name};
+        order_col.output_index = static_cast<int>(index);
+        query->orders.emplace_back(std::move(order_col), sv_order->orderby_dir);
+    }
+    query->has_limit = set_op->has_limit;
+    query->limit_count = set_op->limit_count;
+    query->limit = set_op->has_limit ? set_op->limit_count : -1;
+    if (query->has_limit && query->limit_count < 0) {
+        throw InternalError("LIMIT must not be negative");
+    }
+    query->output_cols = query->union_output_cols;
+    query->parse = set_op;
+    return query;
+}
+
 // 递归分析 jointree。outer_scope 只供 LATERAL 派生表解析相关 WHERE；普通表和
 // 普通 JOIN 不会把外层名字泄漏进自己的输出作用域。
 Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::FromExpr> &from,
@@ -433,6 +557,32 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
         for (auto col : meta.cols) {
             // 语义树使用关系实例名，确保 e1/e2 这样的自连接实例不会混淆。
             col.tab_name = binding.binding_name;
+            result.scope.cols.push_back(col);
+            result.scope.output_cols.push_back(std::move(col));
+        }
+        result.node->cols = result.scope.cols;
+        result.node->output_cols = result.scope.output_cols;
+        return result;
+    }
+
+    if (auto derived = std::dynamic_pointer_cast<ast::DerivedTableRef>(from)) {
+        if (derived->subquery == nullptr || derived->alias.empty()) {
+            throw InternalError("Derived table requires a query and an alias");
+        }
+        AnalyzedFromResult result;
+        result.node = std::make_shared<AnalyzedFrom>();
+        result.node->is_subquery = true;
+        result.node->subquery = do_analyze(derived->subquery);
+        result.node->table = {"", derived->alias};
+        result.node->bindings.push_back(result.node->table);
+        result.node->all_bindings.push_back(result.node->table);
+        result.scope.bindings.push_back(result.node->table);
+
+        int offset = 0;
+        for (auto col : result.node->subquery->output_cols) {
+            col.tab_name = derived->alias;
+            col.offset = offset;
+            offset += col.len;
             result.scope.cols.push_back(col);
             result.scope.output_cols.push_back(std::move(col));
         }
@@ -581,8 +731,32 @@ Analyze::AnalyzedFromResult Analyze::analyze_lateral_ref(
 
     const AnalyzeScope empty_outer;
     const AnalyzeScope &outer = outer_scope == nullptr ? empty_outer : *outer_scope;
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(lateral->subquery);
+    if (select == nullptr) {
+        auto subquery = analyze_query_expr(lateral->subquery, &outer);
+        AnalyzedFromResult result;
+        result.node = std::make_shared<AnalyzedFrom>();
+        result.node->is_subquery = true;
+        result.node->subquery = std::move(subquery);
+        result.node->table = {"", lateral->alias};
+        result.node->bindings.push_back(result.node->table);
+        result.node->all_bindings.push_back(result.node->table);
+        result.scope.bindings.push_back(result.node->table);
+
+        int offset = 0;
+        for (auto col : result.node->subquery->output_cols) {
+            col.tab_name = lateral->alias;
+            col.offset = offset;
+            offset += col.len;
+            result.scope.cols.push_back(col);
+            result.scope.output_cols.push_back(std::move(col));
+        }
+        result.node->cols = result.scope.cols;
+        result.node->output_cols = result.scope.output_cols;
+        return result;
+    }
     // 先取得子查询自己的名字空间，用 local-first 规则识别 WHERE 中的相关列。
-    auto local_from = analyze_from(lateral->subquery->from);
+    auto local_from = analyze_from(select->from);
     std::vector<std::shared_ptr<ast::BoolExpr>> local_where;
     std::vector<std::shared_ptr<ast::BoolExpr>> correlated_where;
 
@@ -592,7 +766,7 @@ Analyze::AnalyzedFromResult Analyze::analyze_lateral_ref(
                                   outer.output_cols.end());
 
     std::vector<std::shared_ptr<ast::BoolExpr>> conjuncts;
-    split_ast_top_level_and(lateral->subquery->where_expr, conjuncts);
+    split_ast_top_level_and(select->where_expr, conjuncts);
     for (const auto &part : conjuncts) {
         bool uses_outer = false;
         // 递归访问整个合取项的比较叶。只要 OR/NOT 子树中任意叶
@@ -608,7 +782,7 @@ Analyze::AnalyzedFromResult Analyze::analyze_lateral_ref(
 
     // 复用完整 SELECT Analyzer；仅把相关 WHERE 留给参数化 Filter。SELECT/GROUP/
     // HAVING/内部 ON 中的外层引用仍会按普通未知列报错，这是当前明确的支持边界。
-    auto local_select = std::make_shared<ast::SelectStmt>(*lateral->subquery);
+    auto local_select = std::make_shared<ast::SelectStmt>(*select);
     local_select->where_expr = combine_ast_with_and(local_where);
     auto subquery = do_analyze(local_select);
 
@@ -637,7 +811,7 @@ Analyze::AnalyzedFromResult Analyze::analyze_lateral_ref(
 
     AnalyzedFromResult result;
     result.node = std::make_shared<AnalyzedFrom>();
-    result.node->is_lateral_subquery = true;
+    result.node->is_subquery = true;
     result.node->subquery = std::move(subquery);
     result.node->table = {"", lateral->alias};
     result.node->bindings.push_back(result.node->table);
@@ -774,7 +948,8 @@ TabCol Analyze::resolve_column(const AnalyzeScope &scope, TabCol target) {
 // 为 ON/WHERE/UPDATE/DELETE 建立统一的递归分析流程。每个比较
 // 叶完成列绑定与类型改写，逻辑节点只保留拓扑。
 ConditionExprPtr Analyze::analyze_conditions(
-    const std::shared_ptr<ast::BoolExpr> &sv_expr, const AnalyzeScope &scope) {
+    const std::shared_ptr<ast::BoolExpr> &sv_expr, const AnalyzeScope &scope,
+    bool allow_subquery) {
     if (sv_expr == nullptr) return nullptr;
 
     if (auto atom = std::dynamic_pointer_cast<ast::BinaryExpr>(sv_expr)) {
@@ -787,18 +962,51 @@ ConditionExprPtr Analyze::analyze_conditions(
         if (one.empty()) return nullptr;
         return make_bool_atom(std::move(one[0]));
     }
+    if (auto predicate = std::dynamic_pointer_cast<ast::SubqueryPredicate>(sv_expr)) {
+        if (!allow_subquery) {
+            throw InternalError("Subquery predicates are currently supported only in SELECT WHERE");
+        }
+        Condition condition;
+        condition.kind = predicate->type == ast::SubqueryPredicateType::EXISTS
+                             ? ConditionKind::EXISTS_SUBQUERY
+                             : ConditionKind::IN_SUBQUERY;
+        condition.subquery = analyze_predicate_subquery(predicate->subquery, scope);
+        if (condition.kind == ConditionKind::IN_SUBQUERY) {
+            if (predicate->lhs == nullptr || condition.subquery->output_cols.size() != 1) {
+                throw InternalError("IN subquery must return exactly one column");
+            }
+            condition.lhs_col = resolve_column(
+                scope, {.tab_name = predicate->lhs->tab_name,
+                        .col_name = predicate->lhs->col_name});
+            const ColType lhs_type = get_col_type(scope.cols, condition.lhs_col);
+            const ColType rhs_type = condition.subquery->output_cols.front().type;
+            const bool numeric = (lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT) &&
+                                 (rhs_type == TYPE_INT || rhs_type == TYPE_FLOAT);
+            if (lhs_type != rhs_type && !numeric) {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            }
+        }
+        return make_bool_atom(std::move(condition));
+    }
     if (auto logical = std::dynamic_pointer_cast<ast::LogicalExpr>(sv_expr)) {
         const BoolExprType type = logical->op == ast::LogicalOp::AND
                                       ? BoolExprType::AND
                                       : BoolExprType::OR;
         return make_bool_binary(
-            type, analyze_conditions(logical->left, scope),
-            analyze_conditions(logical->right, scope));
+            type, analyze_conditions(logical->left, scope, allow_subquery),
+            analyze_conditions(logical->right, scope, allow_subquery));
     }
     if (auto negated = std::dynamic_pointer_cast<ast::NotExpr>(sv_expr)) {
-        return make_bool_not(analyze_conditions(negated->child, scope));
+        return make_bool_not(analyze_conditions(negated->child, scope, allow_subquery));
     }
     throw InternalError("Unexpected boolean expression node");
+}
+
+std::shared_ptr<Query> Analyze::analyze_predicate_subquery(
+    const std::shared_ptr<ast::QueryExpr> &subquery,
+    const AnalyzeScope &outer_scope) {
+    if (subquery == nullptr) throw InternalError("Invalid predicate subquery");
+    return analyze_query_expr(subquery, &outer_scope);
 }
 
 ConditionExprPtr Analyze::analyze_lateral_conditions(
@@ -892,6 +1100,9 @@ void Analyze::check_condition_types(const AnalyzeScope &scope,
         }
         if (lhs_type != rhs_type) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+        }
+        if (cond.op == OP_LIKE && lhs_type != TYPE_STRING) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), "STRING");
         }
         kept.push_back(std::move(cond));
     }
@@ -1059,6 +1270,7 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
     std::map<ast::SvCompOp, CompOp> m = {
         {ast::SV_OP_EQ, OP_EQ}, {ast::SV_OP_NE, OP_NE}, {ast::SV_OP_LT, OP_LT},
         {ast::SV_OP_GT, OP_GT}, {ast::SV_OP_LE, OP_LE}, {ast::SV_OP_GE, OP_GE},
+        {ast::SV_OP_LIKE, OP_LIKE},
     };
     return m.at(op);
 }

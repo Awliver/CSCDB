@@ -195,14 +195,17 @@ class IndexScanExecutor : public AbstractExecutor {
      * 字节级比较两段数据（与 SeqScanExecutor 同一套逻辑）
      */
     static bool cmp_bytes(const char *a, const char *b, int len, ColType type, CompOp op) {
+        if (op == OP_LIKE) {
+            return type == TYPE_STRING && sql_like_match(a, len, b, len);
+        }
         int cmp;
         if (type == TYPE_INT) {
-            int ia = *reinterpret_cast<const int *>(a);
-            int ib = *reinterpret_cast<const int *>(b);
+            int ia = load_unaligned<int>(a);
+            int ib = load_unaligned<int>(b);
             cmp = (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
         } else if (type == TYPE_FLOAT) {
-            float fa = *reinterpret_cast<const float *>(a);
-            float fb = *reinterpret_cast<const float *>(b);
+            float fa = load_unaligned<float>(a);
+            float fb = load_unaligned<float>(b);
             cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
         } else {
             cmp = memcmp(a, b, len);
@@ -214,6 +217,7 @@ class IndexScanExecutor : public AbstractExecutor {
             case OP_GT: return cmp > 0;
             case OP_LE: return cmp <= 0;
             case OP_GE: return cmp >= 0;
+            case OP_LIKE: return false;
         }
         return false;
     }

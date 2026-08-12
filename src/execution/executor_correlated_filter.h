@@ -83,13 +83,13 @@ inline int compare_bytes(const CorrelatedTupleContext::Operand &lhs,
         throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
     }
     if (lhs.type == TYPE_INT) {
-        const int a = *reinterpret_cast<const int *>(lhs.data);
-        const int b = *reinterpret_cast<const int *>(rhs.data);
+        const int a = load_unaligned<int>(lhs.data);
+        const int b = load_unaligned<int>(rhs.data);
         return a < b ? -1 : (a > b ? 1 : 0);
     }
     if (lhs.type == TYPE_FLOAT) {
-        const float a = *reinterpret_cast<const float *>(lhs.data);
-        const float b = *reinterpret_cast<const float *>(rhs.data);
+        const float a = load_unaligned<float>(lhs.data);
+        const float b = load_unaligned<float>(rhs.data);
         return a < b ? -1 : (a > b ? 1 : 0);
     }
 
@@ -112,6 +112,10 @@ inline int compare_bytes(const CorrelatedTupleContext::Operand &lhs,
 
 inline bool compare_operands(const CorrelatedTupleContext::Operand &lhs,
                              const CorrelatedTupleContext::Operand &rhs, CompOp op) {
+    if (op == OP_LIKE) {
+        return lhs.type == TYPE_STRING && rhs.type == TYPE_STRING &&
+               sql_like_match(lhs.data, lhs.len, rhs.data, rhs.len);
+    }
     const int cmp = compare_bytes(lhs, rhs);
     switch (op) {
         case OP_EQ: return cmp == 0;
@@ -120,6 +124,7 @@ inline bool compare_operands(const CorrelatedTupleContext::Operand &lhs,
         case OP_GT: return cmp > 0;
         case OP_LE: return cmp <= 0;
         case OP_GE: return cmp >= 0;
+        case OP_LIKE: return false;
     }
     return false;
 }

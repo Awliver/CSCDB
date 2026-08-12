@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_nestedloop_join.h"
 #include "execution/executor_filter.h"
+#include "execution/executor_subquery_filter.h"
 #include "execution/executor_correlated_filter.h"
 #include "execution/executor_lateral_join.h"
 #include "execution/executor_rename.h"
@@ -79,23 +80,8 @@ class Portal
                 {
                     std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_, context);
                     std::vector<TabCol> sel_cols;
-                    std::shared_ptr<Plan> cur = x->subplan_;
-                    while (cur) {
-                        if (auto p = std::dynamic_pointer_cast<ProjectionPlan>(cur)) {
-                            sel_cols = p->sel_cols_;
-                            break;
-                        } else if (auto l = std::dynamic_pointer_cast<LimitPlan>(cur)) {
-                            cur = l->subplan_;
-                        } else if (auto s = std::dynamic_pointer_cast<SortPlan>(cur)) {
-                            cur = s->subplan_;
-                        } else if (auto u = std::dynamic_pointer_cast<UnionPlan>(cur)) {
-                            for (auto &col : u->output_cols_) {
-                                sel_cols.push_back({col.tab_name, col.name});
-                            }
-                            break;
-                        } else {
-                            break;
-                        }
+                    for (const auto &col : root->cols()) {
+                        sel_cols.push_back({col.tab_name, col.name});
                     }
                     return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(sel_cols), std::move(root), plan);
                 }
@@ -202,6 +188,20 @@ class Portal
         } else if (auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
             return std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                     x->predicate_);
+        } else if (auto x = std::dynamic_pointer_cast<SubqueryFilterPlan>(plan)) {
+            auto child = convert_plan_executor(x->subplan_, context, correlated);
+            std::vector<std::unique_ptr<AbstractExecutor>> subqueries;
+            std::vector<std::shared_ptr<CorrelatedTupleContext>> contexts;
+            subqueries.reserve(x->subquery_plans_.size());
+            contexts.reserve(x->subquery_plans_.size());
+            for (const auto &subplan : x->subquery_plans_) {
+                auto subquery_context = std::make_shared<CorrelatedTupleContext>();
+                subqueries.push_back(convert_plan_executor(subplan, context, subquery_context));
+                contexts.push_back(std::move(subquery_context));
+            }
+            return std::make_unique<SubqueryFilterExecutor>(
+                std::move(child), x->predicate_, std::move(subqueries),
+                std::move(contexts));
         } else if (auto x = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
             if (correlated == nullptr) {
                 throw InternalError("Correlated filter used outside LATERAL JOIN");
@@ -248,19 +248,8 @@ class Portal
                 return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                 x->sort_cols_[0].first, x->sort_cols_[0].second);
             } else {
-                std::vector<std::pair<ColMeta, bool>> meta_cols;
                 auto prev = convert_plan_executor(x->subplan_, context, correlated);
-                auto &input_cols = prev->cols();
-                for (auto &[tc, is_desc] : x->sort_cols_) {
-                    auto it = std::find_if(input_cols.begin(), input_cols.end(),
-                        [&](const ColMeta &c) {
-                            return c.name == tc.col_name &&
-                                   (tc.tab_name.empty() || c.tab_name == tc.tab_name);
-                        });
-                    if (it == input_cols.end()) throw ColumnNotFoundError(tc.col_name);
-                    meta_cols.emplace_back(*it, is_desc);
-                }
-                return std::make_unique<SortExecutor>(std::move(prev), meta_cols);
+                return std::make_unique<SortExecutor>(std::move(prev), x->sort_cols_);
             }
         } else if(auto x = std::dynamic_pointer_cast<AggPlan>(plan)) {
             return std::make_unique<AggExecutor>(convert_plan_executor(x->subplan_, context, correlated),
@@ -274,7 +263,7 @@ class Portal
             for (auto &subplan : x->subplans_) {
                 children.push_back(convert_plan_executor(subplan, context, correlated));
             }
-            return std::make_unique<UnionExecutor>(std::move(children), x->output_cols_);
+            return std::make_unique<UnionExecutor>(std::move(children), x->output_cols_, x->all_);
         }
         return nullptr;
     }

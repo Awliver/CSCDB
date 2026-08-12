@@ -69,7 +69,7 @@ class Query;
 
 struct AnalyzedFrom {
     bool is_table = false;
-    bool is_lateral_subquery = false;
+    bool is_subquery = false;
 
     // 普通表或 LATERAL 派生表的叶节点信息。
     TableBinding table;
@@ -121,9 +121,11 @@ public:
     int limit = -1;
     std::vector<std::string> sel_captions;
 
-    std::vector<std::shared_ptr<Query>> union_queries;
+    std::shared_ptr<Query> union_left;
+    std::shared_ptr<Query> union_right;
+    bool union_all = false;
     std::vector<ColMeta> union_output_cols;
-    std::string union_alias;
+    std::shared_ptr<Query> group_child;
 
     // 横向派生查询中引用外层行的 WHERE 条件。
     ConditionExprPtr correlated_expr;
@@ -155,6 +157,18 @@ private:
     };
 
     TabCol check_column(const std::vector<ColMeta> &all_cols, TabCol target);
+    std::shared_ptr<Query> analyze_query_expr(
+        const std::shared_ptr<ast::QueryExpr> &expr,
+        const AnalyzeScope *correlation_scope);
+    std::shared_ptr<Query> analyze_query_group(
+        const std::shared_ptr<ast::QueryGroup> &group,
+        const AnalyzeScope *correlation_scope);
+    std::shared_ptr<Query> analyze_union_expr(
+        const std::shared_ptr<ast::UnionStmt> &set_op,
+        const AnalyzeScope *correlation_scope);
+    std::shared_ptr<Query> analyze_correlated_select(
+        const std::shared_ptr<ast::SelectStmt> &select,
+        const AnalyzeScope &outer_scope);
     void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
     Condition convert_condition_atom(const std::shared_ptr<ast::BinaryExpr> &sv_cond);
     AnalyzedFromResult analyze_from(const std::shared_ptr<ast::FromExpr> &from,
@@ -168,7 +182,11 @@ private:
     TabCol resolve_lateral_column(const AnalyzeScope &local, const AnalyzeScope &outer,
                                   TabCol target, bool *is_outer);
     ConditionExprPtr analyze_conditions(const std::shared_ptr<ast::BoolExpr> &sv_expr,
-                                        const AnalyzeScope &scope);
+                                        const AnalyzeScope &scope,
+                                        bool allow_subquery = false);
+    std::shared_ptr<Query> analyze_predicate_subquery(
+        const std::shared_ptr<ast::QueryExpr> &subquery,
+        const AnalyzeScope &outer_scope);
     ConditionExprPtr analyze_lateral_conditions(
         const std::shared_ptr<ast::BoolExpr> &sv_expr,
         const AnalyzeScope &local, const AnalyzeScope &outer,

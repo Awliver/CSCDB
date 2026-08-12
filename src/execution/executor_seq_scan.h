@@ -218,14 +218,17 @@ class SeqScanExecutor : public AbstractExecutor {
      * @return 比较结果是否满足 op
      */
     static bool compare_value(const char *a, const char *b, int len, ColType type, CompOp op) {
+        if (op == OP_LIKE) {
+            return type == TYPE_STRING && sql_like_match(a, len, b, len);
+        }
         int cmp;
         if (type == TYPE_INT) {
-            int ia = *reinterpret_cast<const int *>(a);
-            int ib = *reinterpret_cast<const int *>(b);
+            int ia = load_unaligned<int>(a);
+            int ib = load_unaligned<int>(b);
             cmp = (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
         } else if (type == TYPE_FLOAT) {
-            float fa = *reinterpret_cast<const float *>(a);
-            float fb = *reinterpret_cast<const float *>(b);
+            float fa = load_unaligned<float>(a);
+            float fb = load_unaligned<float>(b);
             cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
         } else { // TYPE_STRING
             cmp = memcmp(a, b, len);
@@ -237,6 +240,7 @@ class SeqScanExecutor : public AbstractExecutor {
             case OP_GT: return cmp > 0;
             case OP_LE: return cmp <= 0;
             case OP_GE: return cmp >= 0;
+            case OP_LIKE: return false;
         }
         return false;
     }

@@ -29,8 +29,47 @@ static std::shared_ptr<ast::AggExpr> make_aggregate_expr(
                                           is_star, distinct);
 }
 
+static std::shared_ptr<ast::QueryExpr> append_union_operand(
+    std::shared_ptr<ast::QueryExpr> left, bool all,
+    std::shared_ptr<ast::QueryExpr> right) {
+    return std::make_shared<ast::UnionStmt>(std::move(left), std::move(right), all);
+}
+
 static bool is_lateral_ref(const std::shared_ptr<ast::FromExpr> &from) {
     return std::dynamic_pointer_cast<ast::LateralRef>(from) != nullptr;
+}
+
+static std::shared_ptr<ast::BoolExpr> make_between_expr(
+    const std::shared_ptr<ast::Col> &column,
+    const std::shared_ptr<ast::Expr> &lower,
+    const std::shared_ptr<ast::Expr> &upper,
+    bool negated) {
+    auto result = std::make_shared<ast::LogicalExpr>(
+        ast::LogicalOp::AND,
+        std::make_shared<ast::BinaryExpr>(column, ast::SV_OP_GE, lower),
+        std::make_shared<ast::BinaryExpr>(column, ast::SV_OP_LE, upper));
+    if (negated) return std::make_shared<ast::NotExpr>(std::move(result));
+    return result;
+}
+
+static std::shared_ptr<ast::BoolExpr> make_in_list_expr(
+    const std::shared_ptr<ast::Col> &column,
+    const std::vector<std::shared_ptr<ast::Value>> &values,
+    bool negated) {
+    std::shared_ptr<ast::BoolExpr> result;
+    for (const auto &value : values) {
+        auto atom = std::make_shared<ast::BinaryExpr>(
+            column, ast::SV_OP_EQ, std::static_pointer_cast<ast::Expr>(value));
+        if (result == nullptr) {
+            result = std::static_pointer_cast<ast::BoolExpr>(std::move(atom));
+        } else {
+            result = std::make_shared<ast::LogicalExpr>(ast::LogicalOp::OR,
+                                                        std::move(result),
+                                                        std::move(atom));
+        }
+    }
+    if (negated) return std::make_shared<ast::NotExpr>(std::move(result));
+    return result;
 }
 %}
 
@@ -44,7 +83,8 @@ static bool is_lateral_ref(const std::shared_ptr<ast::FromExpr> &from) {
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
-%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION DISTINCT
+%token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION ALL DISTINCT
+%token LIKE BETWEEN EXISTS IN
 %token LEFT RIGHT INNER OUTER CROSS FULL NATURAL SEMI ANTI LATERAL
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -57,8 +97,8 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON 
 
 // specify types for non-terminal symbol
 %type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
-%type <sv_select> select_stmt union_branch
-%type <sv_selects> union_query
+%type <sv_query> query_expression union_expression query_primary
+%type <sv_select> select_core
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -84,6 +124,7 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON 
 %type <sv_str> agg_name
 %type <sv_cols> opt_group_by group_by_list
 %type <sv_int> opt_limit
+%type <sv_bool> union_quantifier
 %type <sv_str> opt_alias required_alias
 %type <sv_setKnobType> set_knob_type
 
@@ -196,71 +237,81 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   select_stmt
+    |   query_expression
     {
         $$ = $1;
     }
-    |   EXPLAIN select_stmt
+    |   EXPLAIN query_expression
     {
         $$ = std::make_shared<ExplainStmt>($2, false);
     }
-    |   EXPLAIN ANALYZE select_stmt
+    |   EXPLAIN ANALYZE query_expression
     {
         $$ = std::make_shared<ExplainStmt>($3, true);
     }
-    |   SELECT '*' FROM '(' union_query ')' AS tbName opt_order_clause opt_limit
+    ;
+
+query_expression:
+        union_expression opt_order_clause opt_limit
     {
-        $$ = std::make_shared<UnionStmt>($5, $8, $9, $10 >= 0, $10 < 0 ? 0 : $10);
+        $1->set_tail($2, $3);
+        $$ = $1;
     }
     ;
 
-select_stmt:
-        SELECT '*' FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
-    }
-    |   SELECT colList FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
-    }
-    |   SELECT agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4, $5, $6, $7, $8, $9 >= 0, $9 < 0 ? 0 : $9);
-    }
-    |   SELECT colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_order_clause opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>($2, $4, $6, $7, $8, $9, $10, $11 >= 0, $11 < 0 ? 0 : $11);
-    }
-    ;
-
-union_branch:
-        SELECT '*' FROM from_clause optWhereClause opt_group_by opt_having opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
-    }
-    |   SELECT colList FROM from_clause optWhereClause opt_group_by opt_having opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
-    }
-    |   SELECT agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, $8 >= 0, $8 < 0 ? 0 : $8);
-    }
-    |   SELECT colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having opt_limit
-    {
-        $$ = std::make_shared<SelectStmt>($2, $4, $6, $7, $8, $9, std::vector<std::shared_ptr<OrderBy>>{}, $10 >= 0, $10 < 0 ? 0 : $10);
-    }
-    ;
-
-union_query:
-        union_branch UNION union_branch
-    {
-        $$ = std::vector<std::shared_ptr<SelectStmt>>{$1, $3};
-    }
-    |   union_query UNION union_branch
+union_expression:
+        query_primary
     {
         $$ = $1;
-        $$.push_back($3);
+    }
+    |   union_expression UNION union_quantifier query_primary
+    {
+        $$ = append_union_operand($1, $3, $4);
+    }
+    ;
+
+union_quantifier:
+        /* UNION defaults to DISTINCT */
+    {
+        $$ = false;
+    }
+    |   DISTINCT
+    {
+        $$ = false;
+    }
+    |   ALL
+    {
+        $$ = true;
+    }
+    ;
+
+query_primary:
+        select_core
+    {
+        $$ = $1;
+    }
+    |   '(' query_expression ')'
+    {
+        $$ = std::make_shared<QueryGroup>($2);
+    }
+    ;
+
+select_core:
+        SELECT '*' FROM from_clause optWhereClause opt_group_by opt_having
+    {
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+    }
+    |   SELECT colList FROM from_clause optWhereClause opt_group_by opt_having
+    {
+        $$ = std::make_shared<SelectStmt>($2, std::vector<std::shared_ptr<AggExpr>>{}, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+    }
+    |   SELECT agg_list FROM from_clause optWhereClause opt_group_by opt_having
+    {
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<Col>>{}, $2, $4, $5, $6, $7, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
+    }
+    |   SELECT colList ',' agg_list FROM from_clause optWhereClause opt_group_by opt_having
+    {
+        $$ = std::make_shared<SelectStmt>($2, $4, $6, $7, $8, $9, std::vector<std::shared_ptr<OrderBy>>{}, false, 0);
     }
     ;
 
@@ -354,6 +405,46 @@ condition:
         col op expr
     {
         $$ = std::make_shared<BinaryExpr>($1, $2, $3);
+    }
+    |   col LIKE value
+    {
+        $$ = std::make_shared<BinaryExpr>($1, SV_OP_LIKE,
+                                          std::static_pointer_cast<Expr>($3));
+    }
+    |   col NOT LIKE value
+    {
+        $$ = std::make_shared<NotExpr>(std::make_shared<BinaryExpr>(
+            $1, SV_OP_LIKE, std::static_pointer_cast<Expr>($4)));
+    }
+    |   col BETWEEN expr AND expr
+    {
+        $$ = make_between_expr($1, $3, $5, false);
+    }
+    |   col NOT BETWEEN expr AND expr
+    {
+        $$ = make_between_expr($1, $4, $6, true);
+    }
+    |   col IN '(' valueList ')'
+    {
+        $$ = make_in_list_expr($1, $4, false);
+    }
+    |   col NOT IN '(' valueList ')'
+    {
+        $$ = make_in_list_expr($1, $5, true);
+    }
+    |   col IN '(' query_expression ')'
+    {
+        $$ = std::make_shared<SubqueryPredicate>(SubqueryPredicateType::IN, $1, $4);
+    }
+    |   col NOT IN '(' query_expression ')'
+    {
+        $$ = std::make_shared<NotExpr>(std::make_shared<SubqueryPredicate>(
+            SubqueryPredicateType::IN, $1, $5));
+    }
+    |   EXISTS '(' query_expression ')'
+    {
+        $$ = std::make_shared<SubqueryPredicate>(SubqueryPredicateType::EXISTS,
+                                                 nullptr, $3);
     }
     ;
 
@@ -628,7 +719,11 @@ table_ref:
     {
         $$ = $2;
     }
-    | LATERAL '(' select_stmt ')' required_alias
+    | '(' query_expression ')' required_alias
+    {
+        $$ = std::make_shared<DerivedTableRef>($2, $4);
+    }
+    | LATERAL '(' query_expression ')' required_alias
     {
         $$ = std::make_shared<LateralRef>($3, $5);
     }
@@ -954,6 +1049,10 @@ order_clause:
     {
         $$ = std::make_shared<OrderBy>($1, $2);
     }
+    | VALUE_INT opt_asc_desc
+    {
+        $$ = std::make_shared<OrderBy>($1, $2);
+    }
     ;   
 
 opt_asc_desc:
@@ -969,6 +1068,7 @@ opt_limit:
     }
     |   LIMIT VALUE_INT
     {
+        if ($2 < 0) YYERROR;
         $$ = $2;
     }
     ;    

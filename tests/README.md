@@ -10,6 +10,7 @@
 | 子目录 | 职责 |
 |--------|------|
 | **`run_tests.py`** | P2 官方 11 测试点（一键入口） |
+| **`syntax_functional_test.py`** | Expression Tree 与谓词语法统一正确性测试 |
 | **`framework/`** | 各题目专项用例（P3–P7、EXPLAIN 等） |
 | **`bench/`** | TPC-C 规范压测工具（tpccbench） |
 | **`local/`** | 本地 OJ 模拟、快测、一致性检查 |
@@ -42,6 +43,94 @@ python3 tests/local/run_oj_perf_test.py --strict
 # TPC-C 快速冒烟（日常迭代，不能代表排名 tpmC）
 python3 tests/local/bench_tpcc_neworder.py --quick
 ```
+
+## SQL 语法功能专项正确性测试
+
+统一入口为 `tests/syntax_functional_test.py`。该测试面向 Parser、Expression Tree 及谓词
+语法，依次运行六个内部组件，并以任一组件失败作为整体失败：
+
+| 组件 | 主要覆盖 |
+|------|----------|
+| Parser / AST | 关键字 token、语法树结构、优先级和非法语法拒绝 |
+| Boolean Expression Tree | `AND` / `OR` / `NOT` 优先级与括号，`WHERE`、`ON`、`HAVING`、`UPDATE`、`DELETE`，三值逻辑及索引残余谓词 |
+| UNION Query Expression | `UNION [ALL\|DISTINCT]`、混合链与括号、全局/分支 `ORDER BY` 和 `LIMIT`、派生表、相关子查询、类型提升与错误恢复 |
+| UNION PostgreSQL 随机差分 | 固定 seed 生成二元/混合/括号/分支排序限制等随机 UNION，对比 RMDB 与 PostgreSQL，并分别验证无索引和有索引计划 |
+| 确定性谓词门禁 | `LIKE` / `NOT LIKE`、`BETWEEN` / `NOT BETWEEN`、值列表及子查询 `IN` / `NOT IN`、相关和非相关 `EXISTS` / `NOT EXISTS` |
+| PostgreSQL 随机差分 | 固定 seed 生成深度不超过 3 的随机布尔树，比较 RMDB 与真实 PostgreSQL 的结果，并验证无索引与有索引路径结果一致 |
+
+完整测试的谓词门禁默认使用 1,000,000 行主表和 10,000 行子查询表；确定性 UNION
+门禁默认使用 1,000,000 行主表和 10,000 行有意重叠的副表。UNION 随机差分也默认
+使用 1,000,000 行，3 个 seed 各生成 40 条 SQL，加 8 条边界用例；每条 SQL 都执行
+RMDB/PostgreSQL × 无索引/有索引四条路径，并用 `EXPLAIN` 确认 RMDB 的分支确实从
+顺序扫描切换到索引扫描。谓词随机差分则默认使用 3 个 seed 各 100 条 SQL，加 15 条
+固定边界及回归用例。
+
+```bash
+# 完整语法功能正确性测试（推荐提交前运行）
+python3 -B tests/syntax_functional_test.py
+
+# 日常快速测试：10,000 行确定性门禁 + 56 条随机/边界 SQL
+python3 -B tests/syntax_functional_test.py --quick
+```
+
+统一入口还支持以下定位参数：
+
+```bash
+# 只运行一个内部组件
+python3 -B tests/syntax_functional_test.py --component parser
+python3 -B tests/syntax_functional_test.py --component boolean
+python3 -B tests/syntax_functional_test.py --component union
+python3 -B tests/syntax_functional_test.py --component union-differential
+python3 -B tests/syntax_functional_test.py --component predicates
+python3 -B tests/syntax_functional_test.py --component differential
+
+# 调整大数据门禁规模（UNION 参数同时控制确定性门禁和随机差分）
+python3 -B tests/syntax_functional_test.py \
+  --union-rows 500000 --predicate-rows 1000000
+
+# 扩展随机覆盖范围
+python3 -B tests/syntax_functional_test.py \
+  --seeds 42,99,123,456 --cases-per-seed 250 --diff-rows 5000
+
+# 扩展 UNION 随机差分覆盖（仍在百万行数据上执行）
+python3 -B tests/syntax_functional_test.py --component union-differential \
+  --union-seeds 42,99,123,456 --union-cases-per-seed 100 --union-rows 1000000
+
+# 复用已有 PostgreSQL 实例
+python3 -B tests/syntax_functional_test.py \
+  --postgres-dsn postgresql://user:password@127.0.0.1:5432/database
+```
+
+默认差分模式会在 `/tmp` 创建并在结束时清理隔离的临时 PostgreSQL 集群。环境需要
+能够找到 `initdb`、`pg_ctl` 和 `psql`；也可以通过 `--postgres-dsn` 或
+`RMDB_POSTGRES_DSN` 使用现有实例。所有随机用例均可由输出中的 seed 和 case id 复现。
+当前方言尚未声明支持 PostgreSQL 的 `ILIKE`、`ESCAPE`、`BETWEEN SYMMETRIC` 和
+SQL `NULL` 三值谓词语义，因此差分生成器不会生成这些语法。
+
+确定性用例固定取自 PostgreSQL 官方回归测试版本
+`postgres/postgres@b495c5685a1ac436a0006aba464efcf0edb6153d`：
+
+- [`strings.sql`](https://github.com/postgres/postgres/blob/b495c5685a1ac436a0006aba464efcf0edb6153d/src/test/regress/sql/strings.sql#L418)：`LIKE` / `NOT LIKE`；
+- [`horology.sql`](https://github.com/postgres/postgres/blob/b495c5685a1ac436a0006aba464efcf0edb6153d/src/test/regress/sql/horology.sql#L384)：`BETWEEN` / `NOT BETWEEN`；
+- [`expressions.sql`](https://github.com/postgres/postgres/blob/b495c5685a1ac436a0006aba464efcf0edb6153d/src/test/regress/sql/expressions.sql#L118)：`IN` / `NOT IN` 值列表；
+- [`subselect.sql`](https://github.com/postgres/postgres/blob/b495c5685a1ac436a0006aba464efcf0edb6153d/src/test/regress/sql/subselect.sql#L47)：相关/非相关 `IN` 与 `EXISTS`。
+
+### ASan / UBSan 语法门禁
+
+`tests/local/run_syntax_sanitizers.sh` 不修改 `CMakeLists.txt`，而是在独立构建目录的
+CMake 命令行中注入 sanitizer 编译和链接参数，然后运行统一语法测试的快速配置
+（其中已经包含 parser 单测）：
+
+```bash
+tests/local/run_syntax_sanitizers.sh
+```
+
+默认关闭 LeakSanitizer，以兼容不支持 LSan 的 ptrace/受控环境；AddressSanitizer 的
+越界和悬空访问检查以及 UndefinedBehaviorSanitizer 仍保持启用。可通过
+`RMDB_SANITIZER_BUILD_DIR` 指定独立构建目录，通过
+`RMDB_SANITIZER_GATE_ROWS`、`RMDB_SANITIZER_DIFF_ROWS` 和
+`RMDB_SANITIZER_DIFF_CASES` 调整测试规模；UNION 随机差分条数可由
+`RMDB_SANITIZER_UNION_DIFF_CASES` 单独调整。
 
 ## 初赛 / 开发期性能测试对齐（历史题意模拟）
 
@@ -239,6 +328,7 @@ fresh W=50 门禁。WAL、BPM、恢复或 LOAD 改动后，仍须在原生磁盘
 ```
 tests/
 ├── run_tests.py          # P2 功能回归（11 测试点）
+├── syntax_functional_test.py # SQL 语法专项统一正确性测试
 ├── framework/            # 专项用例（aggregates / explain / p3 …）
 ├── bench/                # tpccbench 规范压测
 ├── local/                # 本地 TPC-C / OJ 模拟
@@ -348,6 +438,40 @@ python3 tests/local/run_oj_perf_test.py --profile          # 压测后跑 perf �
 ### `local/p2_gate.py`
 
 被 `bench_tpcc.py --strict` 调用，确保性能测试前 P2 功能 11 点全部通过。
+
+### `local/union_query_expression_gate.py`
+
+传统 SQL `UNION` 查询表达式专项回归，覆盖顶层 `UNION`、`ALL` / `DISTINCT`、
+混合操作的左结合与括号、整体及分支 `ORDER BY` / `LIMIT`、派生表、类型提升、
+序号排序、相关谓词子查询、`LATERAL`、NULL 集合等价和错误恢复。
+
+测试还从 PostgreSQL 官方 `src/test/regress/sql/union.sql` 固定提交
+`b495c5685a1ac436a0006aba464efcf0edb6153d` 中选取当前方言能够表达的用例。原始 SQL、
+来源行号、blob SHA 和每项适配说明保存在 `local/postgresql_union_cases.py`；许可证与
+提交信息位于 `postgresql_regress/`。不支持的 `INTERSECT`、`EXCEPT`、CTE、数组、
+继承表及 PostgreSQL 专属类型不会被计入通过项。
+
+默认数据为 1,000,000 行 tenk-style 主表和 10,000 行副表，覆盖高重复集合、部分重叠
+集合、整行去重、INT/FLOAT 共同类型、CHAR 扩宽、空分支、派生表过滤、JOIN、索引
+分支及精确 ALL 重复次数；快速模式仍强制不少于 10,000 行：
+
+```bash
+python3 -B tests/local/union_query_expression_gate.py
+python3 -B tests/local/union_query_expression_gate.py --rows 1000000
+```
+
+### `local/postgresql_union_differential.py`
+
+在默认 1,000,000 行确定性数据上生成可复现的随机 UNION SQL，覆盖裸/显式 DISTINCT、
+ALL、混合左结合、右侧括号、分支 `ORDER BY/LIMIT`、集合级排序限制以及单列/多列去重。
+同一批 SQL 会在 RMDB 与真实 PostgreSQL 中分别于建索引前后执行，并要求四份基数结果
+完全一致；失败信息包含 seed、case id、形状和完整 SQL，可直接复现：
+
+```bash
+python3 -B tests/local/postgresql_union_differential.py
+python3 -B tests/local/postgresql_union_differential.py \
+  --rows 1000000 --seeds 42,99,20260812 --cases-per-seed 100
+```
 
 ### `framework/`
 

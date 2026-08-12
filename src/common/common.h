@@ -10,20 +10,46 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include "defs.h"
 #include "record/rm_defs.h"
 
+class Query;
+
+// Records and index keys are packed byte arrays; neither their base address
+// nor a column offset is guaranteed to satisfy int/float alignment.  memcpy
+// is optimized to a normal load/store on platforms that permit it and remains
+// defined on strict-alignment targets and under UBSan.
+template <typename T>
+inline T load_unaligned(const char *data) {
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "load_unaligned requires a trivially copyable type");
+    T value{};
+    std::memcpy(&value, data, sizeof(T));
+    return value;
+}
+
+template <typename T>
+inline void store_unaligned(char *data, const T &value) {
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "store_unaligned requires a trivially copyable type");
+    std::memcpy(data, &value, sizeof(T));
+}
 
 struct TabCol {
     std::string tab_name;
     std::string col_name;
     std::string alias;
+    // Zero-based output position for ORDER BY ordinals.  -1 means resolve by
+    // relation/name as before.
+    int output_index = -1;
 
     friend bool operator<(const TabCol &x, const TabCol &y) {
         return std::make_pair(x.tab_name, x.col_name) < std::make_pair(y.tab_name, y.col_name);
@@ -47,9 +73,9 @@ struct CoalescedJoinColumn {
 };
 
 struct Value {
-    ColType type;  // type of value
+    ColType type = TYPE_INT;  // type of value
     union {
-        int int_val;      // int value
+        int int_val = 0;  // int value
         float float_val;  // float value
     };
     std::string str_val;  // string value
@@ -76,10 +102,10 @@ struct Value {
         raw = std::make_shared<RmRecord>(len);
         if (type == TYPE_INT) {
             assert(len == sizeof(int));
-            *(int *)(raw->data) = int_val;
+            store_unaligned(raw->data, int_val);
         } else if (type == TYPE_FLOAT) {
             assert(len == sizeof(float));
-            *(float *)(raw->data) = float_val;
+            store_unaligned(raw->data, float_val);
         } else if (type == TYPE_STRING) {
             if (len < (int)str_val.size()) {
                 throw StringOverflowError();
@@ -90,16 +116,67 @@ struct Value {
     }
 };
 
-enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
+enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE, OP_LIKE };
+
+enum class ConditionKind {
+    COMPARISON,
+    EXISTS_SUBQUERY,
+    IN_SUBQUERY,
+};
 
 struct Condition {
+    ConditionKind kind = ConditionKind::COMPARISON;
     TabCol lhs_col;   // left-hand side column
-    CompOp op;        // comparison operator
-    bool is_rhs_val;  // true if right-hand side is a value (not a column)
+    CompOp op = OP_EQ;        // comparison operator
+    bool is_rhs_val = true;   // true if right-hand side is a value (not a column)
     TabCol rhs_col;   // right-hand side column
     Value rhs_val;    // right-hand side value
     bool rhs_is_float_lit = false;  // 原始字面量是否为浮点(类型提升后丢失，EXPLAIN 渲染用)
+    // EXISTS/IN subqueries retain the Query interface on semantic leaves.
+    // The planner creates one subplan per leaf, which the executor restarts
+    // with parameters from each outer row.
+    std::shared_ptr<Query> subquery;
 };
+
+// SQL LIKE matcher for zero-padded CHAR storage. '%' matches any byte sequence,
+// '_' matches one byte, and '\\' quotes the following wildcard character.
+inline bool sql_like_match(const char *value, int value_len,
+                           const char *pattern, int pattern_len) {
+    int n = 0;
+    while (n < value_len && value[n] != '\0') ++n;
+    int m = 0;
+    while (m < pattern_len && pattern[m] != '\0') ++m;
+
+    std::vector<unsigned char> previous(static_cast<size_t>(n) + 1, 0);
+    std::vector<unsigned char> current(static_cast<size_t>(n) + 1, 0);
+    previous[0] = 1;
+    for (int j = 0; j < m; ++j) {
+        std::fill(current.begin(), current.end(), 0);
+        const char token = pattern[j];
+        if (token == '%') {
+            current[0] = previous[0];
+            for (int i = 1; i <= n; ++i) {
+                current[static_cast<size_t>(i)] =
+                    previous[static_cast<size_t>(i)] ||
+                    current[static_cast<size_t>(i - 1)];
+            }
+        } else {
+            char literal = token;
+            bool wildcard = token == '_';
+            if (token == '\\' && j + 1 < m) {
+                literal = pattern[++j];
+                wildcard = false;
+            }
+            for (int i = 1; i <= n; ++i) {
+                current[static_cast<size_t>(i)] =
+                    previous[static_cast<size_t>(i - 1)] &&
+                    (wildcard || value[i - 1] == literal);
+            }
+        }
+        previous.swap(current);
+    }
+    return previous[static_cast<size_t>(n)] != 0;
+}
 
 /*
  * SQL 布尔表达式的语义层表示。

@@ -205,15 +205,15 @@ std::string AggExecutor::make_group_key(const char *data) {
 
 float AggExecutor::read_as_float(const char *data, const ColMeta &col) {
     if (col.type == TYPE_INT) {
-        return static_cast<float>(*(const int *)(data + col.offset));
+        return static_cast<float>(load_unaligned<int>(data + col.offset));
     } else if (col.type == TYPE_FLOAT) {
-        return *(const float *)(data + col.offset);
+        return load_unaligned<float>(data + col.offset);
     }
     return 0.0f;
 }
 
 int AggExecutor::read_as_int(const char *data, const ColMeta &col) {
-    return *(const int *)(data + col.offset);
+    return load_unaligned<int>(data + col.offset);
 }
 
 bool AggExecutor::is_null(size_t input_col_idx) const {
@@ -343,6 +343,11 @@ int AggExecutor::compare_value_by_val(const Value &a, const Value &b) {
 }
 
 bool AggExecutor::evaluate_condition(const Value &lhs, const Value &rhs, CompOp op) {
+    if (op == OP_LIKE) {
+        return lhs.type == TYPE_STRING && rhs.type == TYPE_STRING &&
+               sql_like_match(lhs.str_val.data(), static_cast<int>(lhs.str_val.size()),
+                              rhs.str_val.data(), static_cast<int>(rhs.str_val.size()));
+    }
     int cmp = compare_value_by_val(lhs, rhs);
     switch (op) {
         case OP_EQ: return cmp == 0;
@@ -418,10 +423,10 @@ void AggExecutor::write_finalized_value(const Value &value, size_t output_col_id
     char *slot = cur_rec_->data + column.offset;
     switch (column.type) {
         case TYPE_INT:
-            *(int *)slot = value.int_val;
+            store_unaligned(slot, value.int_val);
             break;
         case TYPE_FLOAT:
-            *(float *)slot = value.float_val;
+            store_unaligned(slot, value.float_val);
             break;
         case TYPE_STRING: {
             const size_t bytes = std::min(value.str_val.size(), static_cast<size_t>(column.len));

@@ -120,12 +120,12 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                                    ColType type) {
         int cmp;
         if (type == TYPE_INT) {
-            int ia = *reinterpret_cast<const int *>(a);
-            int ib = *reinterpret_cast<const int *>(b);
+            int ia = load_unaligned<int>(a);
+            int ib = load_unaligned<int>(b);
             cmp = (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
         } else if (type == TYPE_FLOAT) {
-            float fa = *reinterpret_cast<const float *>(a);
-            float fb = *reinterpret_cast<const float *>(b);
+            float fa = load_unaligned<float>(a);
+            float fb = load_unaligned<float>(b);
             cmp = (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
         } else {
             const int common = std::min(a_len, b_len);
@@ -146,6 +146,9 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     static bool compare_value(const char *a, int a_len, const char *b, int b_len,
                               ColType type, CompOp op) {
+        if (op == OP_LIKE) {
+            return type == TYPE_STRING && sql_like_match(a, a_len, b, b_len);
+        }
         const int cmp = compare_typed_value(a, a_len, b, b_len, type);
         switch (op) {
             case OP_EQ: return cmp == 0;
@@ -154,6 +157,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             case OP_GT: return cmp > 0;
             case OP_LE: return cmp <= 0;
             case OP_GE: return cmp >= 0;
+            case OP_LIKE: return false;
         }
         return false;
     }

@@ -21,6 +21,7 @@ enum JoinType {
 }; // 选择的种类
 namespace ast {
 
+struct QueryExpr;
 struct SelectStmt;
 
 enum SvType {
@@ -28,7 +29,7 @@ enum SvType {
 };
 
 enum SvCompOp {
-    SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE
+    SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE, SV_OP_LIKE
 };
 
 enum class LogicalOp {
@@ -231,12 +232,63 @@ struct NotExpr : public BoolExpr {
     explicit NotExpr(std::shared_ptr<BoolExpr> child_) : child(std::move(child_)) {}
 };
 
+// EXISTS and IN(subquery) remain boolean-expression leaves.  Keeping the
+// subquery on the leaf (instead of rewriting it into a JOIN) preserves the
+// surrounding OR/NOT topology and therefore the original SQL semantics.
+enum class SubqueryPredicateType {
+    EXISTS,
+    IN,
+};
+
+struct SubqueryPredicate : public BoolExpr {
+    SubqueryPredicateType type;
+    std::shared_ptr<Col> lhs;  // only populated for IN(subquery)
+    std::shared_ptr<QueryExpr> subquery;
+
+    SubqueryPredicate(SubqueryPredicateType type_, std::shared_ptr<Col> lhs_,
+                      std::shared_ptr<QueryExpr> subquery_)
+        : type(type_), lhs(std::move(lhs_)), subquery(std::move(subquery_)) {}
+};
+
 struct OrderBy : public TreeNode
 {
     std::shared_ptr<Col> cols;
+    int ordinal = 0;
+    bool is_ordinal = false;
     OrderByDir orderby_dir;
     OrderBy( std::shared_ptr<Col> cols_, OrderByDir orderby_dir_) :
        cols(std::move(cols_)), orderby_dir(std::move(orderby_dir_)) {}
+    OrderBy(int ordinal_, OrderByDir orderby_dir_) :
+       ordinal(ordinal_), is_ordinal(true), orderby_dir(std::move(orderby_dir_)) {}
+};
+
+// SELECT and set operations share the query-level ORDER BY/LIMIT tail.  Keeping
+// it on a common base lets a parenthesized UNION be used anywhere a query is
+// accepted without wrapping it in the old, special-case SELECT * shell.
+struct QueryExpr : public TreeNode {
+    bool has_sort = false;
+    std::shared_ptr<OrderBy> order;
+    std::vector<std::shared_ptr<OrderBy>> orders;
+    int limit = -1;
+    bool has_limit = false;
+    int limit_count = 0;
+
+    void set_tail(std::vector<std::shared_ptr<OrderBy>> orders_, int limit_) {
+        orders = std::move(orders_);
+        has_sort = !orders.empty();
+        order = orders.empty() ? nullptr : orders.front();
+        limit = limit_;
+        has_limit = limit_ >= 0;
+        limit_count = has_limit ? limit_ : 0;
+    }
+};
+
+// Retains a parenthesized query boundary so an outer ORDER BY/LIMIT never
+// overwrites a tail that belongs to the inner query expression.
+struct QueryGroup : public QueryExpr {
+    std::shared_ptr<QueryExpr> child;
+
+    explicit QueryGroup(std::shared_ptr<QueryExpr> child_) : child(std::move(child_)) {}
 };
 
 struct InsertStmt : public TreeNode {
@@ -281,13 +333,24 @@ struct TableRef : FromExpr {
     TableRef(std::string tab_name_, std::string alias_) : tab_name(std::move(tab_name_)), alias(std::move(alias_)) {}
 };
 
+// An ordinary derived table may contain either a SELECT or an arbitrarily
+// parenthesized UNION expression.  SQL requires a correlation name here, but
+// the AS keyword itself is optional.
+struct DerivedTableRef : FromExpr {
+    std::shared_ptr<QueryExpr> subquery;
+    std::string alias;
+
+    DerivedTableRef(std::shared_ptr<QueryExpr> subquery_, std::string alias_)
+        : subquery(std::move(subquery_)), alias(std::move(alias_)) {}
+};
+
 // LATERAL 右侧是一个可以引用左侧关系的派生表。别名是其对外的惟一绑定名，
 // 因此 grammar 不允许省略 alias。关联名解析由 Analyzer 在上下文作用域中完成。
 struct LateralRef : FromExpr {
-    std::shared_ptr<SelectStmt> subquery;
+    std::shared_ptr<QueryExpr> subquery;
     std::string alias;
 
-    LateralRef(std::shared_ptr<SelectStmt> subquery_, std::string alias_)
+    LateralRef(std::shared_ptr<QueryExpr> subquery_, std::string alias_)
         : subquery(std::move(subquery_)), alias(std::move(alias_)) {}
 };
 
@@ -310,7 +373,7 @@ struct JoinExpr : FromExpr {
           on_true(on_true_) {}
 }; // 定义专门的连接表达式结构
 
-struct SelectStmt : public TreeNode {
+struct SelectStmt : public QueryExpr {
     std::vector<std::shared_ptr<Col>> cols;
     std::vector<std::shared_ptr<AggExpr>> aggs;
     // 将 FROM 后的 ON 条件与 WHERE 后的 WHERE 条件区分
@@ -318,13 +381,6 @@ struct SelectStmt : public TreeNode {
     std::shared_ptr<BoolExpr> where_expr;
     std::vector<std::shared_ptr<Col>> group_by_cols;
     std::shared_ptr<BoolExpr> having_expr;
-
-    bool has_sort;
-    std::shared_ptr<OrderBy> order;                      // 单 ORDER BY（题4/题10 兼容）
-    std::vector<std::shared_ptr<OrderBy>> orders;        // 多 ORDER BY（题5/p7）
-    int limit = -1;
-    bool has_limit = false;
-    int limit_count = 0;
 
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
                std::vector<std::shared_ptr<AggExpr>> aggs_,
@@ -336,38 +392,27 @@ struct SelectStmt : public TreeNode {
                bool has_limit_, int limit_count_)
         : cols(std::move(cols_)), aggs(std::move(aggs_)), from(std::move(from_)),
           where_expr(std::move(where_expr_)),
-          group_by_cols(std::move(group_by_cols_)), having_expr(std::move(having_expr_)),
-          orders(std::move(orders_)), has_limit(has_limit_), limit_count(limit_count_) {
-        has_sort = !orders.empty();
-        if (!orders.empty()) order = orders[0];
+          group_by_cols(std::move(group_by_cols_)), having_expr(std::move(having_expr_)) {
+        set_tail(std::move(orders_), has_limit_ ? limit_count_ : -1);
     }
 };
 
 struct ExplainStmt : public TreeNode {
-    std::shared_ptr<SelectStmt> select;
+    std::shared_ptr<QueryExpr> query;
     bool analyze;
 
-    ExplainStmt(std::shared_ptr<SelectStmt> select_, bool analyze_)
-        : select(std::move(select_)), analyze(analyze_) {}
+    ExplainStmt(std::shared_ptr<QueryExpr> query_, bool analyze_)
+        : query(std::move(query_)), analyze(analyze_) {}
 };
 
-struct UnionStmt : public TreeNode {
-    std::vector<std::shared_ptr<SelectStmt>> selects;
-    std::string alias;
-    std::vector<std::shared_ptr<OrderBy>> orders;
-    bool has_limit;
-    int limit_count;
+struct UnionStmt : public QueryExpr {
+    std::shared_ptr<QueryExpr> left;
+    std::shared_ptr<QueryExpr> right;
+    // true is UNION ALL; false is UNION DISTINCT (including bare UNION).
+    bool all = false;
 
-    UnionStmt(std::vector<std::shared_ptr<SelectStmt>> selects_,
-              std::string alias_,
-              std::vector<std::shared_ptr<OrderBy>> orders_,
-              bool has_limit_,
-              int limit_count_)
-        : selects(std::move(selects_)),
-          alias(std::move(alias_)),
-          orders(std::move(orders_)),
-          has_limit(has_limit_),
-          limit_count(limit_count_) {}
+    UnionStmt(std::shared_ptr<QueryExpr> left_, std::shared_ptr<QueryExpr> right_, bool all_)
+        : left(std::move(left_)), right(std::move(right_)), all(all_) {}
 };
 
 // set enable_nestloop
@@ -381,19 +426,20 @@ struct SetStmt : public TreeNode {
 
 // Semantic value
 struct SemValue {
-    int sv_int;
-    float sv_float;
+    int sv_int = 0;
+    float sv_float = 0.0F;
     std::string sv_str;
-    bool sv_bool;
-    OrderByDir sv_orderby_dir;
+    bool sv_bool = false;
+    OrderByDir sv_orderby_dir = OrderBy_DEFAULT;
     std::vector<std::string> sv_strs;
     std::shared_ptr<FromExpr> sv_from;
 
     std::shared_ptr<TreeNode> sv_node;
+    std::shared_ptr<QueryExpr> sv_query;
     std::shared_ptr<SelectStmt> sv_select;
     std::vector<std::shared_ptr<SelectStmt>> sv_selects;
 
-    SvCompOp sv_comp_op;
+    SvCompOp sv_comp_op = SV_OP_EQ;
 
     std::shared_ptr<TypeLen> sv_type_len;
 
@@ -419,7 +465,7 @@ struct SemValue {
     std::shared_ptr<OrderBy> sv_orderby;
     std::vector<std::shared_ptr<OrderBy>> sv_orderbys;
 
-    SetKnobType sv_setKnobType;
+    SetKnobType sv_setKnobType = EnableNestLoop;
 };
 
 extern std::shared_ptr<ast::TreeNode> parse_tree;
