@@ -19,6 +19,10 @@ static std::shared_ptr<ast::Value> negate_value(const std::shared_ptr<ast::Value
     if (auto f = std::dynamic_pointer_cast<ast::FloatLit>(v)) return std::make_shared<ast::FloatLit>(-f->val);
     return nullptr;
 }
+
+static bool is_lateral_ref(const std::shared_ptr<ast::FromExpr> &from) {
+    return std::dynamic_pointer_cast<ast::LateralRef>(from) != nullptr;
+}
 %}
 
 // request a pure (reentrant) parser
@@ -32,7 +36,7 @@ static std::shared_ptr<ast::Value> negate_value(const std::shared_ptr<ast::Value
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 %token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION DISTINCT
-%token LEFT RIGHT INNER OUTER CROSS FULL
+%token LEFT RIGHT INNER OUTER CROSS FULL NATURAL SEMI ANTI LATERAL
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -70,7 +74,7 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_cols> opt_group_by group_by_list
 %type <sv_conds> opt_having
 %type <sv_int> opt_limit
-%type <sv_str> opt_alias
+%type <sv_str> opt_alias required_alias
 %type <sv_setKnobType> set_knob_type
 
 %%
@@ -577,6 +581,21 @@ table_ref:
     {
         $$ = $2;
     }
+    | LATERAL '(' select_stmt ')' required_alias
+    {
+        $$ = std::make_shared<LateralRef>($3, $5);
+    }
+    ;
+
+required_alias:
+    IDENTIFIER
+    {
+        $$ = $1;
+    }
+    | AS IDENTIFIER
+    {
+        $$ = $2;
+    }
     ;
 
     // joined_table 表示被选择连接的表
@@ -588,42 +607,182 @@ joined_table:
     | joined_table JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
-            INNER_JOIN, $1, $3, $5);
+            INNER_JOIN, $1, $3, $5, false, is_lateral_ref($3));
+    }
+    | joined_table JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$5) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($3), true);
     }
     | joined_table JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{});
+            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($3));
     }
     | joined_table INNER JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
-            INNER_JOIN, $1, $4, $6);
+            INNER_JOIN, $1, $4, $6, false, is_lateral_ref($4));
+    }
+    | joined_table INNER JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$6) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($4), true);
     }
     | joined_table LEFT opt_outer JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
-            LEFT_JOIN, $1, $5, $7);
+            LEFT_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table LEFT opt_outer JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
     }
     | joined_table RIGHT opt_outer JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
-            RIGHT_JOIN, $1, $5, $7);
+            RIGHT_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table RIGHT opt_outer JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
     }
     | joined_table FULL opt_outer JOIN table_ref ON whereClause
     {
         $$ = std::make_shared<JoinExpr>(
-            FULL_JOIN, $1, $5, $7);
+            FULL_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table FULL opt_outer JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            FULL_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
     }
     | joined_table CROSS JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            CROSS_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{});
+            CROSS_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($4));
+    }
+    | joined_table NATURAL JOIN table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            true, is_lateral_ref($4));
+    }
+    | joined_table NATURAL INNER JOIN table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            INNER_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            true, is_lateral_ref($5));
+    }
+    | joined_table NATURAL LEFT opt_outer JOIN table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_JOIN, $1, $6, std::vector<std::shared_ptr<BinaryExpr>>{},
+            true, is_lateral_ref($6));
+    }
+    | joined_table NATURAL RIGHT opt_outer JOIN table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_JOIN, $1, $6, std::vector<std::shared_ptr<BinaryExpr>>{},
+            true, is_lateral_ref($6));
+    }
+    | joined_table NATURAL FULL opt_outer JOIN table_ref
+    {
+        $$ = std::make_shared<JoinExpr>(
+            FULL_JOIN, $1, $6, std::vector<std::shared_ptr<BinaryExpr>>{},
+            true, is_lateral_ref($6));
+    }
+    | joined_table SEMI JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_SEMI_JOIN, $1, $4, $6, false, is_lateral_ref($4));
+    }
+    | joined_table SEMI JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$6) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_SEMI_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($4), true);
+    }
+    | joined_table LEFT SEMI JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_SEMI_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table LEFT SEMI JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_SEMI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
+    }
+    | joined_table RIGHT SEMI JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_SEMI_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table RIGHT SEMI JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_SEMI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
+    }
+    | joined_table ANTI JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_ANTI_JOIN, $1, $4, $6, false, is_lateral_ref($4));
+    }
+    | joined_table ANTI JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$6) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_ANTI_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($4), true);
+    }
+    | joined_table LEFT ANTI JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_ANTI_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table LEFT ANTI JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            LEFT_ANTI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
+    }
+    | joined_table RIGHT ANTI JOIN table_ref ON whereClause
+    {
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_ANTI_JOIN, $1, $5, $7, false, is_lateral_ref($5));
+    }
+    | joined_table RIGHT ANTI JOIN table_ref ON VALUE_BOOL
+    {
+        if (!$7) YYERROR;
+        $$ = std::make_shared<JoinExpr>(
+            RIGHT_ANTI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($5), true);
     }
     | joined_table ',' table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{});
+            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{},
+            false, is_lateral_ref($3));
     }
     ;
 
@@ -662,7 +821,10 @@ having_condition:
     }
     |   agg_func op expr
     {
-        auto col = std::make_shared<Col>("", $1->to_string());
+        // 保留聚合实参的限定符，Analyzer 才能拒绝 SEMI/ANTI 已隐藏侧的
+        // HAVING count(hidden.col)；函数文本仍沿用现有内部表示。
+        auto col = std::make_shared<Col>(
+            (!$1->is_star && $1->col) ? $1->col->tab_name : "", $1->to_string());
         $$ = std::make_shared<BinaryExpr>(col, $2, $3);
     }
     ;

@@ -182,13 +182,15 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::str
 
 std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
                                               std::vector<Condition> join_conds,
-                                              JoinType join_type, Context *context) {
+                                              JoinType join_type, Context *context,
+                                              bool natural, bool lateral,
+                                              std::vector<CoalescedJoinColumn> coalesced_cols) {
     auto right_scan = std::dynamic_pointer_cast<ScanPlan>(right);
     auto right_projection = std::dynamic_pointer_cast<ProjectionPlan>(right);
     if (right_scan == nullptr && right_projection != nullptr) {
         right_scan = std::dynamic_pointer_cast<ScanPlan>(right_projection->subplan_);
     }
-    if (join_type == INNER_JOIN && right_scan != nullptr &&
+    if (join_type == INNER_JOIN && !natural && !lateral && right_scan != nullptr &&
         !mvcc_force_seqscan(context, right_scan->tab_name_, 2, right_scan->predicates_)) {
             // 只有 INNER JOIN 才选择 INLJ
         std::vector<std::string> index_col_names;
@@ -213,7 +215,8 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
         }
     }
     return std::make_shared<JoinPlan>(T_NestLoop, join_type, std::move(left), std::move(right),
-                                      std::move(join_conds));
+                                      std::move(join_conds), natural, lateral,
+                                      std::move(coalesced_cols));
 }
 
 namespace {
@@ -231,9 +234,22 @@ std::vector<TabCol> plan_output_cols(const std::shared_ptr<Plan> &plan) {
         return cols;
     }
     if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        if (join->type == LEFT_SEMI_JOIN || join->type == LEFT_ANTI_JOIN) {
+            return plan_output_cols(join->left_);
+        }
+        if (join->type == RIGHT_SEMI_JOIN || join->type == RIGHT_ANTI_JOIN) {
+            return plan_output_cols(join->right_);
+        }
         auto cols = plan_output_cols(join->left_);
         auto right_cols = plan_output_cols(join->right_);
         cols.insert(cols.end(), right_cols.begin(), right_cols.end());
+        for (const auto &merged : join->coalesced_cols_) cols.push_back(merged.output);
+        return cols;
+    }
+    if (auto rename = std::dynamic_pointer_cast<RenamePlan>(plan)) {
+        std::vector<TabCol> cols;
+        cols.reserve(rename->output_cols_.size());
+        for (const auto &col : rename->output_cols_) cols.push_back({col.tab_name, col.name});
         return cols;
     }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
@@ -302,12 +318,11 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         double rows = 1.0;
     };
 
-    auto all_bindings = query->from->bindings;
+    auto all_bindings = query->from->all_bindings;
     if (query->select_all) {
         query->cols.clear();
-        for (const auto &binding : all_bindings) {
-            const auto &tab = sm_manager_->db_.get_table(binding.table_name);
-            for (const auto &col : tab.cols) query->cols.push_back({binding.binding_name, col.name});
+        for (const auto &col : query->from->output_cols) {
+            query->cols.push_back({col.tab_name, col.name});
         }
     }
 
@@ -326,6 +341,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     std::function<bool(const std::shared_ptr<AnalyzedFrom> &)> is_inner_group;
     is_inner_group = [&](const std::shared_ptr<AnalyzedFrom> &node) {
         if (node->is_table) return true;
+        if (node->is_lateral_subquery) return false;
+        if (node->natural || node->lateral) return false;
         if (node->join_type != INNER_JOIN && node->join_type != CROSS_JOIN) return false;
         return is_inner_group(node->left) && is_inner_group(node->right);
     };
@@ -344,7 +361,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     */
     std::function<void(const std::shared_ptr<AnalyzedFrom> &)> prepare_on; 
     prepare_on = [&](const std::shared_ptr<AnalyzedFrom> &node) {
-        if (node->is_table) return; // 根节点返回
+        if (node->is_table || node->is_lateral_subquery) return; // 叶节点返回
         prepare_on(node->left); // 递归处理左子树
         prepare_on(node->right); // 递归处理右子树
         const auto left_names = node_bindings(node->left);
@@ -355,9 +372,9 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
                 const auto &name = *names.begin();
                 const bool in_left = left_names.count(name) != 0; // 单表条件是在左侧
                 const bool in_right = right_names.count(name) != 0; // 单表条件在右侧
-                const bool push_left = in_left && is_inner_group(node->left) &&
+                const bool push_left = !node->lateral && in_left && is_inner_group(node->left) &&
                     (node->join_type == INNER_JOIN || node->join_type == RIGHT_JOIN);
-                const bool push_right = in_right && is_inner_group(node->right) &&
+                const bool push_right = !node->lateral && in_right && is_inner_group(node->right) &&
                     (node->join_type == INNER_JOIN || node->join_type == LEFT_JOIN);
                 if (push_left || push_right) {
                     scan_filters[name].push_back(cond); // 能下推
@@ -375,7 +392,9 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     */
     std::function<bool(const std::shared_ptr<AnalyzedFrom> &, const std::string &)> where_pushable;
     where_pushable = [&](const std::shared_ptr<AnalyzedFrom> &node, const std::string &binding) {
-        if (node->is_table) return node->table.binding_name == binding;
+        if (node->is_table || node->is_lateral_subquery) {
+            return node->table.binding_name == binding;
+        }
         const auto left_names = node_bindings(node->left);
         if (left_names.count(binding) != 0) {
             if (node->join_type == RIGHT_JOIN || node->join_type == FULL_JOIN) return false;
@@ -430,6 +449,22 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     for (const auto &[_, conds] : scan_filters) for (const auto &cond : conds) require_cond(cond);
     for (const auto &[_, conds] : join_filters) for (const auto &cond : conds) require_cond(cond);
     for (const auto &cond : post_join_filters) require_cond(cond);
+    for (const auto &cond : query->correlated_conds) require_cond(cond);
+    std::function<void(const std::shared_ptr<AnalyzedFrom> &)> require_natural_sources;
+    require_natural_sources = [&](const std::shared_ptr<AnalyzedFrom> &node) {
+        if (node == nullptr || node->is_table) return;
+        if (node->is_lateral_subquery) {
+            for (const auto &cond : node->subquery->correlated_conds) require_cond(cond);
+            return;
+        }
+        for (const auto &merged : node->coalesced_cols) {
+            require_col(merged.left);
+            require_col(merged.right);
+        }
+        require_natural_sources(node->left);
+        require_natural_sources(node->right);
+    };
+    require_natural_sources(query->from);
 
     const size_t relation_count = all_bindings.size();
     auto make_scan = [&](const TableBinding &binding) -> BuildResult {
@@ -469,6 +504,16 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     std::function<BuildResult(const std::shared_ptr<AnalyzedFrom> &)> build;
     build = [&](const std::shared_ptr<AnalyzedFrom> &node) -> BuildResult {
         if (node->is_table) return make_scan(node->table);
+        if (node->is_lateral_subquery) {
+            std::shared_ptr<Plan> plan = generate_select_plan(node->subquery, context);
+            plan = std::make_shared<RenamePlan>(std::move(plan), node->output_cols);
+            auto local_filters = scan_filters[node->table.binding_name];
+            if (!local_filters.empty()) {
+                plan = std::make_shared<FilterPlan>(T_Filter, std::move(plan),
+                                                    std::move(local_filters));
+            }
+            return {std::move(plan), {node->table.binding_name}, 1000.0};
+        }
 
         if (is_inner_group(node)) { // 纯 INNER / CROSS 子树，则会将其展开
             std::vector<TableBinding> leaves;
@@ -592,14 +637,27 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         if (node->join_type == LEFT_JOIN) rows = std::max(rows, left.rows);
         if (node->join_type == RIGHT_JOIN) rows = std::max(rows, right.rows);
         if (node->join_type == FULL_JOIN) rows = std::max(rows, left.rows + right.rows);
+        BindingSet output_bindings = combined;
+        if (node->join_type == LEFT_SEMI_JOIN || node->join_type == LEFT_ANTI_JOIN) {
+            output_bindings = left.bindings;
+            rows = std::max(1.0, left.rows * 0.5);
+        } else if (node->join_type == RIGHT_SEMI_JOIN || node->join_type == RIGHT_ANTI_JOIN) {
+            output_bindings = right.bindings;
+            rows = std::max(1.0, right.rows * 0.5);
+        }
         return {make_join_plan(std::move(left.plan), std::move(right.plan), std::move(conds),
-                               node->join_type, context), std::move(combined), rows};
+                               node->join_type, context, node->natural, node->lateral,
+                               node->coalesced_cols), std::move(output_bindings), rows};
     };
 
     auto result = build(query->from);
     if (!post_join_filters.empty()) {
         result.plan = std::make_shared<FilterPlan>(T_Filter, std::move(result.plan),
                                                    std::move(post_join_filters));
+    }
+    if (!query->correlated_conds.empty()) {
+        result.plan = std::make_shared<CorrelatedFilterPlan>(std::move(result.plan),
+                                                            query->correlated_conds);
     }
     return result.plan;
 }
@@ -622,13 +680,13 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     // 规划会为 SELECT * 展开输出列，使用副本避免修改 Analyzer 结果。
     query = std::make_shared<Query>(*query);
 
-    auto physical_table = [&](const std::string &binding_name) -> std::string {
+    auto find_input_col = [&](const TabCol &target) -> ColMeta {
         if (query->from != nullptr) {
-            for (const auto &binding : query->from->bindings) {
-                if (binding.binding_name == binding_name) return binding.table_name;
+            for (const auto &col : query->from->cols) {
+                if (col.tab_name == target.tab_name && col.name == target.col_name) return col;
             }
         }
-        return binding_name;
+        throw ColumnNotFoundError(target.col_name);
     };
 
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
@@ -640,10 +698,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
         int offset = 0;
         // GROUP BY 列
         for (auto &gc : query->group_by_cols) {
-            auto tab = sm_manager_->db_.get_table(physical_table(gc.tab_name));
-            auto col_it = tab.get_col(gc.col_name);
-            ColMeta col = *col_it;
-            col.tab_name = gc.tab_name;
+            ColMeta col = find_input_col(gc);
             col.offset = offset;
             offset += col.len;
             output_cols.push_back(col);
@@ -666,8 +721,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                 } else if (agg.arg_type == TYPE_FLOAT) {
                     col.len = sizeof(float);
                 } else {
-                    auto tab = sm_manager_->db_.get_table(physical_table(agg.col.tab_name));
-                    col.len = tab.get_col(agg.col.col_name)->len;
+                    col.len = find_input_col(agg.col).len;
                 }
             }
             col.offset = offset;

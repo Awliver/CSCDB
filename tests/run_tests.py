@@ -1001,6 +1001,195 @@ failure
 failure"""
     results.append(run_testpoint("JOIN全功能回归", "tp12_join_db", tp12_sqls, tp12_expected))
 
+    # ==================== 测试点13: 扩展 JOIN 语义 ====================
+    # NATURAL 验证公共列合并与 FULL COALESCE；SEMI/ANTI 验证存在性语义；
+    # LATERAL 用逐左行 Top-1/聚合直接检查右子计划是否按外层行重新执行。
+    tp13_sqls = [
+        "create table nx_l (id int, lv int)",
+        "create table nx_r (id int, rv int)",
+        "create table nx_z (z int)",
+        "create table nx_s (id int, sv int)",
+        "create table nx_e (id int)",
+        "create table nx_c4 (k char(4), v int)",
+        "create table nx_c8 (k char(8), w int)",
+        "create table nx_m1 (a int, b int, ml int)",
+        "create table nx_m2 (b int, a int, mr int)",
+        "insert into nx_l values (1,10)",
+        "insert into nx_l values (2,20)",
+        "insert into nx_l values (4,40)",
+        "insert into nx_r values (2,200)",
+        "insert into nx_r values (3,300)",
+        "insert into nx_r values (4,400)",
+        "insert into nx_r values (4,401)",
+        "insert into nx_z values (9)",
+        "insert into nx_s values (2,2000)",
+        "insert into nx_s values (3,3000)",
+        "insert into nx_s values (5,5000)",
+        "insert into nx_c4 values ('abc',1)",
+        "insert into nx_c8 values ('abc',2)",
+        "insert into nx_c8 values ('abcdef',3)",
+        "insert into nx_m1 values (1,10,110)",
+        "insert into nx_m1 values (2,20,220)",
+        "insert into nx_m2 values (10,1,1001)",
+        "insert into nx_m2 values (20,9,9020)",
+        "insert into nx_m2 values (99,2,2099)",
+
+        "select * from nx_l natural join nx_r order by id,rv",
+        "select id,l.id,r.id from nx_l l natural full join nx_r r order by id,r.rv",
+        "select id,count(*) c from nx_l natural full join nx_r group by id order by id",
+        "select id,count(*) c from nx_l natural full join nx_r group by id having id>2 order by id",
+        "select count(*) c from nx_l natural join nx_z",
+        "select id,l.id,r.id from nx_l l natural right join nx_r r order by id,r.rv",
+        "select id,lv,rv,sv from (nx_l natural full join nx_r) natural full join nx_s order by id,rv",
+        "select * from nx_c4 natural full join nx_c8 order by k",
+        "select * from nx_m1 natural full join nx_m2 order by a,b",
+        "select * from nx_c4 semi join nx_c8 on nx_c4.k=nx_c8.k",
+
+        "select * from nx_l semi join nx_r on nx_l.id=nx_r.id order by nx_l.id",
+        "select * from nx_l anti join nx_r on nx_l.id=nx_r.id order by nx_l.id",
+        "select * from nx_l right semi join nx_r on nx_l.id=nx_r.id order by nx_r.id,nx_r.rv",
+        "select * from nx_l right anti join nx_r on nx_l.id=nx_r.id order by nx_r.id",
+        "select * from nx_e e right semi join nx_r r on e.id=r.id order by r.id,r.rv",
+        "select * from nx_e e right anti join nx_r r on e.id=r.id order by r.id,r.rv",
+        "select nx_r.id from nx_l semi join nx_r on nx_l.id=nx_r.id",
+        "select * from nx_l semi join nx_e on nx_l.id=nx_e.id",
+        "select * from nx_l anti join nx_e on nx_l.id=nx_e.id order by nx_l.id",
+        "select count(*) c from (nx_l l full join nx_r r on l.id=r.id) "
+        "semi join nx_s s on l.id=s.id",
+        "select count(*) c from (nx_l l full join nx_r r on l.id=r.id) "
+        "anti join nx_s s on l.id=s.id",
+
+        "select x.rv from nx_l l cross join lateral "
+        "(select r.rv from nx_r r where r.id=l.id order by r.rv desc limit 1) x order by x.rv",
+        "select l.id,x.rv from nx_l l left join lateral "
+        "(select r.rv from nx_r r where r.id=l.id) x on true order by l.id,x.rv",
+        "select l.id,x.c from nx_l l cross join lateral "
+        "(select count(*) c from nx_r r where r.id=l.id) x order by l.id",
+        "select l.id,x.rv from nx_l l left join lateral "
+        "(select r.rv from nx_r r where l.id<>0.5) x on true where x.rv=200 order by l.id",
+        "select l.id,x.rv from nx_l l inner join lateral "
+        "(select r.rv from nx_r r where r.id=l.id) x on x.rv>400 order by l.id,x.rv",
+        "select l.id,x.rv from nx_l l left join lateral "
+        "(select r.rv from nx_r r where r.id=l.id) x on x.rv>999 order by l.id",
+        "select * from nx_l l right join lateral "
+        "(select * from nx_r r where r.id=l.id) x on l.id=x.id",
+        "select * from nx_l l semi join nx_z z on true order by l.id",
+        "select * from nx_l l anti join nx_z z on true",
+        "select l.id,z.z from (nx_l l semi join nx_r r on l.id=r.id) left join nx_z z on true order by l.id",
+        "select count(*) c from nx_l l semi join nx_r r on l.id=r.id having r.id>0",
+        "select count(*) c from nx_l l semi join nx_r r on l.id=r.id having count(r.id)>0",
+        "select count(l.id) c from nx_l l semi join nx_r r on l.id=r.id having count(l.id)>0",
+        "select x.v from nx_l l cross join lateral "
+        "(select r.id v,r.rv v from nx_r r where r.id=l.id) x",
+    ]
+    tp13_expected = """| id | lv | rv |
+| 2 | 20 | 200 |
+| 4 | 40 | 400 |
+| 4 | 40 | 401 |
+| id | id | id |
+| 1 | 1 | NULL |
+| 2 | 2 | 2 |
+| 3 | NULL | 3 |
+| 4 | 4 | 4 |
+| 4 | 4 | 4 |
+| id | c |
+| 1 | 1 |
+| 2 | 1 |
+| 3 | 1 |
+| 4 | 2 |
+| id | c |
+| 3 | 1 |
+| 4 | 2 |
+| c |
+| 3 |
+| id | id | id |
+| 2 | 2 | 2 |
+| 3 | NULL | 3 |
+| 4 | 4 | 4 |
+| 4 | 4 | 4 |
+| id | lv | rv | sv |
+| 1 | 10 | NULL | NULL |
+| 2 | 20 | 200 | 2000 |
+| 3 | NULL | 300 | 3000 |
+| 4 | 40 | 400 | NULL |
+| 4 | 40 | 401 | NULL |
+| 5 | NULL | NULL | 5000 |
+| k | v | w |
+| abc | 1 | 2 |
+| abcdef | NULL | 3 |
+| a | b | ml | mr |
+| 1 | 10 | 110 | 1001 |
+| 2 | 20 | 220 | NULL |
+| 2 | 99 | NULL | 2099 |
+| 9 | 20 | NULL | 9020 |
+| k | v |
+| abc | 1 |
+| id | lv |
+| 2 | 20 |
+| 4 | 40 |
+| id | lv |
+| 1 | 10 |
+| id | rv |
+| 2 | 200 |
+| 4 | 400 |
+| 4 | 401 |
+| id | rv |
+| 3 | 300 |
+| id | rv |
+| id | rv |
+| 2 | 200 |
+| 3 | 300 |
+| 4 | 400 |
+| 4 | 401 |
+failure
+| id | lv |
+| id | lv |
+| 1 | 10 |
+| 2 | 20 |
+| 4 | 40 |
+| c |
+| 1 |
+| c |
+| 4 |
+| rv |
+| 200 |
+| 401 |
+| id | rv |
+| 1 | NULL |
+| 2 | 200 |
+| 4 | 400 |
+| 4 | 401 |
+| id | c |
+| 1 | 0 |
+| 2 | 1 |
+| 4 | 2 |
+| id | rv |
+| 1 | 200 |
+| 2 | 200 |
+| 4 | 200 |
+| id | rv |
+| 4 | 401 |
+| id | rv |
+| 1 | NULL |
+| 2 | NULL |
+| 4 | NULL |
+failure
+| id | lv |
+| 1 | 10 |
+| 2 | 20 |
+| 4 | 40 |
+| id | lv |
+| id | z |
+| 2 | 9 |
+| 4 | 9 |
+failure
+failure
+| c |
+| 2 |
+failure"""
+    results.append(run_testpoint("NATURAL/SEMI/ANTI/LATERAL JOIN回归",
+                                 "tp13_extended_join_db", tp13_sqls, tp13_expected))
+
     # 汇总
     print(f"\n{'='*60}")
     print("测试汇总")
@@ -1018,6 +1207,7 @@ failure"""
         "JOIN聚合测试",
         "大规模聚合综合测试",
         "JOIN全功能回归",
+        "NATURAL/SEMI/ANTI/LATERAL JOIN回归",
     ]
     for name, ok in zip(names, results):
         status = "PASS" if ok else "FAIL"

@@ -102,6 +102,10 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "OUTER" { return OUTER; }
 "CROSS" { return CROSS; }
 "FULL" { return FULL; }
+"NATURAL" { return NATURAL; }
+"SEMI" { return SEMI; }
+"ANTI" { return ANTI; }
+"LATERAL" { return LATERAL; }
 "ON" { return ON; }
 "EXPLAIN" { return EXPLAIN; }
 "ANALYZE" { return ANALYZE; }

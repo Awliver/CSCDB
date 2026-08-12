@@ -17,6 +17,9 @@ python3 tests/framework/p6_union_test.py
 
 # P4 EXPLAIN
 python3 tests/framework/explain/test_official_exact.py
+
+# JOIN 线下验收（严格校验 NLJ/INLJ 与扩展 JOIN 的 EXPLAIN）
+python3 tests/framework/explain/test_join_acceptance.py
 ```
 
 ## 目录概览
@@ -27,6 +30,7 @@ python3 tests/framework/explain/test_official_exact.py
 | `explain/` | P4 EXPLAIN |
 | `edge_cases/` | 边界与回归 |
 | `joins/` | P7 连接 |
+| `explain/test_join_acceptance.py` | JOIN 精确计划与运行时行数门禁 |
 | `p3/` | 索引相关 |
 | `test_db7` … | P2 测例数据库快照 |
 
