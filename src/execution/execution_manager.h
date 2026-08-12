@@ -53,7 +53,6 @@ class QlManager {
     void run_load(const std::string &file_path, const std::string &tab_name, Context *context);
 
     // 题4：EXPLAIN ANALYZE —— 构建优化后的计划树、执行计数、输出计划树（不输出结果集）
-    void run_explain(std::shared_ptr<Query> query, Context *context);
     // 题7：基于优化器计划树的 EXPLAIN ANALYZE（NLJ/INLJ）
     void explain_query_plan(std::shared_ptr<ExplainPlan> plan, Context *context);
 };

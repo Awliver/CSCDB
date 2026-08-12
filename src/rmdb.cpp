@@ -312,7 +312,7 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_select(const char *s) {
     if (!fp_trailing_ok(p)) return nullptr;
 
     return std::make_shared<ast::SelectStmt>(
-        cols, aggs, std::vector<std::string>{tab}, conds,
+        cols, aggs, std::make_shared<ast::TableRef>(tab, ""), conds,
         std::vector<std::shared_ptr<ast::Col>>{}, std::vector<std::shared_ptr<ast::BinaryExpr>>{},
         orders, has_limit, limit_count);
 }

@@ -63,21 +63,17 @@ public:
 class ScanPlan : public Plan
 {
     public:
-        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names)
-            : ScanPlan(tag, sm_manager, tab_name, tab_name, std::move(conds), std::move(index_col_names)) {}
-
         ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::string binding_name,
-                 std::vector<Condition> conds, std::vector<std::string> index_col_names)
+                 std::vector<Condition> predicates, std::vector<std::string> index_col_names)
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
             binding_name_ = std::move(binding_name);
-            conds_ = std::move(conds);
+            predicates_ = std::move(predicates);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
             for (auto &col : cols_) col.tab_name = binding_name_;
             len_ = cols_.back().offset + cols_.back().len;
-            fed_conds_ = conds_;
             index_col_names_ = index_col_names;
         
         }
@@ -86,9 +82,8 @@ class ScanPlan : public Plan
         std::string tab_name_;                     // 物理表名
         std::string binding_name_;                 // SQL 中的关系实例名（别名），支持自连接
         std::vector<ColMeta> cols_;                
-        std::vector<Condition> conds_;             
+        std::vector<Condition> predicates_;
         size_t len_;                               
-        std::vector<Condition> fed_conds_;
         std::vector<std::string> index_col_names_;
     
 };
@@ -96,18 +91,15 @@ class ScanPlan : public Plan
 class JoinPlan : public Plan
 {
     public:
-        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
-            : JoinPlan(tag, INNER_JOIN, std::move(left), std::move(right), std::move(conds)) {}
-
         JoinPlan(PlanTag tag, JoinType join_type, std::shared_ptr<Plan> left,
-                 std::shared_ptr<Plan> right, std::vector<Condition> conds)
+                 std::shared_ptr<Plan> right, std::vector<Condition> on_predicates)
         {
             // 分离逻辑连接类型和执行算法
             Plan::tag = tag; // 执行算法 T_NestLoop, T_IndexNestLoop
             type = join_type; // 逻辑类型 INNER, LEFT, RIGHT, FULL, CROSS
             left_ = std::move(left);
             right_ = std::move(right);
-            conds_ = std::move(conds);
+            on_predicates_ = std::move(on_predicates);
         }
         ~JoinPlan(){}
         // 左节点
@@ -115,7 +107,7 @@ class JoinPlan : public Plan
         // 右节点
         std::shared_ptr<Plan> right_;
         // 连接条件
-        std::vector<Condition> conds_;
+        std::vector<Condition> on_predicates_;
         // 逻辑连接类型，与 tag 表示的物理算法分离
         JoinType type;
 };
@@ -127,15 +119,15 @@ class JoinPlan : public Plan
     class FilterPlan : public Plan
 {
     public:
-        FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<Condition> conds)
+        FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<Condition> predicates)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
-            conds_ = std::move(conds);
+            predicates_ = std::move(predicates);
         }
         ~FilterPlan() {}
         std::shared_ptr<Plan> subplan_;
-        std::vector<Condition> conds_;
+        std::vector<Condition> predicates_;
 };
 
 class ProjectionPlan : public Plan
@@ -244,22 +236,19 @@ class ExplainPlan : public Plan
 class DMLPlan : public Plan
 {
     public:
-        DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan,std::string tab_name,
-                std::vector<Value> values, std::vector<Condition> conds,
-                std::vector<SetClause> set_clauses)
+        DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::string tab_name,
+                std::vector<Value> values, std::vector<SetClause> set_clauses)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
             tab_name_ = std::move(tab_name);
             values_ = std::move(values);
-            conds_ = std::move(conds);
             set_clauses_ = std::move(set_clauses);
         }
         ~DMLPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::string tab_name_;
         std::vector<Value> values_;
-        std::vector<Condition> conds_;
         std::vector<SetClause> set_clauses_;
 };
 
@@ -304,16 +293,4 @@ class SetKnobPlan : public Plan
         }
     ast::SetKnobType set_knob_type_;
     bool bool_value_;
-};
-
-class plannerInfo{
-    public:
-    std::shared_ptr<ast::SelectStmt> parse;
-    std::vector<Condition> where_conds;
-    std::vector<TabCol> sel_cols;
-    std::shared_ptr<Plan> plan;
-    std::vector<std::shared_ptr<Plan>> table_scan_executors;
-    std::vector<SetClause> set_clauses;
-    plannerInfo(std::shared_ptr<ast::SelectStmt> parse_):parse(std::move(parse_)){}
-
 };

@@ -61,8 +61,6 @@ int main() {
         assert(join != nullptr && join->type == LEFT_JOIN);
         assert(join->on_conds.size() == 1);
         assert(select->where_conds.size() == 1);
-        assert(select->tabs == std::vector<std::string>({"a", "b"}));
-        assert(select->conds.size() == 2);  // legacy Analyzer compatibility view
         yy_delete_buffer(buf);
     }
     ast::parse_tree.reset();

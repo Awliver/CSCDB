@@ -283,7 +283,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         right_cols_ = right_tab_.cols;
         for (auto &col : right_cols_) col.tab_name = right_binding_;
         join_conds_ = std::move(join_conds);
-        right_conds_ = right_scan.conds_;
+        right_conds_ = right_scan.predicates_;
 
         len_ = left_->tupleLen() + right_record_size_;
         cols_ = left_->cols();

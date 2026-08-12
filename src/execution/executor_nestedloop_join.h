@@ -26,7 +26,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     JoinType join_type_ = INNER_JOIN;
     size_t len_ = 0;
     std::vector<ColMeta> cols_;
-    std::vector<Condition> fed_conds_;
+    std::vector<Condition> on_predicates_;
     bool isend_ = true;
 
     std::unique_ptr<RmRecord> cur_left_;
@@ -135,7 +135,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     // 对 JOIN 匹配而言与 false 相同。
     bool eval_join_conds(const RmRecord *left_rec, const RmRecord *right_rec,
                          size_t right_index) const {
-        for (const auto &cond : fed_conds_) {
+        for (const auto &cond : on_predicates_) {
             const auto lhs = find_operand(cond.lhs_col, left_rec, right_rec, right_index);
             if (!lhs.found || lhs.is_null) return false;
 
@@ -234,7 +234,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                            std::vector<Condition> conds,
                            JoinType join_type = INNER_JOIN)
         : left_(std::move(left)), right_(std::move(right)), join_type_(join_type),
-          fed_conds_(std::move(conds)) {
+          on_predicates_(std::move(conds)) {
         len_ = left_->tupleLen() + right_->tupleLen();
         cols_ = left_->cols();
         auto right_cols = right_->cols();

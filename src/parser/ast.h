@@ -277,18 +277,6 @@ struct SelectStmt : public TreeNode {
     // 将 FROM 后的 ON 条件与 WHERE 后的 WHERE 条件区分
     std::shared_ptr<FromExpr> from;
     std::vector<std::shared_ptr<BinaryExpr>> where_conds;
-
-    // 下列字段是供现有 Analyzer/Planner 使用的兼容视图。
-    // tabs/aliases 由 from 树展开，conds 为 ON + WHERE；新代码不应依赖 conds
-    // 来判断谓词的语义位置。
-    std::vector<std::string> tabs;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
-    std::vector<std::shared_ptr<JoinExpr>> jointree; // vector 实现 jointree
-
-    // 列别名
-    std::vector<std::string> aliases;
-    bool is_explain = false;
-
     std::vector<std::shared_ptr<Col>> group_by_cols;
     std::vector<std::shared_ptr<BinaryExpr>> having_conds;
 
@@ -299,45 +287,6 @@ struct SelectStmt : public TreeNode {
     bool has_limit = false;
     int limit_count = 0;
 
-    void set_from(std::shared_ptr<FromExpr> from_,
-                  std::vector<std::shared_ptr<BinaryExpr>> where_conds_) { // 将 from 构造成 jointree，将条件收集
-        from = std::move(from_);
-        where_conds = std::move(where_conds_);
-        tabs.clear();
-        aliases.clear();
-        jointree.clear();
-        conds.clear();
-        collect_from(from);
-        conds.insert(conds.end(), where_conds.begin(), where_conds.end());
-    }
-
-    void collect_from(const std::shared_ptr<FromExpr> &node) { // 递归构建 jointree
-        if (auto table = std::dynamic_pointer_cast<TableRef>(node)) {
-            // jointree 叶子节点即为涉及的表
-            tabs.push_back(table->tab_name);
-            aliases.push_back(table->alias);
-            return;
-        }
-        auto join = std::dynamic_pointer_cast<JoinExpr>(node);
-        if (join == nullptr) return;
-        collect_from(join->left);
-        collect_from(join->right);
-        jointree.push_back(join); 
-        // 先处理左子树，再处理右子树，最后将当前节点放入 jointree
-        // 后序遍历，子连接在前，父连接在后
-        conds.insert(conds.end(), join->on_conds.begin(), join->on_conds.end());
-    }
-
-    SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
-               std::vector<std::string> tabs_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_,
-               std::shared_ptr<OrderBy> order_) :
-            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
-            order(std::move(order_)) {
-                has_sort = (bool)order;
-                if (order) orders = {order};
-            }
-
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
                std::vector<std::shared_ptr<AggExpr>> aggs_,
                std::shared_ptr<FromExpr> from_,
@@ -346,29 +295,13 @@ struct SelectStmt : public TreeNode {
                std::vector<std::shared_ptr<BinaryExpr>> having_conds_,
                std::vector<std::shared_ptr<OrderBy>> orders_,
                bool has_limit_, int limit_count_)
-        : cols(std::move(cols_)), aggs(std::move(aggs_)),
+        : cols(std::move(cols_)), aggs(std::move(aggs_)), from(std::move(from_)),
+          where_conds(std::move(where_conds_)),
           group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
           orders(std::move(orders_)), has_limit(has_limit_), limit_count(limit_count_) {
-        set_from(std::move(from_), std::move(where_conds_));
         has_sort = !orders.empty();
         if (!orders.empty()) order = orders[0];
     }
-
-    SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
-               std::vector<std::shared_ptr<AggExpr>> aggs_,
-               std::vector<std::string> tabs_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_,
-               std::vector<std::shared_ptr<Col>> group_by_cols_,
-               std::vector<std::shared_ptr<BinaryExpr>> having_conds_,
-               std::vector<std::shared_ptr<OrderBy>> orders_,
-               bool has_limit_,
-               int limit_count_) :
-            cols(std::move(cols_)), aggs(std::move(aggs_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
-            group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
-            orders(std::move(orders_)), has_limit(has_limit_), limit_count(limit_count_) {
-                has_sort = !orders.empty();
-                if (!orders.empty()) order = orders[0];
-            }
 };
 
 struct ExplainStmt : public TreeNode {

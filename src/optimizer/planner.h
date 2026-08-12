@@ -44,14 +44,9 @@ class Planner {
     void set_enable_sortmerge_join(bool set_val) { enable_sortmerge_join = set_val; }
     
    private:
-    std::shared_ptr<Query> logical_optimization(std::shared_ptr<Query> query, Context *context);
     std::shared_ptr<Plan> physical_optimization(std::shared_ptr<Query> query, Context *context);
 
-    std::shared_ptr<Plan> make_one_rel(std::shared_ptr<Query> query);
-    std::shared_ptr<Plan> make_one_rel_sql_order(std::shared_ptr<Query> query, Context *context);
     std::shared_ptr<Plan> make_join_tree_plan(std::shared_ptr<Query> query, Context *context);
-
-    std::shared_ptr<Plan> generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
     
     std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context *context);
 

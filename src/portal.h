@@ -104,8 +104,8 @@ class Portal
                     for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                         rids.push_back(scan->rid());
                     }
-                    std::unique_ptr<AbstractExecutor> root =std::make_unique<UpdateExecutor>(sm_manager_, 
-                                                            x->tab_name_, x->set_clauses_, x->conds_, rids, context);
+                    std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
+                        sm_manager_, x->tab_name_, x->set_clauses_, rids, context);
                     return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root), plan);
                 }
                 case T_Delete:
@@ -117,7 +117,7 @@ class Portal
                     }
 
                     std::unique_ptr<AbstractExecutor> root =
-                        std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
+                        std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, rids, context);
 
                     return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root), plan);
                 }
@@ -196,15 +196,15 @@ class Portal
                                                         x->sel_cols_);
         } else if (auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
             return std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context),
-                                                    x->conds_);
+                                                    x->predicates_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->binding_name_,
-                                                         x->conds_, context);
+                                                         x->predicates_, context);
             }
             else {
                 return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->binding_name_,
-                                                           x->conds_, x->index_col_names_, context);
+                                                           x->predicates_, x->index_col_names_, context);
             } 
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
@@ -212,12 +212,12 @@ class Portal
                 auto right_scan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
                 if (right_scan == nullptr) throw InternalError("Unexpected INLJ right plan");
                 return std::make_unique<IndexNestedLoopJoinExecutor>(std::move(left), sm_manager_, *right_scan,
-                                                                     x->conds_, context);
+                                                                     x->on_predicates_, context);
             }
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                                 std::move(left), 
-                                std::move(right), x->conds_, x->type);
+                                std::move(right), x->on_predicates_, x->type);
             return join;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             if (x->sort_cols_.size() == 1) {

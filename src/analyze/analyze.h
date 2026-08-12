@@ -82,24 +82,18 @@ struct AnalyzedFrom {
 */
  struct AnalyzeScope {
     std::vector<TableBinding> bindings;
-    std::vector<std::string> table_names;
     std::vector<ColMeta> cols;
 };
 
 
 class Query{
     public:
-    bool is_outer_join = false;
-    bool requires_join_tree_planner = false;
     std::shared_ptr<ast::TreeNode> parse;
     // 不再把 ON、WHERE当作同一种条件
     std::shared_ptr<AnalyzedFrom> from; // 完整的语义 jointree
     std::vector<Condition> where_conds; // JOIN 完成后的 WHERE 条件
 
-    // 旧 Planner 的兼容视图：按连接树后序排列的 ON 条件 + WHERE 条件。
-    std::vector<Condition> conds;
     std::vector<TabCol> cols;
-    std::vector<std::string> tables;
     std::vector<SetClause> set_clauses;
     std::vector<Value> values;
 
@@ -108,14 +102,6 @@ class Query{
     std::vector<TabCol> group_by_cols;
     std::vector<Condition> having_conds;
     std::vector<std::pair<TabCol, ast::OrderByDir>> orders;
-
-    // Planner 生成的逻辑优化结果。原始 conds 保持不变，供 EXPLAIN 等后续
-    // 阶段使用；物理规划直接消费已下推的单表谓词和剩余连接谓词。
-    std::map<std::string, std::vector<Condition>> table_filters;
-    std::vector<Condition> join_conditions;
-    // 多表非 SELECT * 查询会为每个表保存投影（即使恰好保留整表列），以便
-    // 在 Join 之前显式裁列；单表查询只保存能实际裁列的投影。
-    std::map<std::string, std::vector<TabCol>> table_projections;
 
     bool has_limit = false;
     int limit_count = 0;
@@ -128,13 +114,9 @@ class Query{
     std::string union_alias;
 
     // 题4 EXPLAIN
-    bool is_explain = false;
     bool explain_analyze = false;
     bool select_all = false;
     std::shared_ptr<Query> explain_query;
-    std::map<std::string, std::string> alias2real;
-    std::map<std::string, std::string> real2alias;
-
     Query(){}
 };
 
@@ -152,8 +134,6 @@ private:
     struct AnalyzedFromResult {
         std::shared_ptr<AnalyzedFrom> node;
         AnalyzeScope scope;
-        bool has_outer_join = false;
-        bool has_repeated_table = false;
     };
 
     TabCol check_column(const std::vector<ColMeta> &all_cols, TabCol target);
@@ -161,18 +141,12 @@ private:
     void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
     void check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds);
     AnalyzedFromResult analyze_from(const std::shared_ptr<ast::FromExpr> &from);
-    AnalyzedFromResult analyze_legacy_from(const std::vector<std::string> &tabs,
-                                           const std::vector<std::string> &aliases);
     AnalyzeScope merge_scopes(const AnalyzeScope &left, const AnalyzeScope &right);
     TabCol resolve_column(const AnalyzeScope &scope, TabCol target);
     std::vector<Condition> analyze_conditions(
         const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
         const AnalyzeScope &scope);
     void check_condition_types(const AnalyzeScope &scope, std::vector<Condition> &conds);
-    void collect_join_conditions(const std::shared_ptr<AnalyzedFrom> &from,
-                                 std::vector<Condition> &conds);
-    TabCol to_physical_column(const AnalyzeScope &scope, TabCol col);
-    Condition to_physical_condition(const AnalyzeScope &scope, Condition cond);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
     bool is_compatible_type(ColType lhs, ColType rhs);

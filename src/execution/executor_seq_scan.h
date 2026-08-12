@@ -20,11 +20,10 @@ class SeqScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;              // 表的名称
     std::string binding_name_;          // SQL 中的关系实例名
-    std::vector<Condition> conds_;      // scan的条件
+    std::vector<Condition> predicates_; // 当前 Scan 执行的局部谓词
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
     size_t len_;                        // scan后生成的每条记录的长度
-    std::vector<Condition> fed_conds_;  // 同conds_，两个字段相同
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;     // table_iterator
@@ -67,7 +66,7 @@ class SeqScanExecutor : public AbstractExecutor {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         binding_name_ = std::move(binding_name);
-        conds_ = std::move(conds);
+        predicates_ = std::move(conds);
         TabMeta &tab = sm_manager_->db_.get_table(tab_name_);
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab.cols;
@@ -76,14 +75,13 @@ class SeqScanExecutor : public AbstractExecutor {
 
         context_ = context;
 
-        fed_conds_ = conds_;
         compile_conds();
     }
 
      void compile_conds() {
         compiled_.clear();
-        compiled_.reserve(fed_conds_.size());
-        for (const auto &cond : fed_conds_) {
+        compiled_.reserve(predicates_.size());
+        for (const auto &cond : predicates_) {
             auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
                 return c.name == cond.lhs_col.col_name &&
                        (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
@@ -231,7 +229,7 @@ class SeqScanExecutor : public AbstractExecutor {
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
         if (ser_on_) {
-            auto physical_conds = fed_conds_;
+            auto physical_conds = predicates_;
             for (auto &cond : physical_conds) {
                 if (cond.lhs_col.tab_name == binding_name_) cond.lhs_col.tab_name = tab_name_;
                 if (!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_) cond.rhs_col.tab_name = tab_name_;

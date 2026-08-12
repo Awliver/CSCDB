@@ -25,11 +25,10 @@ class IndexScanExecutor : public AbstractExecutor {
     std::string tab_name_;                      // 物理表名
     std::string binding_name_;                  // SQL 中的关系实例名
     TabMeta tab_;                               // 表的元数据
-    std::vector<Condition> conds_;              // 扫描条件
+    std::vector<Condition> predicates_;         // 当前 Scan 执行的局部谓词
     RmFileHandle *fh_;                          // 表的数据文件句柄
     std::vector<ColMeta> cols_;                 // 需要读取的字段
     size_t len_;                                // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_;          // 扫描条件，和conds_字段相同
 
     std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
@@ -104,9 +103,9 @@ class IndexScanExecutor : public AbstractExecutor {
         tab_name_ = std::move(tab_name);
         binding_name_ = std::move(binding_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
-        conds_ = std::move(conds);
+        predicates_ = std::move(conds);
         // index_no_ = index_no;
-        index_col_names_ = index_col_names; 
+        index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
@@ -116,7 +115,7 @@ class IndexScanExecutor : public AbstractExecutor {
             {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
         };
 
-        for (auto &cond : conds_) {
+        for (auto &cond : predicates_) {
             if (cond.lhs_col.tab_name != binding_name_) {
                 // lhs is on other table, now rhs must be on this table
                 assert(!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_);
@@ -125,7 +124,6 @@ class IndexScanExecutor : public AbstractExecutor {
                 cond.op = swap_op.at(cond.op);
             }
         }
-        fed_conds_ = conds_;
         table_record_size_ = fh_->get_file_hdr().record_size;
     }
 
@@ -186,10 +184,10 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     /**
-     * 用 fed_conds_ 中的所有等值条件对单条记录做过滤
+     * 用 predicates_ 中的所有等值条件对单条记录做过滤
      */
     bool eval_conds(const RmRecord *rec) const {
-        for (const auto &cond : fed_conds_) {
+        for (const auto &cond : predicates_) {
             auto col_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
                 return c.name == cond.lhs_col.col_name;
             });
@@ -211,14 +209,14 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     /**
-     * 按索引列顺序分析 fed_conds_：找出前缀有多少 EQ 条件，并构造 EQ 前缀字节
+     * 按索引列顺序分析 predicates_：找出前缀有多少 EQ 条件，并构造 EQ 前缀字节
      */
     void analyze_conditions() {
         eq_match_count_ = 0;
         eq_prefix_data_.clear();
         for (const auto &col : index_meta_.cols) {
             bool found_eq = false;
-            for (const auto &cond : fed_conds_) {
+            for (const auto &cond : predicates_) {
                 if (cond.is_rhs_val && cond.op == OP_EQ &&
                     cond.lhs_col.tab_name == binding_name_ &&
                     cond.lhs_col.col_name == col.name) {
@@ -238,7 +236,7 @@ class IndexScanExecutor : public AbstractExecutor {
         skip_eq_data_.clear();
         if (eq_match_count_ == 0 && index_meta_.cols.size() >= 2) {
             bool first_has_cond = false;
-            for (const auto &cond : fed_conds_) {
+            for (const auto &cond : predicates_) {
                 if (cond.is_rhs_val && cond.lhs_col.tab_name == binding_name_ &&
                     cond.lhs_col.col_name == index_meta_.cols[0].name) {
                     first_has_cond = true;
@@ -249,7 +247,7 @@ class IndexScanExecutor : public AbstractExecutor {
                 for (size_t ci = 1; ci < index_meta_.cols.size(); ci++) {
                     const auto &col = index_meta_.cols[ci];
                     bool found_eq = false;
-                    for (const auto &cond : fed_conds_) {
+                    for (const auto &cond : predicates_) {
                         if (cond.is_rhs_val && cond.op == OP_EQ &&
                             cond.lhs_col.tab_name == binding_name_ &&
                             cond.lhs_col.col_name == col.name) {
@@ -475,7 +473,7 @@ class IndexScanExecutor : public AbstractExecutor {
      * 在 slot 指针上直接评估条件（无 alloc 版）
      */
     bool eval_conds_on_slot(const char *slot) const {
-        for (const auto &cond : fed_conds_) {
+        for (const auto &cond : predicates_) {
             auto col_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
                 return c.name == cond.lhs_col.col_name;
             });
@@ -498,8 +496,8 @@ class IndexScanExecutor : public AbstractExecutor {
 
     void compile_conds() {
         compiled_.clear();
-        compiled_.reserve(fed_conds_.size());
-        for (const auto &cond : fed_conds_) {
+        compiled_.reserve(predicates_.size());
+        for (const auto &cond : predicates_) {
             auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
                 return c.name == cond.lhs_col.col_name;
             });
@@ -582,7 +580,7 @@ class IndexScanExecutor : public AbstractExecutor {
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
         if (ser_on_) {
-            auto physical_conds = fed_conds_;
+            auto physical_conds = predicates_;
             for (auto &cond : physical_conds) {
                 if (cond.lhs_col.tab_name == binding_name_) cond.lhs_col.tab_name = tab_name_;
                 if (!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_) cond.rhs_col.tab_name = tab_name_;
@@ -605,7 +603,7 @@ class IndexScanExecutor : public AbstractExecutor {
         if (skip_mode_) {
             // index skip scan：从索引最小首列值起逐值枚举
             skip_done_ = false;
-            need_eval_ = !fed_conds_.empty();
+            need_eval_ = !predicates_.empty();
             need_prefix_check_ = true;
             if ((int)cur_key_buf_.size() < index_meta_.col_tot_len) {
                 cur_key_buf_.resize(index_meta_.col_tot_len);
@@ -639,7 +637,7 @@ class IndexScanExecutor : public AbstractExecutor {
         bool lower_inclusive = false, upper_inclusive = false;
         if (eq_match_count_ < (int)index_meta_.cols.size()) {
             const auto &range_col = index_meta_.cols[eq_match_count_];
-            for (const auto &cond : fed_conds_) {
+            for (const auto &cond : predicates_) {
                 if (!cond.is_rhs_val) continue;
                 if (cond.lhs_col.tab_name != binding_name_) continue;
                 if (cond.lhs_col.col_name != range_col.name) continue;
@@ -690,7 +688,7 @@ class IndexScanExecutor : public AbstractExecutor {
         }
 
         // 逐行防线不变：所有值条件始终 eval；EQ 前缀检查始终开启（早期硬停）。
-        need_eval_ = !fed_conds_.empty();
+        need_eval_ = !predicates_.empty();
         need_prefix_check_ = (eq_match_count_ > 0);
 
         scan_ = std::make_unique<IxScan>(ih, start_key.data(), end_key.data(), end_incl,

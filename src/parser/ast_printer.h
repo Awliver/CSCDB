@@ -168,15 +168,10 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
             print_node_list(x->cols, offset);
-            if (x->from != nullptr) {
-                print_val("FROM", offset);
-                print_node(x->from, offset + 2);
-                print_val("WHERE", offset);
-                print_node_list(x->where_conds, offset + 2);
-            } else {
-                print_val_list(x->tabs, offset);
-                print_node_list(x->conds, offset);
-            }
+            print_val("FROM", offset);
+            print_node(x->from, offset + 2);
+            print_val("WHERE", offset);
+            print_node_list(x->where_conds, offset + 2);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {
