@@ -34,6 +34,25 @@ int main() {
         "select * from a right outer join b on a.id = b.id;",
         "select * from a full join b on a.id = b.id;",
         "select * from a cross join b;",
+        "select * from a natural join b;",
+        "select * from a natural inner join b;",
+        "select * from a natural left outer join b;",
+        "select * from a natural right join b;",
+        "select * from a natural full outer join b;",
+        "select * from a semi join b on a.id = b.id;",
+        "select * from a left semi join b on a.id = b.id;",
+        "select * from a right semi join b on a.id = b.id;",
+        "select * from a anti join b on a.id = b.id;",
+        "select * from a left anti join b on a.id = b.id;",
+        "select * from a right anti join b on a.id = b.id;",
+        "select * from a join lateral (select * from b) x on a.id = x.id;",
+        "select * from a inner join lateral (select * from b) as x on a.id = x.id;",
+        "select * from a cross join lateral (select * from b) x;",
+        "select * from a left outer join lateral (select * from b) x on a.id = x.id;",
+        "select * from a left join lateral (select * from b) x on true;",
+        "select * from a right join lateral (select * from b) x on a.id = x.id;",
+        "select * from a full outer join lateral (select * from b) x on a.id = x.id;",
+        "select * from a natural join lateral (select * from b) x;",
         "exit;",
         "help;",
         "",
@@ -51,17 +70,24 @@ int main() {
         }
     }
 
-    {
-        YY_BUFFER_STATE buf = yy_scan_string(
-            "select * from a left join b on a.id = b.id where b.enabled = 1;");
+    auto parse_select = [](const std::string &sql) {
+        ast::parse_tree.reset();
+        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
         assert(yyparse() == 0);
         auto select = std::dynamic_pointer_cast<ast::SelectStmt>(ast::parse_tree);
         assert(select != nullptr);
+        yy_delete_buffer(buf);
+        return select;
+    };
+
+    {
+        auto select = parse_select(
+            "select * from a left join b on a.id = b.id where b.enabled = 1;");
         auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
         assert(join != nullptr && join->type == LEFT_JOIN);
+        assert(!join->natural && !join->lateral);
         assert(join->on_conds.size() == 1);
         assert(select->where_conds.size() == 1);
-        yy_delete_buffer(buf);
     }
     {
         YY_BUFFER_STATE buf = yy_scan_string(
@@ -87,6 +113,75 @@ int main() {
         assert(yyparse() != 0);
         yy_delete_buffer(buf);
     }
+
+    {
+        auto select = parse_select("select * from a natural full outer join b;");
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->type == FULL_JOIN);
+        assert(join->natural && !join->lateral);
+        assert(join->on_conds.empty());
+    }
+
+    {
+        const std::vector<std::pair<std::string, JoinType>> cases = {
+            {"select * from a semi join b on a.id = b.id;", LEFT_SEMI_JOIN},
+            {"select * from a left semi join b on a.id = b.id;", LEFT_SEMI_JOIN},
+            {"select * from a right semi join b on a.id = b.id;", RIGHT_SEMI_JOIN},
+            {"select * from a anti join b on a.id = b.id;", LEFT_ANTI_JOIN},
+            {"select * from a left anti join b on a.id = b.id;", LEFT_ANTI_JOIN},
+            {"select * from a right anti join b on a.id = b.id;", RIGHT_ANTI_JOIN},
+        };
+        for (const auto &[sql, type] : cases) {
+            auto select = parse_select(sql);
+            auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+            assert(join != nullptr && join->type == type);
+            assert(!join->natural && !join->lateral);
+            assert(join->on_conds.size() == 1);
+        }
+    }
+
+    {
+        auto select = parse_select(
+            "select * from a left outer join lateral "
+            "(select b.id from b where b.id > 0) as x on a.id = x.id;");
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->type == LEFT_JOIN);
+        assert(!join->natural && join->lateral);
+        assert(join->on_conds.size() == 1);
+        auto lateral = std::dynamic_pointer_cast<ast::LateralRef>(join->right);
+        assert(lateral != nullptr && lateral->alias == "x");
+        assert(lateral->subquery != nullptr);
+        assert(lateral->subquery->where_conds.size() == 1);
+    }
+
+    {
+        auto select = parse_select(
+            "select * from a left join lateral (select * from b) x on true;");
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->type == LEFT_JOIN && join->lateral);
+        assert(join->on_true && join->on_conds.empty());
+    }
+
+    {
+        auto select = parse_select(
+            "select * from a natural join lateral (select * from b) x;");
+        auto join = std::dynamic_pointer_cast<ast::JoinExpr>(select->from);
+        assert(join != nullptr && join->type == INNER_JOIN);
+        assert(join->natural && join->lateral && join->on_conds.empty());
+    }
+
+    auto assert_parse_error = [](const std::string &sql) {
+        ast::parse_tree.reset();
+        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
+        assert(yyparse() != 0);
+        yy_delete_buffer(buf);
+    };
+    assert_parse_error("select * from a natural cross join b;");
+    assert_parse_error("select * from a natural join b on a.id = b.id;");
+    assert_parse_error("select * from a semi join b;");
+    assert_parse_error("select * from a cross join lateral (select * from b);");
+    assert_parse_error("select * from a left join lateral (select * from b) x on false;");
+
     ast::parse_tree.reset();
     return 0;
 }

@@ -62,7 +62,9 @@ class Planner {
     std::shared_ptr<Plan> make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
                                          std::vector<Condition> join_conds,
                                          JoinType join_type = INNER_JOIN,
-                                         Context *context = nullptr);
+                                         Context *context = nullptr,
+                                         bool natural = false, bool lateral = false,
+                                         std::vector<CoalescedJoinColumn> coalesced_cols = {});
 
     ColType interp_sv_type(ast::SvType sv_type) {
         std::map<ast::SvType, ColType> m = {

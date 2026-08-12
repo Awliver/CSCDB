@@ -29,6 +29,22 @@ struct TabCol {
     }
 };
 
+/*
+ * A synthesized JOIN output column whose value is COALESCE(left, right).
+ *
+ * NATURAL/USING analysis keeps the two physical input columns addressable for
+ * ON evaluation, then asks the join executor to append one logical output
+ * column.  Keeping this description independent from Plan/Executor types lets
+ * the same contract flow through the whole query pipeline.
+ */
+struct CoalescedJoinColumn {
+    TabCol left;
+    TabCol right;
+    TabCol output;
+    ColType type;
+    int len;
+};
+
 struct Value {
     ColType type;  // type of value
     union {

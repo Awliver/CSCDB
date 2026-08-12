@@ -73,33 +73,33 @@ private:
     std::vector<bool> cur_nulls_;   // 当前输出行各列是否 NULL（空集聚合）
 
     // 辅助函数
-    std::string make_group_key(const char *data);
-    float read_as_float(const char *data, const ColMeta &col);
-    int read_as_int(const char *data, const ColMeta &col);
-    bool is_null(size_t input_col_idx) const;
-    int compare_value_by_val(const Value &a, const Value &b);
-    bool evaluate_condition(const Value &lhs, const Value &rhs, CompOp op);
-    bool satisfy_having(const std::vector<AggState> &states, const std::string &key);
-    void build_cur();
-    void advance_to_valid();
-    const ColMeta *find_argument_col(const AggregateInfo &agg) const;
-    void update_state(const AggregateInfo &agg, AggState &state,
-                      const RmRecord &record, const ColMeta *argument_col);
-    Value finalize(const AggregateInfo &agg, const AggState &state) const;
-    void write_finalized_value(const Value &value, size_t output_col_idx);
-    Value get_group_col_value(size_t group_idx, const std::string &key);
+    inline std::string make_group_key(const char *data);
+    inline float read_as_float(const char *data, const ColMeta &col);
+    inline int read_as_int(const char *data, const ColMeta &col);
+    inline bool is_null(size_t input_col_idx) const;
+    inline int compare_value_by_val(const Value &a, const Value &b);
+    inline bool evaluate_condition(const Value &lhs, const Value &rhs, CompOp op);
+    inline bool satisfy_having(const std::vector<AggState> &states, const std::string &key);
+    inline void build_cur();
+    inline void advance_to_valid();
+    inline const ColMeta *find_argument_col(const AggregateInfo &agg) const;
+    inline void update_state(const AggregateInfo &agg, AggState &state,
+                             const RmRecord &record, const ColMeta *argument_col);
+    inline Value finalize(const AggregateInfo &agg, const AggState &state) const;
+    inline void write_finalized_value(const Value &value, size_t output_col_idx);
+    inline Value get_group_col_value(size_t group_idx, const std::string &key);
 
 public:
-    AggExecutor(std::unique_ptr<AbstractExecutor> prev,
-                const std::vector<TabCol> &group_cols,
-                const std::vector<AggregateInfo> &agg_exprs,
-                const std::vector<HavingCondition> &having_conds,
-                std::vector<ColMeta> output_cols);
+    inline AggExecutor(std::unique_ptr<AbstractExecutor> prev,
+                       const std::vector<TabCol> &group_cols,
+                       const std::vector<AggregateInfo> &agg_exprs,
+                       const std::vector<HavingCondition> &having_conds,
+                       std::vector<ColMeta> output_cols);
 
-    void beginTuple() override;
-    void nextTuple() override;
-    bool is_end() const override;
-    std::unique_ptr<RmRecord> Next() override;
+    inline void beginTuple() override;
+    inline void nextTuple() override;
+    inline bool is_end() const override;
+    inline std::unique_ptr<RmRecord> Next() override;
     const std::vector<bool> *null_mask() const override { return &cur_nulls_; }
     const std::vector<ColMeta> &cols() const override { return cols_; }
     size_t tupleLen() const override { return len_; }

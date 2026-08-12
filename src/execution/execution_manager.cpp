@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include "executor_delete.h"
+#include "executor_aggregation.h"
 #include "executor_index_scan.h"
 #include "executor_insert.h"
 #include "executor_nestedloop_join.h"
@@ -18,6 +19,11 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "executor_filter.h"
+#include "executor_correlated_filter.h"
+#include "executor_lateral_join.h"
+#include "executor_rename.h"
+#include "executor_limit.h"
+#include "execution_sort.h"
 #include "index/ix.h"
 #include <algorithm>
 #include <map>
@@ -186,11 +192,20 @@ std::string join_strings_sorted(std::vector<std::string> values) {
     return os.str();
 }
 
+bool is_natural_synthetic(const std::string &binding) {
+    return !binding.empty() && binding.front() == '\x1f';
+}
+
+std::string display_col(const TabCol &col) {
+    if (col.tab_name.empty() || is_natural_synthetic(col.tab_name)) return col.col_name;
+    return col.tab_name + "." + col.col_name;
+}
+
 std::string cond_to_string(const Condition &cond) {
     std::ostringstream os;
-    os << cond.lhs_col.tab_name << "." << cond.lhs_col.col_name << join_op_to_string(cond.op);
+    os << display_col(cond.lhs_col) << join_op_to_string(cond.op);
     if (!cond.is_rhs_val) {
-        os << cond.rhs_col.tab_name << "." << cond.rhs_col.col_name;
+        os << display_col(cond.rhs_col);
     } else if (cond.rhs_val.type == TYPE_INT) {
         os << cond.rhs_val.int_val;
     } else if (cond.rhs_val.type == TYPE_FLOAT) {
@@ -224,19 +239,37 @@ void collect_plan_bindings(const std::shared_ptr<Plan> &plan, std::set<std::stri
         collect_plan_bindings(limit->subplan_, bindings);
     } else if (auto agg = std::dynamic_pointer_cast<AggPlan>(plan)) {
         collect_plan_bindings(agg->subplan_, bindings);
+    } else if (auto rename = std::dynamic_pointer_cast<RenamePlan>(plan)) {
+        if (!rename->output_cols_.empty()) bindings.insert(rename->output_cols_.front().tab_name);
+    } else if (auto correlated = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
+        collect_plan_bindings(correlated->subplan_, bindings);
     }
 }
 
 std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
-    const std::shared_ptr<Plan> &plan) {
+    const std::shared_ptr<Plan> &plan,
+    std::shared_ptr<CorrelatedTupleContext> correlated = nullptr) {
     if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        // 投影不改变行数；统计连接结果时保留更宽的输入 schema 也不会改变
-        // 谓词求值，因此可以透明跳过。
-        return make_explain_executor(sm_manager, projection->subplan_);
+        auto child = make_explain_executor(sm_manager, projection->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        return std::make_unique<ProjectionExecutor>(std::move(child), projection->sel_cols_);
     }
     if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
-        return std::make_unique<FilterExecutor>(
-            make_explain_executor(sm_manager, filter->subplan_), filter->predicates_);
+        auto child = make_explain_executor(sm_manager, filter->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        return std::make_unique<FilterExecutor>(std::move(child), filter->predicates_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
+        if (correlated == nullptr) return nullptr;
+        auto child = make_explain_executor(sm_manager, filter->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        return std::make_unique<CorrelatedFilterExecutor>(
+            std::move(child), filter->predicates_, correlated);
+    }
+    if (auto rename = std::dynamic_pointer_cast<RenamePlan>(plan)) {
+        auto child = make_explain_executor(sm_manager, rename->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        return std::make_unique<RenameExecutor>(std::move(child), rename->output_cols_);
     }
     if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
         // 统计只关心真实输出行；统一用顺序扫描可避免把 EXPLAIN 绑定到某个
@@ -245,33 +278,127 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
                                                  scan->predicates_, nullptr);
     }
     if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        auto left = make_explain_executor(sm_manager, join->left_, correlated);
+        if (left == nullptr) return nullptr;
+        if (join->lateral_) {
+            auto lateral_context = std::make_shared<CorrelatedTupleContext>();
+            auto right = make_explain_executor(sm_manager, join->right_, lateral_context);
+            if (right == nullptr) return nullptr;
+            return std::make_unique<LateralNestedLoopJoinExecutor>(
+                std::move(left), std::move(right), join->on_predicates_, join->type,
+                std::move(lateral_context));
+        }
+        auto right = make_explain_executor(sm_manager, join->right_, correlated);
+        if (right == nullptr) return nullptr;
         return std::make_unique<NestedLoopJoinExecutor>(
-            make_explain_executor(sm_manager, join->left_),
-            make_explain_executor(sm_manager, join->right_),
-            join->on_predicates_, join->type);
+            std::move(left), std::move(right),
+            join->on_predicates_, join->type, join->coalesced_cols_);
+    }
+    if (auto agg = std::dynamic_pointer_cast<AggPlan>(plan)) {
+        auto child = make_explain_executor(sm_manager, agg->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        return std::make_unique<AggExecutor>(
+            std::move(child), agg->group_cols_, agg->agg_exprs_,
+            agg->having_conds_, agg->output_cols_);
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        auto child = make_explain_executor(sm_manager, sort->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        if (sort->sort_cols_.size() == 1) {
+            return std::make_unique<SortExecutor>(std::move(child),
+                                                  sort->sort_cols_[0].first,
+                                                  sort->sort_cols_[0].second);
+        }
+        std::vector<std::pair<ColMeta, bool>> columns;
+        for (const auto &[target, desc] : sort->sort_cols_) {
+            auto it = std::find_if(child->cols().begin(), child->cols().end(),
+                                   [&](const ColMeta &col) {
+                                       return col.name == target.col_name &&
+                                              (target.tab_name.empty() || col.tab_name == target.tab_name);
+                                   });
+            if (it == child->cols().end()) throw ColumnNotFoundError(target.col_name);
+            columns.emplace_back(*it, desc);
+        }
+        return std::make_unique<SortExecutor>(std::move(child), columns);
+    }
+    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        auto child = make_explain_executor(sm_manager, limit->subplan_, correlated);
+        if (child == nullptr) return nullptr;
+        return std::make_unique<LimitExecutor>(std::move(child), limit->limit_);
     }
     return nullptr;
 }
 
-size_t count_plan_output(SmManager *sm_manager, const std::shared_ptr<Plan> &plan) {
+struct ExplainOuterTuple {
+    std::unique_ptr<RmRecord> record;
+    std::vector<ColMeta> columns;
+    std::vector<bool> nulls;
+};
+
+using ExplainOuterRows = std::vector<ExplainOuterTuple>;
+
+ExplainOuterRows materialize_plan_output(SmManager *sm_manager,
+                                         const std::shared_ptr<Plan> &plan,
+                                         const ExplainOuterRows *outer_rows = nullptr) {
+    ExplainOuterRows result;
+    auto correlated = outer_rows == nullptr
+                          ? std::shared_ptr<CorrelatedTupleContext>()
+                          : std::make_shared<CorrelatedTupleContext>();
+    auto executor = make_explain_executor(sm_manager, plan, correlated);
+    if (executor == nullptr) return result;
+
+    auto collect_current_run = [&]() {
+        for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) {
+            ExplainOuterTuple tuple;
+            tuple.columns = executor->cols();
+            tuple.nulls.assign(tuple.columns.size(), false);
+            if (const auto *mask = executor->null_mask(); mask != nullptr) {
+                for (size_t i = 0; i < tuple.nulls.size() && i < mask->size(); ++i) {
+                    tuple.nulls[i] = (*mask)[i];
+                }
+            }
+            tuple.record = executor->Next();
+            if (tuple.record == nullptr) {
+                throw InternalError("EXPLAIN executor returned no current tuple");
+            }
+            result.push_back(std::move(tuple));
+        }
+    };
+
+    if (outer_rows == nullptr) {
+        collect_current_run();
+    } else {
+        for (const auto &outer : *outer_rows) {
+            correlated->bind(*outer.record, outer.columns, &outer.nulls);
+            collect_current_run();
+        }
+        correlated->clear();
+    }
+    return result;
+}
+
+size_t count_plan_output(SmManager *sm_manager, const std::shared_ptr<Plan> &plan,
+                         const ExplainOuterRows *outer_rows = nullptr) {
     if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        return count_plan_output(sm_manager, projection->subplan_);
+        return count_plan_output(sm_manager, projection->subplan_, outer_rows);
     }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        return count_plan_output(sm_manager, sort->subplan_);
+        return count_plan_output(sm_manager, sort->subplan_, outer_rows);
     }
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        if (outer_rows != nullptr) return materialize_plan_output(sm_manager, plan, outer_rows).size();
         return std::min(limit->limit_, count_plan_output(sm_manager, limit->subplan_));
     }
     if (auto agg = std::dynamic_pointer_cast<AggPlan>(plan)) {
-        if (agg->group_cols_.empty()) return 1;
-        return count_plan_output(sm_manager, agg->subplan_);
+        return materialize_plan_output(sm_manager, plan, outer_rows).size();
     }
     if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        if (outer_rows != nullptr) return materialize_plan_output(sm_manager, plan, outer_rows).size();
         size_t rows = 0;
         for (const auto &child : union_plan->subplans_) rows += count_plan_output(sm_manager, child);
         return rows;
     }
+    if (outer_rows != nullptr) return materialize_plan_output(sm_manager, plan, outer_rows).size();
     auto executor = make_explain_executor(sm_manager, plan);
     if (executor == nullptr) return 0;
     size_t rows = 0;
@@ -287,21 +414,38 @@ std::set<std::string> plan_table_set(const std::shared_ptr<Plan> &plan) {
 
 void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &plan,
                          int depth, size_t outer_rows, long long forced_rows, bool root_select_all,
-                         std::vector<std::string> &lines) {
+                         std::vector<std::string> &lines,
+                         const ExplainOuterRows *correlated_rows = nullptr) {
     if (auto proj = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         std::vector<std::string> cols;
         if (root_select_all) {
             cols.push_back("*");
         } else {
             for (const auto &col : proj->sel_cols_) {
-                cols.push_back((col.tab_name.empty() ? "" : col.tab_name + ".") + col.col_name);
+                cols.push_back(display_col(col));
             }
         }
         lines.push_back(std::string(depth, '\t') + "Project(columns=[" +
                         join_strings_sorted(cols) + "], rows=" +
-                        std::to_string(count_plan_output(sm_manager, plan)) + ")");
+                        std::to_string(count_plan_output(sm_manager, plan, correlated_rows)) + ")");
         render_explain_plan(sm_manager, proj->subplan_, depth + 1, outer_rows, forced_rows,
-                            false, lines);
+                            false, lines, correlated_rows);
+        return;
+    }
+    if (auto filter = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
+        std::vector<std::string> conds;
+        for (const auto &cond : filter->predicates_) conds.push_back(cond_to_string(cond));
+        lines.push_back(std::string(depth, '\t') + "CorrelatedFilter(condition=[" +
+                        join_strings_sorted(conds) + "])");
+        render_explain_plan(sm_manager, filter->subplan_, depth + 1, outer_rows,
+                            forced_rows, false, lines, correlated_rows);
+        return;
+    }
+    if (auto rename = std::dynamic_pointer_cast<RenamePlan>(plan)) {
+        std::string alias = rename->output_cols_.empty() ? "" : rename->output_cols_[0].tab_name;
+        lines.push_back(std::string(depth, '\t') + "DerivedTable(alias=" + alias + ")");
+        render_explain_plan(sm_manager, rename->subplan_, depth + 1, outer_rows,
+                            forced_rows, false, lines, correlated_rows);
         return;
     }
     if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
@@ -310,33 +454,36 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         lines.push_back(std::string(depth, '\t') + "Filter(condition=[" +
                         join_strings_sorted(conds) + "])");
         render_explain_plan(sm_manager, filter->subplan_, depth + 1, outer_rows,
-                            forced_rows, false, lines);
+                            forced_rows, false, lines, correlated_rows);
         return;
     }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         std::vector<std::string> cols;
         for (const auto &[col, desc] : sort->sort_cols_) {
-            cols.push_back((col.tab_name.empty() ? "" : col.tab_name + ".") + col.col_name +
-                           (desc ? " DESC" : " ASC"));
+            cols.push_back(display_col(col) + (desc ? " DESC" : " ASC"));
         }
         lines.push_back(std::string(depth, '\t') + "Sort(columns=[" + join_strings_sorted(cols) + "])");
-        render_explain_plan(sm_manager, sort->subplan_, depth + 1, outer_rows, forced_rows, false, lines);
+        render_explain_plan(sm_manager, sort->subplan_, depth + 1, outer_rows, forced_rows,
+                            false, lines, correlated_rows);
         return;
     }
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
         lines.push_back(std::string(depth, '\t') + "Limit(count=" + std::to_string(limit->limit_) + ")");
-        render_explain_plan(sm_manager, limit->subplan_, depth + 1, outer_rows, forced_rows, false, lines);
+        render_explain_plan(sm_manager, limit->subplan_, depth + 1, outer_rows, forced_rows,
+                            false, lines, correlated_rows);
         return;
     }
     if (auto agg = std::dynamic_pointer_cast<AggPlan>(plan)) {
         std::vector<std::string> groups;
         std::vector<std::string> aggs;
-        for (const auto &col : agg->group_cols_) groups.push_back(col.tab_name + "." + col.col_name);
+        for (const auto &col : agg->group_cols_) groups.push_back(display_col(col));
         for (const auto &expr : agg->agg_exprs_) aggs.push_back(expr.to_string());
         lines.push_back(std::string(depth, '\t') + "Aggregate(group_by=[" +
                         join_strings_sorted(groups) + "], aggregates=[" + join_strings_sorted(aggs) +
-                        "], rows=" + std::to_string(count_plan_output(sm_manager, plan)) + ")");
-        render_explain_plan(sm_manager, agg->subplan_, depth + 1, outer_rows, forced_rows, false, lines);
+                        "], rows=" +
+                        std::to_string(count_plan_output(sm_manager, plan, correlated_rows)) + ")");
+        render_explain_plan(sm_manager, agg->subplan_, depth + 1, outer_rows, forced_rows,
+                            false, lines, correlated_rows);
         return;
     }
     std::string indent(depth, '\t');
@@ -363,27 +510,53 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         if (scan->tag == T_IndexScan && !scan->index_col_names_.empty()) {
             scan_line += ", using_index=(" + join_strings_sorted(scan->index_col_names_) + ")";
         }
-        scan_line += ", rows=" + std::to_string(raw_rows * outer_rows) + ")";
+        // NLJ reports every inner-table visit (outer rows * raw rows).  INLJ
+        // passes forced_rows as the number of successful index probes, which is
+        // the runtime statistic required by the assignment rather than the
+        // hypothetical full-scan count.
+        const size_t scan_rows = forced_rows >= 0 ? static_cast<size_t>(forced_rows)
+                                                  : raw_rows * outer_rows;
+        scan_line += ", rows=" + std::to_string(scan_rows) + ")";
         lines.push_back(scan_line);
         return;
     }
     if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-        size_t left_rows = count_plan_output(sm_manager, join->left_);
-        size_t join_rows = count_plan_output(sm_manager, plan);
+        size_t left_rows = count_plan_output(sm_manager, join->left_, correlated_rows);
+        size_t join_rows = count_plan_output(sm_manager, plan, correlated_rows);
         auto tables = plan_table_set(plan);
         std::vector<std::string> table_names(tables.begin(), tables.end());
         std::vector<std::string> conds;
         for (auto &cond : join->on_predicates_) conds.push_back(cond_to_string(cond));
         static const std::map<JoinType, std::string> join_types = {
             {INNER_JOIN, "INNER"}, {LEFT_JOIN, "LEFT"}, {RIGHT_JOIN, "RIGHT"},
-            {FULL_JOIN, "FULL"}, {CROSS_JOIN, "CROSS"}};
-        lines.push_back(indent + "Join(type=" + join_types.at(join->type) + ", tables=[" +
+            {FULL_JOIN, "FULL"}, {CROSS_JOIN, "CROSS"},
+            {LEFT_SEMI_JOIN, "LEFT SEMI"}, {RIGHT_SEMI_JOIN, "RIGHT SEMI"},
+            {LEFT_ANTI_JOIN, "LEFT ANTI"}, {RIGHT_ANTI_JOIN, "RIGHT ANTI"}};
+        std::string type_name = join_types.at(join->type);
+        if (join->natural_) type_name = "NATURAL " + type_name;
+        if (join->lateral_) type_name += " LATERAL";
+        // Keep the original assignment's exact EXPLAIN format for ordinary
+        // INNER joins.  Both explicit INNER JOIN and comma joins connected by
+        // an equality predicate are normalized to this JoinType by Planner.
+        // Modified join semantics retain type= so they remain distinguishable.
+        const bool legacy_inner = join->type == INNER_JOIN &&
+                                  !join->natural_ && !join->lateral_;
+        const std::string type_field = legacy_inner ? "" : "type=" + type_name + ", ";
+        lines.push_back(indent + "Join(" + type_field + "tables=[" +
                         join_strings_sorted(table_names) + "], condition=[" +
                         join_strings_sorted(conds) + "], rows=" + std::to_string(join_rows) + ")");
-        render_explain_plan(sm_manager, join->left_, depth + 1, 1, -1, false, lines);
+        render_explain_plan(sm_manager, join->left_, depth + 1, 1, -1, false, lines,
+                            correlated_rows);
         bool inlj = join->tag == T_IndexNestLoop;
-        render_explain_plan(sm_manager, join->right_, depth + 1, left_rows,
-                            inlj ? static_cast<long long>(join_rows) : -1, false, lines);
+        if (join->lateral_) {
+            auto lateral_rows = materialize_plan_output(sm_manager, join->left_, correlated_rows);
+            render_explain_plan(sm_manager, join->right_, depth + 1, lateral_rows.size(),
+                                -1, false, lines, &lateral_rows);
+        } else {
+            render_explain_plan(sm_manager, join->right_, depth + 1, left_rows,
+                                inlj ? static_cast<long long>(join_rows) : -1, false, lines,
+                                correlated_rows);
+        }
     }
 }
 
@@ -398,6 +571,24 @@ void QlManager::explain_query_plan(std::shared_ptr<ExplainPlan> plan, Context *c
     std::ostringstream os;
     for (auto &line : lines) os << line << "\n";
     std::string out = os.str();
+
+    // Wire v3 has no legacy text-response frame.  Expose an EXPLAIN plan as a
+    // regular one-column result set so clients can assert both the plan shape
+    // and its runtime row counts.  Keep the historical text buffer below for
+    // the original NUL-terminated protocol and output.txt compatibility.
+    if (context != nullptr && context->wire_sink_ != nullptr) {
+        context->wire_sink_->on_meta({{"QUERY PLAN", TYPE_STRING}});
+        uint64_t emitted = 0;
+        for (const auto &line : lines) {
+            WireCell cell;
+            cell.type = TYPE_STRING;
+            cell.str_val = line;
+            context->wire_sink_->on_row({std::move(cell)});
+            ++emitted;
+            if (context->wire_sink_->failed()) break;
+        }
+        context->wire_sink_->on_end(emitted);
+    }
     if (context->data_send_ && context->offset_) {
         memcpy(context->data_send_ + *(context->offset_), out.c_str(), out.size());
         *(context->offset_) += (int)out.size();

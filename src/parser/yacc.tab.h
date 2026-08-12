@@ -35,8 +35,8 @@
    especially those whose name start with YY_ or yy_.  They are
    private implementation details that can be changed or removed.  */
 
-#ifndef YY_YY_ROOT_CSC_DB_LEARN_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED
-# define YY_YY_ROOT_CSC_DB_LEARN_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED
+#ifndef YY_YY_YACC_TAB_H_INCLUDED
+# define YY_YY_YACC_TAB_H_INCLUDED
 /* Debug traces.  */
 #ifndef YYDEBUG
 # define YYDEBUG 0
@@ -107,15 +107,19 @@ extern int yydebug;
     OUTER = 308,                   /* OUTER  */
     CROSS = 309,                   /* CROSS  */
     FULL = 310,                    /* FULL  */
-    LEQ = 311,                     /* LEQ  */
-    NEQ = 312,                     /* NEQ  */
-    GEQ = 313,                     /* GEQ  */
-    T_EOF = 314,                   /* T_EOF  */
-    IDENTIFIER = 315,              /* IDENTIFIER  */
-    VALUE_STRING = 316,            /* VALUE_STRING  */
-    VALUE_INT = 317,               /* VALUE_INT  */
-    VALUE_FLOAT = 318,             /* VALUE_FLOAT  */
-    VALUE_BOOL = 319               /* VALUE_BOOL  */
+    NATURAL = 311,                 /* NATURAL  */
+    SEMI = 312,                    /* SEMI  */
+    ANTI = 313,                    /* ANTI  */
+    LATERAL = 314,                 /* LATERAL  */
+    LEQ = 315,                     /* LEQ  */
+    NEQ = 316,                     /* NEQ  */
+    GEQ = 317,                     /* GEQ  */
+    T_EOF = 318,                   /* T_EOF  */
+    IDENTIFIER = 319,              /* IDENTIFIER  */
+    VALUE_STRING = 320,            /* VALUE_STRING  */
+    VALUE_INT = 321,               /* VALUE_INT  */
+    VALUE_FLOAT = 322,             /* VALUE_FLOAT  */
+    VALUE_BOOL = 323               /* VALUE_BOOL  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -142,4 +146,4 @@ struct YYLTYPE
 int yyparse (void);
 
 
-#endif /* !YY_YY_ROOT_CSC_DB_LEARN_CSC_DB_SRC_PARSER_YACC_TAB_H_INCLUDED  */
+#endif /* !YY_YY_YACC_TAB_H_INCLUDED  */

@@ -29,8 +29,8 @@ struct AggregateInfo {
     bool is_star = false;
     ColType arg_type = TYPE_INT;
     int arg_len = sizeof(int);
-    bool in_output = true;     // 是否出现在最终输出中
-    bool distinct = false;   // 支持 COUNT(DISTINCT col) 与 COUNT(DISTINCT (col))
+    bool in_output = true;
+    bool distinct = false;
 
     std::string to_string() const {
         return ast::format_aggregate_call(type, col.col_name, is_star, distinct);
@@ -45,8 +45,7 @@ enum class HavingSource {
     AGGREGATE,
 };
 
-/* Analyzer-resolved HAVING operand.  Slots replace the old aggregate-name
- * strings, so execution never reparses SQL text or guesses between aliases. */
+// Analyzer 直接解析 HAVING 的来源和槽位，执行器不再反解聚合函数字符串。
 struct HavingCondition {
     HavingSource source = HavingSource::GROUP_COLUMN;
     size_t index = 0;
@@ -55,59 +54,60 @@ struct HavingCondition {
 };
 
 /*
-    之所以专门设置一个TableBinding，是为了区分连接中的不同关系实例
-    FROM employee e1
-    JOIN employee e2 ON e1.manager_id = e2.id
-    虽然真实表均为employee，但e1、e2是两个实例，若不加以区分会出现语义错误
+    TableBinding 用于区分连接中的不同关系实例。例如 employee e1 与
+    employee e2 虽然指向同一物理表，但属于两个独立 binding。
 */
 struct TableBinding {
-    // FROM student AS s
-    // 若没有别名，则table_name = binding_name
-    std::string table_name;    // 数据库中的真实表名，“student”
-    std::string binding_name;  // 当前 SQL 中引用这张表所使用的名称，“s”
+    std::string table_name;
+    std::string binding_name;
 };
 
+class Query;
 
 struct AnalyzedFrom {
     bool is_table = false;
+    bool is_lateral_subquery = false;
 
-    // 叶节点表示表
+    // 普通表或 LATERAL 派生表的叶节点信息。
     TableBinding table;
+    std::shared_ptr<Query> subquery;
 
-    // 非叶节点表示连接
+    // 非叶节点表示连接。
     JoinType join_type = INNER_JOIN;
+    bool natural = false;
+    bool lateral = false;
     std::shared_ptr<AnalyzedFrom> left;
     std::shared_ptr<AnalyzedFrom> right;
-    std::vector<Condition> on_conds; // 每个 JOIN 节点自行保存 ON 条件
+    std::vector<Condition> on_conds;
+    std::vector<CoalescedJoinColumn> coalesced_cols;
 
-    // 当前子树中可见的关系实例
+    // SEMI/ANTI 的 bindings 只包含保留侧；all_bindings 包含实际读取的全部关系。
     std::vector<TableBinding> bindings;
+    std::vector<TableBinding> all_bindings;
+
+    // cols 包含所有可限定寻址列；output_cols 是 SELECT * 和上层 NATURAL
+    // JOIN 看到的公开 row type。
+    std::vector<ColMeta> cols;
+    std::vector<ColMeta> output_cols;
 };
-/*
-    表示当前 FROM 子树中可以引用哪些关系和列
-    FROM a
-    JOIN b ON a.id = c.id
-    JOIN c ON b.id = c.id
-    第一条连接的作用域不包含 c, 此时报错
-*/
- struct AnalyzeScope {
+
+// 当前 FROM 子树中可以引用的关系与列。
+struct AnalyzeScope {
     std::vector<TableBinding> bindings;
     std::vector<ColMeta> cols;
+    std::vector<ColMeta> output_cols;
 };
 
-
-class Query{
-    public:
+class Query {
+public:
     std::shared_ptr<ast::TreeNode> parse;
-    // 不再把 ON、WHERE当作同一种条件
-    std::shared_ptr<AnalyzedFrom> from; // 完整的语义 jointree
-    std::vector<Condition> where_conds; // JOIN 完成后的 WHERE 条件
+    std::shared_ptr<AnalyzedFrom> from;
+    std::vector<Condition> where_conds;
 
     std::vector<TabCol> cols;
     std::vector<SetClause> set_clauses;
     std::vector<Value> values;
 
-    // 题5 聚合
     std::vector<AggregateInfo> aggs;
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCondition> having_conds;
@@ -115,28 +115,33 @@ class Query{
 
     bool has_limit = false;
     int limit_count = 0;
-    int limit = -1;  // 题10 简单 LIMIT 兼容
+    int limit = -1;
     std::vector<std::string> sel_captions;
 
-    // 题6 UNION
     std::vector<std::shared_ptr<Query>> union_queries;
     std::vector<ColMeta> union_output_cols;
     std::string union_alias;
 
-    // 题4 EXPLAIN
+    // LATERAL 派生查询中引用外层行的 WHERE 条件。
+    std::vector<Condition> correlated_conds;
+
+    // 稳定的查询输出 schema，供派生表、UNION 和 EXPLAIN 使用。
+    std::vector<ColMeta> output_cols;
+
     bool explain_analyze = false;
     bool select_all = false;
     std::shared_ptr<Query> explain_query;
-    Query(){}
+    Query() = default;
 };
 
-class Analyze
-{
+class Analyze {
 private:
     SmManager *sm_manager_;
+    size_t natural_id_ = 0;
+
 public:
-    Analyze(SmManager *sm_manager) : sm_manager_(sm_manager){}
-    ~Analyze(){}
+    explicit Analyze(SmManager *sm_manager) : sm_manager_(sm_manager) {}
+    ~Analyze() = default;
 
     std::shared_ptr<Query> do_analyze(std::shared_ptr<ast::TreeNode> root);
 
@@ -148,11 +153,20 @@ private:
 
     TabCol check_column(const std::vector<ColMeta> &all_cols, TabCol target);
     void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
-    void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
-    void check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds);
-    AnalyzedFromResult analyze_from(const std::shared_ptr<ast::FromExpr> &from);
+    void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+                    std::vector<Condition> &conds);
+    void check_clause(const std::vector<std::string> &tab_names,
+                      std::vector<Condition> &conds);
+    AnalyzedFromResult analyze_from(const std::shared_ptr<ast::FromExpr> &from,
+                                    const AnalyzeScope *outer_scope = nullptr);
+    AnalyzedFromResult analyze_lateral_ref(const std::shared_ptr<ast::LateralRef> &lateral,
+                                           const AnalyzeScope *outer_scope);
     AnalyzeScope merge_scopes(const AnalyzeScope &left, const AnalyzeScope &right);
+    std::vector<TableBinding> merge_all_bindings(const std::vector<TableBinding> &left,
+                                                 const std::vector<TableBinding> &right);
     TabCol resolve_column(const AnalyzeScope &scope, TabCol target);
+    TabCol resolve_lateral_column(const AnalyzeScope &local, const AnalyzeScope &outer,
+                                  TabCol target, bool *is_outer);
     std::vector<Condition> analyze_conditions(
         const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
         const AnalyzeScope &scope);
@@ -171,12 +185,14 @@ private:
                                  const std::vector<AggregateInfo> &aggs,
                                  const std::vector<TabCol> &group_by);
     bool is_in_group_by(const TabCol &col, const std::vector<TabCol> &group_by);
-    void analyze_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-                               const std::vector<TabCol> &group_by,
-                               std::vector<AggregateInfo> &aggs,
-                               const AnalyzeScope &scope,
-                               std::vector<HavingCondition> &result);
-    void check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds);
+    void analyze_having_clause(
+        const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+        const std::vector<TabCol> &group_by,
+        std::vector<AggregateInfo> &aggs,
+        const AnalyzeScope &scope,
+        std::vector<HavingCondition> &result);
+    void check_where_no_aggregate(
+        const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds);
     TabCol resolve_order_column(TabCol order_col,
                                 const std::vector<TabCol> &sel_cols,
                                 const std::vector<TabCol> &group_by_cols,

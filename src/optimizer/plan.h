@@ -49,7 +49,9 @@ typedef enum PlanTag{
     T_Projection,
     T_Aggregation, // 聚合计划节点标签
     T_Limit,
-    T_Union
+    T_Union,
+    T_Rename,
+    T_CorrelatedFilter
 } PlanTag;
 
 // 查询执行计划
@@ -92,7 +94,9 @@ class JoinPlan : public Plan
 {
     public:
         JoinPlan(PlanTag tag, JoinType join_type, std::shared_ptr<Plan> left,
-                 std::shared_ptr<Plan> right, std::vector<Condition> on_predicates)
+                 std::shared_ptr<Plan> right, std::vector<Condition> on_predicates,
+                 bool natural = false, bool lateral = false,
+                 std::vector<CoalescedJoinColumn> coalesced_cols = {})
         {
             // 分离逻辑连接类型和执行算法
             Plan::tag = tag; // 执行算法 T_NestLoop, T_IndexNestLoop
@@ -100,6 +104,9 @@ class JoinPlan : public Plan
             left_ = std::move(left);
             right_ = std::move(right);
             on_predicates_ = std::move(on_predicates);
+            natural_ = natural;
+            lateral_ = lateral;
+            coalesced_cols_ = std::move(coalesced_cols);
         }
         ~JoinPlan(){}
         // 左节点
@@ -110,6 +117,9 @@ class JoinPlan : public Plan
         std::vector<Condition> on_predicates_;
         // 逻辑连接类型，与 tag 表示的物理算法分离
         JoinType type;
+        bool natural_ = false;
+        bool lateral_ = false;
+        std::vector<CoalescedJoinColumn> coalesced_cols_;
 };
 
 /*
@@ -143,6 +153,31 @@ class ProjectionPlan : public Plan
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> sel_cols_;
         
+};
+
+// 派生表只改变输出限定符/列名，不改变记录布局。
+class RenamePlan : public Plan
+{
+    public:
+        RenamePlan(std::shared_ptr<Plan> subplan, std::vector<ColMeta> output_cols)
+            : subplan_(std::move(subplan)), output_cols_(std::move(output_cols)) {
+            Plan::tag = T_Rename;
+        }
+        std::shared_ptr<Plan> subplan_;
+        std::vector<ColMeta> output_cols_;
+};
+
+// LATERAL 子查询中引用外层行的 WHERE。它必须在 Portal 中绑定外层行上下文，
+// 不能退化成普通 Filter 或下推给 Scan。
+class CorrelatedFilterPlan : public Plan
+{
+    public:
+        CorrelatedFilterPlan(std::shared_ptr<Plan> subplan, std::vector<Condition> predicates)
+            : subplan_(std::move(subplan)), predicates_(std::move(predicates)) {
+            Plan::tag = T_CorrelatedFilter;
+        }
+        std::shared_ptr<Plan> subplan_;
+        std::vector<Condition> predicates_;
 };
 
 class SortPlan : public Plan

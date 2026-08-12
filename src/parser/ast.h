@@ -16,9 +16,12 @@ See the Mulan PSL v2 for more details. */
 #include "common/aggregate_defs.h"
 
 enum JoinType {
-    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, CROSS_JOIN
+    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, CROSS_JOIN,
+    LEFT_SEMI_JOIN, RIGHT_SEMI_JOIN, LEFT_ANTI_JOIN, RIGHT_ANTI_JOIN
 }; // 选择的种类
 namespace ast {
+
+struct SelectStmt;
 
 enum SvType {
     SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL
@@ -250,17 +253,33 @@ struct TableRef : FromExpr {
     TableRef(std::string tab_name_, std::string alias_) : tab_name(std::move(tab_name_)), alias(std::move(alias_)) {}
 };
 
+// LATERAL 右侧是一个可以引用左侧关系的派生表。别名是其对外的惟一绑定名，
+// 因此 grammar 不允许省略 alias。关联名解析由 Analyzer 在上下文作用域中完成。
+struct LateralRef : FromExpr {
+    std::shared_ptr<SelectStmt> subquery;
+    std::string alias;
+
+    LateralRef(std::shared_ptr<SelectStmt> subquery_, std::string alias_)
+        : subquery(std::move(subquery_)), alias(std::move(alias_)) {}
+};
+
 struct JoinExpr : FromExpr {
     JoinType type; // 连接类型
     std::shared_ptr<FromExpr> left; // 左表
     std::shared_ptr<FromExpr> right; // 右表
     std::vector<std::shared_ptr<BinaryExpr>> on_conds; // on 条件
+    // NATURAL 和 LATERAL 都是 JOIN 的正交修饰，不应挤占 JoinType。
+    bool natural = false;
+    bool lateral = false;
+    bool on_true = false;  // 显式 ON TRUE；空 on_conds 本身仍表示“未写 ON”。
 
     JoinExpr(JoinType type_, std::shared_ptr<FromExpr> left_,
              std::shared_ptr<FromExpr> right_,
-             std::vector<std::shared_ptr<BinaryExpr>> on_conds_)
+             std::vector<std::shared_ptr<BinaryExpr>> on_conds_,
+             bool natural_ = false, bool lateral_ = false, bool on_true_ = false)
         : type(type_), left(std::move(left_)), right(std::move(right_)),
-          on_conds(std::move(on_conds_)) {}
+          on_conds(std::move(on_conds_)), natural(natural_), lateral(lateral_),
+          on_true(on_true_) {}
 }; // 定义专门的连接表达式结构
 
 struct SelectStmt : public TreeNode {

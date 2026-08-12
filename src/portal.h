@@ -21,6 +21,9 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_nestedloop_join.h"
 #include "execution/executor_filter.h"
+#include "execution/executor_correlated_filter.h"
+#include "execution/executor_lateral_join.h"
+#include "execution/executor_rename.h"
 #include "execution/executor_update.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_delete.h"
@@ -189,14 +192,25 @@ class Portal
     void drop(){}
 
 
-    std::unique_ptr<AbstractExecutor> convert_plan_executor(std::shared_ptr<Plan> plan, Context *context)
+    std::unique_ptr<AbstractExecutor> convert_plan_executor(
+        std::shared_ptr<Plan> plan, Context *context,
+        std::shared_ptr<CorrelatedTupleContext> correlated = nullptr)
     {
         if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)){
-            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
+            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                         x->sel_cols_);
         } else if (auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
-            return std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context),
+            return std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                     x->predicates_);
+        } else if (auto x = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
+            if (correlated == nullptr) {
+                throw InternalError("Correlated filter used outside LATERAL JOIN");
+            }
+            return std::make_unique<CorrelatedFilterExecutor>(
+                convert_plan_executor(x->subplan_, context, correlated), x->predicates_, correlated);
+        } else if (auto x = std::dynamic_pointer_cast<RenamePlan>(plan)) {
+            return std::make_unique<RenameExecutor>(
+                convert_plan_executor(x->subplan_, context, correlated), x->output_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->binding_name_,
@@ -207,25 +221,34 @@ class Portal
                                                            x->predicates_, x->index_col_names_, context);
             } 
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
+            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context, correlated);
+            if (x->lateral_) {
+                auto lateral_context = std::make_shared<CorrelatedTupleContext>();
+                std::unique_ptr<AbstractExecutor> right =
+                    convert_plan_executor(x->right_, context, lateral_context);
+                return std::make_unique<LateralNestedLoopJoinExecutor>(
+                    std::move(left), std::move(right), x->on_predicates_, x->type,
+                    std::move(lateral_context));
+            }
             if (x->tag == T_IndexNestLoop) {
                 auto right_scan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
                 if (right_scan == nullptr) throw InternalError("Unexpected INLJ right plan");
                 return std::make_unique<IndexNestedLoopJoinExecutor>(std::move(left), sm_manager_, *right_scan,
                                                                      x->on_predicates_, context);
             }
-            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
+            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context, correlated);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                                 std::move(left), 
-                                std::move(right), x->on_predicates_, x->type);
+                                std::move(right), x->on_predicates_, x->type,
+                                x->coalesced_cols_);
             return join;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             if (x->sort_cols_.size() == 1) {
-                return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context),
+                return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                 x->sort_cols_[0].first, x->sort_cols_[0].second);
             } else {
                 std::vector<std::pair<ColMeta, bool>> meta_cols;
-                auto prev = convert_plan_executor(x->subplan_, context);
+                auto prev = convert_plan_executor(x->subplan_, context, correlated);
                 auto &input_cols = prev->cols();
                 for (auto &[tc, is_desc] : x->sort_cols_) {
                     auto it = std::find_if(input_cols.begin(), input_cols.end(),
@@ -239,16 +262,16 @@ class Portal
                 return std::make_unique<SortExecutor>(std::move(prev), meta_cols);
             }
         } else if(auto x = std::dynamic_pointer_cast<AggPlan>(plan)) {
-            return std::make_unique<AggExecutor>(convert_plan_executor(x->subplan_, context),
+            return std::make_unique<AggExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                  x->group_cols_, x->agg_exprs_,
                                                  x->having_conds_, x->output_cols_);
         } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
-            return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context),
+            return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                    x->limit_);
         } else if(auto x = std::dynamic_pointer_cast<UnionPlan>(plan)) {
             std::vector<std::unique_ptr<AbstractExecutor>> children;
             for (auto &subplan : x->subplans_) {
-                children.push_back(convert_plan_executor(subplan, context));
+                children.push_back(convert_plan_executor(subplan, context, correlated));
             }
             return std::make_unique<UnionExecutor>(std::move(children), x->output_cols_);
         }

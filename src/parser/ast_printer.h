@@ -69,6 +69,10 @@ private:
                 {RIGHT_JOIN, "RIGHT_JOIN"},
                 {FULL_JOIN, "FULL_JOIN"},
                 {CROSS_JOIN, "CROSS_JOIN"},
+                {LEFT_SEMI_JOIN, "LEFT_SEMI_JOIN"},
+                {RIGHT_SEMI_JOIN, "RIGHT_SEMI_JOIN"},
+                {LEFT_ANTI_JOIN, "LEFT_ANTI_JOIN"},
+                {RIGHT_ANTI_JOIN, "RIGHT_ANTI_JOIN"},
         };
         return m.at(type);
     }
@@ -137,9 +141,13 @@ private:
             std::cout << "SET_CLAUSE\n";
             print_val(x->col_name, offset);
             print_node(x->val, offset);
+        } else if (auto x = std::dynamic_pointer_cast<AggExpr>(node)) {
+            std::cout << "AGG_EXPR\n";
+            print_val(x->to_string(), offset);
         } else if (auto x = std::dynamic_pointer_cast<BinaryExpr>(node)) {
             std::cout << "BINARY_EXPR\n";
-            print_node(x->lhs, offset);
+            if (x->lhs_agg != nullptr) print_node(x->lhs_agg, offset);
+            else print_node(x->lhs, offset);
             print_val(op2str(x->op), offset);
             print_node(x->rhs, offset);
         } else if (auto x = std::dynamic_pointer_cast<InsertStmt>(node)) {
@@ -159,12 +167,23 @@ private:
             std::cout << "TABLE_REF\n";
             print_val(x->tab_name, offset);
             if (!x->alias.empty()) print_val("AS " + x->alias, offset);
+        } else if (auto x = std::dynamic_pointer_cast<LateralRef>(node)) {
+            std::cout << "LATERAL_REF\n";
+            print_val("AS " + x->alias, offset);
+            print_node(x->subquery, offset);
         } else if (auto x = std::dynamic_pointer_cast<JoinExpr>(node)) {
-            std::cout << join_type2str(x->type) << '\n';
+            std::cout << (x->natural ? "NATURAL_" : "") << join_type2str(x->type) << '\n';
+            if (x->lateral) print_val("LATERAL", offset);
             print_node(x->left, offset);
             print_node(x->right, offset);
-            print_val("ON", offset);
-            print_node_list(x->on_conds, offset + 2);
+            if (!x->natural) {
+                print_val("ON", offset);
+                if (x->on_true) {
+                    print_val("TRUE", offset + 2);
+                } else {
+                    print_node_list(x->on_conds, offset + 2);
+                }
+            }
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
             print_node_list(x->cols, offset);
