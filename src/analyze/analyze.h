@@ -45,7 +45,7 @@ enum class HavingSource {
     AGGREGATE,
 };
 
-// Analyzer 直接解析 HAVING 的来源和槽位，执行器不再反解聚合函数字符串。
+// 分析器直接解析 HAVING 的来源和槽位，执行器不再反解聚合函数字符串。
 struct HavingCondition {
     HavingSource source = HavingSource::GROUP_COLUMN;
     size_t index = 0;
@@ -54,8 +54,8 @@ struct HavingCondition {
 };
 
 /*
-    TableBinding 用于区分连接中的不同关系实例。例如 employee e1 与
-    employee e2 虽然指向同一物理表，但属于两个独立 binding。
+    TableBinding 用于区分连接中的不同关系实例。例如，同一张 employee
+    物理表分别使用别名 e1 和 e2 时，两者属于不同的关系实例。
 */
 struct TableBinding {
     std::string table_name;
@@ -81,12 +81,12 @@ struct AnalyzedFrom {
     std::vector<Condition> on_conds;
     std::vector<CoalescedJoinColumn> coalesced_cols;
 
-    // SEMI/ANTI 的 bindings 只包含保留侧；all_bindings 包含实际读取的全部关系。
+    // 半连接/反连接的 bindings 只包含保留侧；all_bindings 包含实际读取的全部关系。
     std::vector<TableBinding> bindings;
     std::vector<TableBinding> all_bindings;
 
-    // cols 包含所有可限定寻址列；output_cols 是 SELECT * 和上层 NATURAL
-    // JOIN 看到的公开 row type。
+    // cols 包含所有可限定寻址列；output_cols 是 SELECT * 和上层自然连接
+    // 可见的公开输出行类型。
     std::vector<ColMeta> cols;
     std::vector<ColMeta> output_cols;
 };
@@ -122,10 +122,10 @@ public:
     std::vector<ColMeta> union_output_cols;
     std::string union_alias;
 
-    // LATERAL 派生查询中引用外层行的 WHERE 条件。
+    // 横向派生查询中引用外层行的 WHERE 条件。
     std::vector<Condition> correlated_conds;
 
-    // 稳定的查询输出 schema，供派生表、UNION 和 EXPLAIN 使用。
+    // 稳定的查询输出模式，供派生表、UNION 和 EXPLAIN 使用。
     std::vector<ColMeta> output_cols;
 
     bool explain_analyze = false;

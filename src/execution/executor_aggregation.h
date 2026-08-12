@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <climits>
 #include <cstring>
@@ -50,9 +51,15 @@ private:
         std::string str_min;
         int64_t sum_cnt = 0;
         bool has_value = false;
-        // Most states are not DISTINCT; keep the per-group base state small
-        // and allocate the hash set only for a DISTINCT aggregate that sees a
-        // non-NULL value.
+        int64_t int_product = 1;
+        double float_product = 1.0;
+        bool product_has_value = false;
+        // Welford 在线算法状态，同时供总体方差和总体标准差使用。
+        int64_t variance_count = 0;
+        double variance_mean = 0.0;
+        double variance_m2 = 0.0;
+        // 大多数聚合不使用 DISTINCT，因此保持每组基础状态紧凑；只有 DISTINCT
+        // 聚合首次遇到非 NULL 值时才分配哈希集合。
         std::unique_ptr<std::unordered_set<std::string>> distinct_seen;
     };
 
@@ -63,7 +70,7 @@ private:
     std::vector<TabCol> group_cols_;
     std::vector<size_t> group_col_idxs_;
     std::vector<AggregateInfo> agg_exprs_;
-    std::vector<int> argument_col_idxs_;  // -1 for star; bound once, not per input row
+    std::vector<int> argument_col_idxs_;  // 星号参数记为 -1；只绑定一次，不逐输入行查找
     std::vector<HavingCondition> having_conds_;
     std::vector<ColMeta> cols_;
     size_t len_;
@@ -198,9 +205,8 @@ void AggExecutor::update_state(const AggregateInfo &agg, AggState &st,
     const auto *spec = ast::aggregate_spec(agg.type);
     if (spec == nullptr) throw InternalError("Unknown aggregate function");
 
-    // Common SQL input policy: argument aggregates ignore NULL, and DISTINCT
-    // filters equal physical values before the transition.  New simple
-    // aggregates inherit both without another per-function branch.
+    // 统一的 SQL 输入策略：带参数的聚合忽略 NULL，DISTINCT 在状态转移前过滤
+    // 物理值相同的输入。新增简单聚合会自动继承这两项规则，无需再写函数分支。
     if (!agg.is_star) {
         if (argument_col == nullptr) throw InternalError("Aggregate argument is not bound");
         const size_t input_col_idx = static_cast<size_t>(argument_col - prev_->cols().data());
@@ -257,10 +263,29 @@ void AggExecutor::update_state(const AggregateInfo &agg, AggState &st,
         return;
     }
 
-    // A registry entry marked CUSTOM must add its transition in this single,
-    // adjacent switch.  Failing loudly prevents a half-registered function
-    // from returning plausible but wrong contest answers.
+    // 注册为 CUSTOM 的聚合必须在这个唯一且相邻的 switch 中补充状态转移。
+    // 未实现时直接报错，避免注册不完整的函数返回看似合理但实际错误的比赛答案。
     switch (agg.type) {
+        case ast::AGG_PRODUCT:
+            if (argument_col->type == TYPE_INT) {
+                st.int_product *= read_as_int(record.data, *argument_col);
+            } else {
+                st.float_product *= read_as_float(record.data, *argument_col);
+            }
+            st.product_has_value = true;
+            return;
+        case ast::AGG_VARIANCE:
+        case ast::AGG_STDDEV: {
+            const double value = (argument_col->type == TYPE_INT)
+                                     ? static_cast<double>(read_as_int(record.data, *argument_col))
+                                     : static_cast<double>(read_as_float(record.data, *argument_col));
+            ++st.variance_count;
+            const double delta = value - st.variance_mean;
+            st.variance_mean += delta / static_cast<double>(st.variance_count);
+            const double delta2 = value - st.variance_mean;
+            st.variance_m2 += delta * delta2;
+            return;
+        }
         default: throw InternalError("Aggregate CUSTOM update is not implemented");
     }
 }
@@ -313,8 +338,8 @@ Value AggExecutor::finalize(const AggregateInfo &agg, const AggState &st) const 
         return agg_make_int(0);
     };
 
-    // Second and final extension point for a simple aggregate.  Functions
-    // registered with SUMMARY can reuse the fields above and need one case.
+    // 新增简单聚合的第二个也是最后一个修改点。注册为 SUMMARY 的函数可以复用
+    // 上述状态字段，只需增加一个 case。
     switch (agg.type) {
         case ast::AGG_COUNT: return agg_make_int(static_cast<int>(st.count));
         case ast::AGG_SUM:
@@ -336,6 +361,27 @@ Value AggExecutor::finalize(const AggregateInfo &agg, const AggState &st) const 
                                    ? (static_cast<double>(st.int_sum) / st.sum_cnt)
                                    : (st.float_sum / st.sum_cnt)))
                        : agg_make_float(0.0f);
+        case ast::AGG_RANGE:
+            // 增加能够用现有聚合函数表示的新函数时，只用修改finalize一个文件
+            if (!st.has_value) return zero();
+            if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_max - st.int_min);
+            if (agg.arg_type == TYPE_FLOAT) return agg_make_float(st.float_max - st.float_min);
+        case ast::AGG_PRODUCT:
+            if (!st.product_has_value) return zero();
+            if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_product);
+            if (agg.arg_type == TYPE_FLOAT) return agg_make_float(st.float_product);
+        case ast::AGG_VARIANCE:
+        case ast::AGG_STDDEV: {
+            if (st.variance_count == 0) return agg_make_float(0.0f);
+            // VARIANCE/STDDEV 采用总体定义（除以 N）。Welford 理论上保证
+            // M2 非负；max 用于消除浮点舍入可能产生的极小负数。
+            const double variance = std::max(
+                0.0, st.variance_m2 / static_cast<double>(st.variance_count));
+            if (agg.type == ast::AGG_VARIANCE) {
+                return agg_make_float(static_cast<float>(variance));
+            }
+            return agg_make_float(static_cast<float>(std::sqrt(variance)));
+        }
     }
     throw InternalError("Aggregate finalize is not implemented");
 }
@@ -398,7 +444,7 @@ bool AggExecutor::satisfy_having(const std::vector<AggState> &states, const std:
             const bool is_null =
                 (static_cast<unsigned char>(key[cond.index / 8]) &
                  (1U << (cond.index % 8))) != 0;
-            // Comparisons against NULL are UNKNOWN; HAVING retains TRUE only.
+            // 与 NULL 比较的结果是 UNKNOWN，而 HAVING 只保留结果为 TRUE 的分组。
             if (is_null) return false;
             lhs = get_group_col_value(cond.index, key);
         } else {

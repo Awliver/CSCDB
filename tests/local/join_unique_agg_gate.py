@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Wire-v3 cross-feature gate for JOIN, unique indexes, and aggregation.
+"""JOIN、唯一索引和聚合的 Wire-v3 跨功能门禁。
 
-The cases in this file deliberately exercise feature boundaries instead of
-testing each subsystem in isolation.  In particular, rejected unique-index
-operations are judged by typed before/after state snapshots; an ERROR frame by
-itself is not considered proof that the heap and every index stayed intact.
+本文件中的用例专门覆盖功能边界，而不是孤立测试各个子系统。特别是，对于被拒绝
+的唯一索引操作，会比较操作前后的类型化状态快照；仅收到一个 ERROR 帧，不能证明
+堆表和所有索引都没有发生变化。
 
-Run from the repository root after building ``rmdb``::
+构建 ``rmdb`` 后，在仓库根目录运行::
 
     python3 tests/local/join_unique_agg_gate.py
 
-An out-of-tree build can be selected without editing the test::
+无需修改测试即可指定仓库外的构建目录::
 
     RMDB_BUILD_DIR=/tmp/csc-db-join-agg-build \
       python3 tests/local/join_unique_agg_gate.py
@@ -57,7 +56,7 @@ C = SQLTYPE_CHAR
 
 
 class GateFailure(AssertionError):
-    """A semantic or Wire contract mismatch."""
+    """表示语义或 Wire 协议约定不匹配。"""
 
 
 def port_is_open() -> bool:
@@ -99,7 +98,7 @@ def cell_equal(actual: object, expected: object) -> bool:
         return isinstance(actual, (int, float)) and math.isclose(
             float(actual), expected, rel_tol=1e-6, abs_tol=1e-6
         )
-    # bool is an int subclass, but is never a legal SQL value in these cases.
+    # bool 是 int 的子类，但在这些用例中绝不是合法的 SQL 整数值。
     if isinstance(expected, int):
         return isinstance(actual, int) and not isinstance(actual, bool) and actual == expected
     return actual == expected
@@ -194,7 +193,7 @@ class Checks:
         self.total += 1
         try:
             check()
-        except Exception as exc:  # continue so one boundary bug does not hide the others
+        except Exception as exc:  # 继续执行，避免一个边界缺陷遮蔽其他缺陷
             self.failures.append((label, str(exc)))
             print(f"[FAIL] {label}")
             print(str(exc))
@@ -233,7 +232,7 @@ def run_checks(client: WireClient) -> Checks:
             [
                 [10, 3, 2, 2, 12, 5, 7, 6.0],
                 [20, 1, 1, 1, 9, 9, 9, 9.0],
-                # RMDB's established empty-aggregate dialect finalizes to zero.
+                # RMDB 已有方言约定：空输入聚合最终生成零值。
                 [30, 1, 0, 0, 0, 0, 0, 0.0],
             ],
         )
@@ -309,8 +308,8 @@ def run_checks(client: WireClient) -> Checks:
             state_sqls,
             require_failure_frame=True,
         )
-        # A legal aggregate immediately after both errors proves the connection
-        # and analyzed join scope were not left in a poisoned partial state.
+        # 两次错误后立即执行合法聚合，用于证明连接和已分析的连接作用域没有
+        # 残留在受污染的中间状态。
         assert_query(
             client,
             "post-rejection SEMI control",
@@ -348,8 +347,8 @@ def run_checks(client: WireClient) -> Checks:
         rows = [
             [10, 2, 13.333333],
             [20, 2, 5.0],
-            # Same correlation key reappears after another outer row: the RHS
-            # aggregate must be restarted rather than carrying prior state.
+            # 同一关联键经过另一条外层记录后再次出现：右侧聚合必须重新启动，
+            # 不能携带上一次执行的状态。
             [30, 2, 13.333333],
             [40, 0, 0.0],
         ]
@@ -359,8 +358,8 @@ def run_checks(client: WireClient) -> Checks:
     checks.run("correlated LATERAL COUNT DISTINCT/AVG repeated re-entry", lateral_reentry_aggregate)
 
     def unique_index_lifecycle() -> None:
-        # Failed build over dirty data must leave no registered index or temp
-        # state; deleting the duplicate and retrying the exact DDL must work.
+        # 在重复数据上建索引失败后，不得残留已注册索引或临时状态；删除重复记录后，
+        # 原样重试同一条 DDL 必须成功。
         for sql in [
             "create table ui_dirty (k int, v int)",
             "insert into ui_dirty values (1,10)",
@@ -416,8 +415,8 @@ def run_checks(client: WireClient) -> Checks:
             live_state,
             require_failure_frame=True,
         )
-        # The legacy DML path may report COMMAND_OK for a uniqueness rejection;
-        # the authoritative contract is that neither heap nor index state moves.
+        # 旧 DML 路径在拒绝唯一性冲突时可能返回 COMMAND_OK；权威判据是堆表和
+        # 索引状态均未发生变化。
         assert_rejected_without_change(
             client,
             "duplicate indexed INSERT",
@@ -443,9 +442,8 @@ def run_checks(client: WireClient) -> Checks:
             baseline_rows,
         )
 
-        # Roll back one DELETE, one INSERT, and one indexed UPDATE together.
-        # Then probe every affected key: old keys must still be occupied while
-        # keys introduced only by the aborted transaction must be reusable.
+        # 在同一事务中回滚一次 DELETE、一次 INSERT 和一次索引列 UPDATE。随后检查
+        # 所有受影响键：旧键必须仍被占用，仅由已回滚事务引入的键必须可以复用。
         for sql in [
             "begin",
             "delete from ui_live where k=2",

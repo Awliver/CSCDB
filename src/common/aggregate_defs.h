@@ -36,11 +36,10 @@ enum class AggregateResultRule : uint8_t {
 };
 
 /*
- * COUNT owns the counting transition. SUMMARY updates the reusable
- * count/sum/min/max state, which is enough for the common contest aggregates.
- * NULL skipping and DISTINCT filtering are applied before either transition.
- * A genuinely different state transition may use CUSTOM and add one case in
- * AggExecutor::update_state().
+ * COUNT 使用专用计数状态转移；SUMMARY 更新可复用的 count/sum/min/max 状态，
+ * 足以支持比赛中常见的简单聚合。NULL 跳过与 DISTINCT 过滤会在状态转移前统一
+ * 完成。确实需要不同状态转移的聚合可选择 CUSTOM，并在
+ * AggExecutor::update_state() 中增加一个分支。
  */
 enum class AggregateUpdateRule : uint8_t {
     COUNT,
@@ -49,18 +48,29 @@ enum class AggregateUpdateRule : uint8_t {
 };
 
 /*
- * Aggregate extension registry -- this is the first of two intended edit
- * points for a new simple aggregate.  Add exactly one row here; parsing,
- * spelling, argument validation and result-schema inference all consume it.
- * The second edit point is the finalize switch in executor_aggregation.h (and,
- * only for a CUSTOM transition, its update switch).
+ * 聚合扩展注册表——这是新增简单聚合时两个预定修改点中的第一个，只需在这里增加一行，解析、函数名、参数校验和结果结构推导都会读取该配置
+ * 第二个修改点是 executor_aggregation.h 中 finalize() 的 switch；
+ * 只有 无法使用原有聚合表示的新函数（CUSTOM 状态表示）需要修改相邻的 update switch。
+* X(
+        枚举名,
+        SQL函数名,
+        接受的参数类型,
+        是否允许*,
+        是否允许DISTINCT,
+        输出类型规则,
+        状态更新规则
+    )
  */
-#define RMDB_AGGREGATE_FUNCTIONS(X)                                                        \
-    X(COUNT, "count", AGG_INPUT_ANY,     true,  true,  FIXED_INT,        COUNT)           \
-    X(MAX,   "max",   AGG_INPUT_ANY,     false, false, SAME_AS_ARGUMENT, SUMMARY)         \
-    X(MIN,   "min",   AGG_INPUT_ANY,     false, false, SAME_AS_ARGUMENT, SUMMARY)         \
-    X(SUM,   "sum",   AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, SUMMARY)         \
-    X(AVG,   "avg",   AGG_INPUT_NUMERIC, false, false, FIXED_FLOAT,      SUMMARY)
+#define RMDB_AGGREGATE_FUNCTIONS(X)                                                 \
+    X(COUNT, "count", AGG_INPUT_ANY,     true,  true,  FIXED_INT,        COUNT)     \
+    X(MAX,   "max",   AGG_INPUT_ANY,     false, false, SAME_AS_ARGUMENT, SUMMARY)   \
+    X(MIN,   "min",   AGG_INPUT_ANY,     false, false, SAME_AS_ARGUMENT, SUMMARY)   \
+    X(SUM,   "sum",   AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, SUMMARY)   \
+    X(AVG,   "avg",   AGG_INPUT_NUMERIC, false, false, FIXED_FLOAT,      SUMMARY)   \
+    X(RANGE, "range", AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, SUMMARY)   \
+    X(PRODUCT, "product", AGG_INPUT_NUMERIC, false, false, SAME_AS_ARGUMENT, CUSTOM) \
+    X(VARIANCE, "variance", AGG_INPUT_NUMERIC, false, false, FIXED_FLOAT, CUSTOM)    \
+    X(STDDEV, "stddev", AGG_INPUT_NUMERIC, false, false, FIXED_FLOAT, CUSTOM)
 
 enum AggType {
 #define RMDB_DECLARE_AGG_ENUM(symbol, name, inputs, star, distinct, result, update) AGG_##symbol,
@@ -182,4 +192,4 @@ static_assert([] {
     return true;
 }(), "Aggregate registry names and enum values must be unique");
 
-}  // namespace ast
+}  // ast 命名空间结束

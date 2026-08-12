@@ -194,7 +194,7 @@ struct SetClause : public TreeNode {
 
 struct BinaryExpr : public TreeNode {
     std::shared_ptr<Col> lhs;
-    std::shared_ptr<AggExpr> lhs_agg;  // HAVING keeps aggregates structural
+    std::shared_ptr<AggExpr> lhs_agg;  // HAVING 以结构化形式保留聚合表达式
     SvCompOp op;
     std::shared_ptr<Expr> rhs;
 

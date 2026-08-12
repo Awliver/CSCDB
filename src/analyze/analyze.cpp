@@ -704,7 +704,7 @@ std::vector<TableBinding> Analyze::merge_all_bindings(const std::vector<TableBin
     return result;
 }
 
-// 统一的列解析，给 col 绑定一个唯一确定的 table 后返回。
+// 统一进行列解析，为列引用绑定作用域内唯一确定的表后返回。
 TabCol Analyze::resolve_column(const AnalyzeScope &scope, TabCol target) {
     if (target.tab_name.empty()) { // 未指明表名前缀
         std::string binding_name;
@@ -829,7 +829,7 @@ std::vector<ColMeta> Analyze::infer_select_output_cols(const std::shared_ptr<Que
         throw ColumnNotFoundError(target.col_name);
     };
     if (!query->aggs.empty() || !query->group_by_cols.empty()) {
-        // UNION observes the SELECT list, not the internal GROUP BY key.
+        // UNION 依据 SELECT 列表确定输出，而不是依据内部 GROUP BY 键。
         for (auto &selected : query->cols) {
             ColMeta col = find_col(selected);
             if (!selected.alias.empty()) col.name = selected.alias;
@@ -1071,8 +1071,8 @@ AggregateInfo Analyze::analyze_aggregate(ast::AggType type,
     agg.distinct = distinct;
 
     if (is_star) {
-        // Star aggregates have no physical input slot.  INT/sizeof(int) is a
-        // stable placeholder; the registry owns their real output contract.
+        // 星号聚合没有物理输入槽位。这里用 INT/sizeof(int) 作为稳定占位，
+        // 实际输出约束由注册表统一定义。
         agg.arg_type = TYPE_INT;
         agg.arg_len = sizeof(int);
         return agg;
@@ -1101,8 +1101,8 @@ bool Analyze::is_in_group_by(const TabCol &col, const std::vector<TabCol> &group
 }
 
 void Analyze::check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds) {
-    // The WHERE grammar only accepts Col on the left, not AggExpr.  Keep this
-    // hook as the semantic boundary if general expressions are added later.
+    // 当前 WHERE 语法左侧只接受 Col，不接受 AggExpr。保留此入口，作为以后加入
+    // 通用表达式时的语义边界。
     (void)sv_conds;
 }
 // 检查 GROUP BY 的语义合法性，如果查询用了聚合，那么 SELECT 中直接输出的普通列必须受到 GROUP BY 的约束
@@ -1153,9 +1153,8 @@ void Analyze::analyze_having_clause(
     for (const auto &expr : sv_conds) {
         auto rhs = std::dynamic_pointer_cast<ast::Value>(expr->rhs);
         if (rhs == nullptr) {
-            // The executor supports a resolved scalar RHS only.  Rejecting a
-            // column here is safer than the previous path, which accepted it
-            // and then read an uninitialized rhs_val at execution time.
+            // 执行器只支持已经解析的标量右操作数。这里直接拒绝列，比旧路径先
+            // 接受、执行时再读取未初始化 rhs_val 更安全。
             throw InternalError("failure");
         }
 
@@ -1185,7 +1184,7 @@ void Analyze::analyze_having_clause(
                 .col_name = expr->lhs->col_name,
             };
 
-            // Unqualified SELECT aliases take precedence over source columns.
+            // 未带限定符的 SELECT 别名优先于来源列。
             if (syntax_col.tab_name.empty()) {
                 auto alias = std::find_if(aggs.begin(), aggs.end(), [&](const AggregateInfo &agg) {
                     return !agg.alias.empty() && agg.alias == syntax_col.col_name;

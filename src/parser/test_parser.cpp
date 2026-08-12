@@ -106,9 +106,8 @@ int main() {
         yy_delete_buffer(buf);
     }
     {
-        // Aggregate names not reserved by the lexer are accepted only when
-        // present in the central registry.  This is the parser side of the
-        // two-edit-point contest extension contract.
+        // 未被词法器保留的聚合名称只有出现在中央注册表中才会被接受。
+        // 这是“两处修改即可扩展”约定在解析器侧的保证。
         YY_BUFFER_STATE buf = yy_scan_string("select not_registered(v) from t;");
         assert(yyparse() != 0);
         yy_delete_buffer(buf);
