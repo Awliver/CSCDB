@@ -22,7 +22,6 @@ See the Mulan PSL v2 for more details. */
 struct TabCol {
     std::string tab_name;
     std::string col_name;
-    int agg_type = 0;        // 题10：聚合函数（一致性检测 SQL）
     std::string alias;
 
     friend bool operator<(const TabCol &x, const TabCol &y) {

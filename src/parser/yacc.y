@@ -19,6 +19,15 @@ static std::shared_ptr<ast::Value> negate_value(const std::shared_ptr<ast::Value
     if (auto f = std::dynamic_pointer_cast<ast::FloatLit>(v)) return std::make_shared<ast::FloatLit>(-f->val);
     return nullptr;
 }
+
+static std::shared_ptr<ast::AggExpr> make_aggregate_expr(
+    const std::string &name, std::shared_ptr<ast::Col> col, std::string alias,
+    bool is_star = false, bool distinct = false) {
+    ast::AggType type;
+    if (!ast::aggregate_type_from_name(name, type)) return nullptr;
+    return std::make_shared<ast::AggExpr>(type, std::move(col), std::move(alias),
+                                          is_star, distinct);
+}
 %}
 
 // request a pure (reentrant) parser
@@ -67,6 +76,7 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_orderby_dir> opt_asc_desc
 %type <sv_agg_expr> agg_func
 %type <sv_agg_exprs> agg_list
+%type <sv_str> agg_name
 %type <sv_cols> opt_group_by group_by_list
 %type <sv_conds> opt_having
 %type <sv_int> opt_limit
@@ -509,39 +519,40 @@ agg_list:
     ;
 
 agg_func:
-        COUNT '(' '*' ')' opt_alias
+        agg_name '(' '*' ')' opt_alias
     {
-        $$ = std::make_shared<AggExpr>(AGG_COUNT, nullptr, $5, true);
+        $$ = make_aggregate_expr($1, nullptr, $5, true);
+        if ($$ == nullptr) YYERROR;
     }
-    |   COUNT '(' col ')' opt_alias
+    |   agg_name '(' col ')' opt_alias
     {
-        $$ = std::make_shared<AggExpr>(AGG_COUNT, $3, $5, false);
+        $$ = make_aggregate_expr($1, $3, $5);
+        if ($$ == nullptr) YYERROR;
     }
-    |   COUNT '(' DISTINCT col ')' opt_alias
+    |   agg_name '(' DISTINCT col ')' opt_alias
     {
         /* 决赛：原生 COUNT(DISTINCT col) */
-        $$ = std::make_shared<AggExpr>(AGG_COUNT, $4, $6, false, true);
+        $$ = make_aggregate_expr($1, $4, $6, false, true);
+        if ($$ == nullptr) YYERROR;
     }
-    |   COUNT '(' DISTINCT '(' col ')' ')' opt_alias
+    |   agg_name '(' DISTINCT '(' col ')' ')' opt_alias
     {
         /* 决赛：COUNT(DISTINCT (col)) 括号变体 */
-        $$ = std::make_shared<AggExpr>(AGG_COUNT, $5, $8, false, true);
+        $$ = make_aggregate_expr($1, $5, $8, false, true);
+        if ($$ == nullptr) YYERROR;
     }
-    |   MAX '(' col ')' opt_alias
+    ;
+
+agg_name:
+        COUNT { $$ = "count"; }
+    |   MAX   { $$ = "max"; }
+    |   MIN   { $$ = "min"; }
+    |   SUM   { $$ = "sum"; }
+    |   AVG   { $$ = "avg"; }
+    |   IDENTIFIER
     {
-        $$ = std::make_shared<AggExpr>(AGG_MAX, $3, $5, false);
-    }
-    |   MIN '(' col ')' opt_alias
-    {
-        $$ = std::make_shared<AggExpr>(AGG_MIN, $3, $5, false);
-    }
-    |   SUM '(' col ')' opt_alias
-    {
-        $$ = std::make_shared<AggExpr>(AGG_SUM, $3, $5, false);
-    }
-    |   AVG '(' col ')' opt_alias
-    {
-        $$ = std::make_shared<AggExpr>(AGG_AVG, $3, $5, false);
+        if (find_aggregate($1) == nullptr) YYERROR;
+        $$ = $1;
     }
     ;
 
@@ -662,8 +673,7 @@ having_condition:
     }
     |   agg_func op expr
     {
-        auto col = std::make_shared<Col>("", $1->to_string());
-        $$ = std::make_shared<BinaryExpr>(col, $2, $3);
+        $$ = std::make_shared<BinaryExpr>($1, $2, $3);
     }
     ;
 

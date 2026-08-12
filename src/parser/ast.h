@@ -13,6 +13,8 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <memory>
 
+#include "common/aggregate_defs.h"
+
 enum JoinType {
     INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, CROSS_JOIN
 }; // 选择的种类
@@ -34,10 +36,6 @@ enum OrderByDir {
 
 enum SetKnobType {
     EnableNestLoop, EnableSortMerge
-};
-
-enum AggType {
-    AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG
 };
 
 // Base class for tree nodes
@@ -155,33 +153,24 @@ struct BoolLit : public Value {
 struct Col : public Expr {
     std::string tab_name;
     std::string col_name;
-    int agg_type = 0;        // 题10：0=无 1=COUNT 2=MAX 3=MIN 4=SUM（简单聚合快路径）
     std::string alias;       // 题10：AS 别名
 
     Col(std::string tab_name_, std::string col_name_) :
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+// 语法层聚合表达式
 struct AggExpr : public Expr {
     AggType agg_type;
     std::shared_ptr<Col> col;
     std::string alias;
     bool is_star;
-    bool distinct;    // 决赛：原生 COUNT(DISTINCT col) / COUNT(DISTINCT (col))
+    bool distinct;    // 支持 COUNT(DISTINCT col) / COUNT(DISTINCT (col))
     AggExpr(AggType t, std::shared_ptr<Col> c, std::string a, bool star = false, bool dist = false)
         : agg_type(t), col(std::move(c)), alias(std::move(a)), is_star(star), distinct(dist) {}
 
     std::string to_string() const {
-        std::string name;
-        switch (agg_type) {
-            case AGG_COUNT: name = "count"; break;
-            case AGG_MAX:   name = "max"; break;
-            case AGG_MIN:   name = "min"; break;
-            case AGG_SUM:   name = "sum"; break;
-            case AGG_AVG:   name = "avg"; break;
-        }
-        name += "(" + (is_star ? std::string("*") : (col ? col->col_name : "")) + ")";
-        return name;
+        return format_aggregate_call(agg_type, col ? col->col_name : "", is_star, distinct);
     }
 };
 
@@ -202,11 +191,14 @@ struct SetClause : public TreeNode {
 
 struct BinaryExpr : public TreeNode {
     std::shared_ptr<Col> lhs;
+    std::shared_ptr<AggExpr> lhs_agg;  // HAVING keeps aggregates structural
     SvCompOp op;
     std::shared_ptr<Expr> rhs;
 
     BinaryExpr(std::shared_ptr<Col> lhs_, SvCompOp op_, std::shared_ptr<Expr> rhs_) :
             lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
+    BinaryExpr(std::shared_ptr<AggExpr> lhs_agg_, SvCompOp op_, std::shared_ptr<Expr> rhs_) :
+            lhs_agg(std::move(lhs_agg_)), op(op_), rhs(std::move(rhs_)) {}
 };
 
 struct OrderBy : public TreeNode

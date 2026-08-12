@@ -21,27 +21,37 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "common/common.h"
 
+// 聚合函数表
 struct AggregateInfo {
-    ast::AggType type;
+    ast::AggType type = ast::AGG_COUNT;
     TabCol col;
     std::string alias;
-    bool is_star;
-    ColType arg_type;
-    bool in_output = true;
-    bool distinct = false;   // 决赛：原生 COUNT(DISTINCT col)
+    bool is_star = false;
+    ColType arg_type = TYPE_INT;
+    int arg_len = sizeof(int);
+    bool in_output = true;     // 是否出现在最终输出中
+    bool distinct = false;   // 支持 COUNT(DISTINCT col) 与 COUNT(DISTINCT (col))
 
     std::string to_string() const {
-        std::string name;
-        switch (type) {
-            case ast::AGG_COUNT: name = "count"; break;
-            case ast::AGG_MAX:   name = "max"; break;
-            case ast::AGG_MIN:   name = "min"; break;
-            case ast::AGG_SUM:   name = "sum"; break;
-            case ast::AGG_AVG:   name = "avg"; break;
-        }
-        name += "(" + (is_star ? std::string("*") : col.col_name) + ")";
-        return name;
+        return ast::format_aggregate_call(type, col.col_name, is_star, distinct);
     }
+
+    ColType output_type() const { return ast::aggregate_result_type(type, arg_type); }
+    int output_len() const { return ast::aggregate_result_length(type, arg_type, arg_len); }
+};
+
+enum class HavingSource {
+    GROUP_COLUMN,
+    AGGREGATE,
+};
+
+/* Analyzer-resolved HAVING operand.  Slots replace the old aggregate-name
+ * strings, so execution never reparses SQL text or guesses between aliases. */
+struct HavingCondition {
+    HavingSource source = HavingSource::GROUP_COLUMN;
+    size_t index = 0;
+    CompOp op = OP_EQ;
+    Value rhs;
 };
 
 /*
@@ -54,7 +64,7 @@ struct TableBinding {
     // FROM student AS s
     // 若没有别名，则table_name = binding_name
     std::string table_name;    // 数据库中的真实表名，“student”
-    std::string binding_name;  // 当前 SQL 中引用这张表所使用的名称，“s”  
+    std::string binding_name;  // 当前 SQL 中引用这张表所使用的名称，“s”
 };
 
 
@@ -100,7 +110,7 @@ class Query{
     // 题5 聚合
     std::vector<AggregateInfo> aggs;
     std::vector<TabCol> group_by_cols;
-    std::vector<Condition> having_conds;
+    std::vector<HavingCondition> having_conds;
     std::vector<std::pair<TabCol, ast::OrderByDir>> orders;
 
     bool has_limit = false;
@@ -152,15 +162,20 @@ private:
     bool is_compatible_type(ColType lhs, ColType rhs);
 
     ColType get_col_type(const std::vector<ColMeta> &all_cols, const TabCol &col);
+    AggregateInfo analyze_aggregate(ast::AggType type,
+                                    const std::shared_ptr<ast::Col> &column,
+                                    bool is_star, bool distinct,
+                                    const std::string &alias,
+                                    const AnalyzeScope &scope);
     void check_group_by_validity(const std::vector<TabCol> &sel_cols,
                                  const std::vector<AggregateInfo> &aggs,
                                  const std::vector<TabCol> &group_by);
     bool is_in_group_by(const TabCol &col, const std::vector<TabCol> &group_by);
-    bool is_aggregate_argument(const TabCol &col, const std::vector<AggregateInfo> &aggs);
-    void check_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-                             const std::vector<TabCol> &group_by,
-                             std::vector<AggregateInfo> &aggs,
-                             const std::vector<ColMeta> &all_cols);
+    void analyze_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+                               const std::vector<TabCol> &group_by,
+                               std::vector<AggregateInfo> &aggs,
+                               const AnalyzeScope &scope,
+                               std::vector<HavingCondition> &result);
     void check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds);
     TabCol resolve_order_column(TabCol order_col,
                                 const std::vector<TabCol> &sel_cols,

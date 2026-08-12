@@ -47,7 +47,7 @@ typedef enum PlanTag{
     T_Filter,
     T_Sort,
     T_Projection,
-    T_Aggregation,
+    T_Aggregation, // 聚合计划节点标签
     T_Limit,
     T_Union
 } PlanTag;
@@ -165,12 +165,12 @@ class SortPlan : public Plan
         std::vector<std::pair<TabCol, bool>> sort_cols_;
         
 };
-
+// 专门的聚合计划
 class AggPlan : public Plan
 {
     public:
         AggPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> group_cols,
-                std::vector<AggregateInfo> agg_exprs, std::vector<Condition> having_conds,
+                std::vector<AggregateInfo> agg_exprs, std::vector<HavingCondition> having_conds,
                 std::vector<ColMeta> output_cols)
         {
             Plan::tag = tag;
@@ -184,7 +184,7 @@ class AggPlan : public Plan
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> group_cols_;
         std::vector<AggregateInfo> agg_exprs_;
-        std::vector<Condition> having_conds_;
+        std::vector<HavingCondition> having_conds_;
         std::vector<ColMeta> output_cols_;
 };
 

@@ -24,7 +24,7 @@ struct ReproRing {
         IXINS = 4,      // insert_entry(new_orders): a=oid b=d c=rid
         IXDEL = 5,      // delete_entry(new_orders): a=oid b=d
         HEAPINS = 6,    // insert_record(new_orders 堆): c=rid
-        AGGOUT = 7,     // select_agg MIN 结果发出: a=int值 b=扫描行数
+        AGGOUT = 7,     // AggExecutor MIN 结果发出: a=int值 b=扫描行数
         SKIPVIS = 8,    // index scan 跳过行: a=项key末int b=原因(1=mvcc不可见 2=from_heap复查
                         //   3=key不一致 4=槽死 5=eval不匹配 6=前缀越界停) c=rid
         DRAINDROP = 9,  // drain 弃单: a=原因(1=链不在 2=状态不符 3=key_src空 4=is_record假) b=cts c=rid

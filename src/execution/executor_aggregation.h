@@ -38,7 +38,7 @@ class AggExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
 
-    struct AggState {
+    struct AggState { // 一个聚合状态对应一个聚合表达式
         int64_t count = 0;
         int64_t int_sum = 0;
         double float_sum = 0.0;  // 决赛 FLOAT32 规则：binary64 累加，输出前一次舍回 binary32
@@ -50,16 +50,21 @@ private:
         std::string str_min;
         int64_t sum_cnt = 0;
         bool has_value = false;
-        std::unordered_set<std::string> distinct_seen;  // 决赛：COUNT(DISTINCT col) 去重集合
+        // Most states are not DISTINCT; keep the per-group base state small
+        // and allocate the hash set only for a DISTINCT aggregate that sees a
+        // non-NULL value.
+        std::unique_ptr<std::unordered_set<std::string>> distinct_seen;
     };
 
-    std::unordered_map<std::string, std::vector<AggState>> groups_;
-    std::vector<std::string> group_order_;
+    std::unordered_map<std::string, std::vector<AggState>> groups_; // 使用哈希表实现快速分组，groups_[分组键] = 该组的所有聚合状态
+    std::vector<std::string> group_order_; // 保存分组的首次出现顺序，后续输出为 ORDER 的分组时，结果按该顺序输出
     size_t iter_idx_ = 0;
 
     std::vector<TabCol> group_cols_;
+    std::vector<size_t> group_col_idxs_;
     std::vector<AggregateInfo> agg_exprs_;
-    std::vector<Condition> having_conds_;
+    std::vector<int> argument_col_idxs_;  // -1 for star; bound once, not per input row
+    std::vector<HavingCondition> having_conds_;
     std::vector<ColMeta> cols_;
     size_t len_;
     bool plain_agg_;
@@ -67,28 +72,28 @@ private:
     std::unique_ptr<RmRecord> cur_rec_;
     std::vector<bool> cur_nulls_;   // 当前输出行各列是否 NULL（空集聚合）
 
-    std::unordered_map<std::string, size_t> alias_to_idx_;
-    std::unordered_map<std::string, size_t> name_to_idx_;
-
     // 辅助函数
     std::string make_group_key(const char *data);
     float read_as_float(const char *data, const ColMeta &col);
     int read_as_int(const char *data, const ColMeta &col);
-    bool is_null(const char *data, const ColMeta &col);
-    std::string get_agg_func_name(ast::AggType type);
+    bool is_null(size_t input_col_idx) const;
     int compare_value_by_val(const Value &a, const Value &b);
     bool evaluate_condition(const Value &lhs, const Value &rhs, CompOp op);
     bool satisfy_having(const std::vector<AggState> &states, const std::string &key);
     void build_cur();
     void advance_to_valid();
-    Value get_agg_value(const AggregateInfo &agg, const AggState &st);
+    const ColMeta *find_argument_col(const AggregateInfo &agg) const;
+    void update_state(const AggregateInfo &agg, AggState &state,
+                      const RmRecord &record, const ColMeta *argument_col);
+    Value finalize(const AggregateInfo &agg, const AggState &state) const;
+    void write_finalized_value(const Value &value, size_t output_col_idx);
     Value get_group_col_value(size_t group_idx, const std::string &key);
 
 public:
     AggExecutor(std::unique_ptr<AbstractExecutor> prev,
                 const std::vector<TabCol> &group_cols,
                 const std::vector<AggregateInfo> &agg_exprs,
-                const std::vector<Condition> &having_conds,
+                const std::vector<HavingCondition> &having_conds,
                 std::vector<ColMeta> output_cols);
 
     void beginTuple() override;
@@ -104,7 +109,7 @@ public:
 AggExecutor::AggExecutor(std::unique_ptr<AbstractExecutor> prev,
                          const std::vector<TabCol> &group_cols,
                          const std::vector<AggregateInfo> &agg_exprs,
-                         const std::vector<Condition> &having_conds,
+                         const std::vector<HavingCondition> &having_conds,
                          std::vector<ColMeta> output_cols) {
     prev_ = std::move(prev);
     group_cols_ = group_cols;
@@ -115,36 +120,47 @@ AggExecutor::AggExecutor(std::unique_ptr<AbstractExecutor> prev,
     plain_agg_ = group_cols_.empty();
     done_ = false;
 
-    for (size_t i = 0; i < agg_exprs_.size(); i++) {
-        if (!agg_exprs_[i].alias.empty()) {
-            alias_to_idx_[agg_exprs_[i].alias] = i;
-        }
-        std::string agg_name = get_agg_func_name(agg_exprs_[i].type) + "(" +
-                               (agg_exprs_[i].is_star ? "*" : agg_exprs_[i].col.col_name) + ")";
-        name_to_idx_[agg_name] = i;
+    const auto &input_cols = prev_->cols();
+    group_col_idxs_.reserve(group_cols_.size());
+    for (const auto &group : group_cols_) {
+        auto col = std::find_if(input_cols.begin(), input_cols.end(), [&](const ColMeta &candidate) {
+            return candidate.name == group.col_name &&
+                   (group.tab_name.empty() || candidate.tab_name == group.tab_name);
+        });
+        if (col == input_cols.end()) throw ColumnNotFoundError(group.col_name);
+        group_col_idxs_.push_back(static_cast<size_t>(col - input_cols.begin()));
     }
+    argument_col_idxs_.reserve(agg_exprs_.size());
+    for (const auto &agg : agg_exprs_) {
+        if (agg.is_star) {
+            argument_col_idxs_.push_back(-1);
+            continue;
+        }
+        auto col = std::find_if(input_cols.begin(), input_cols.end(), [&](const ColMeta &candidate) {
+            return candidate.name == agg.col.col_name &&
+                   (agg.col.tab_name.empty() || candidate.tab_name == agg.col.tab_name);
+        });
+        if (col == input_cols.end()) throw ColumnNotFoundError(agg.col.col_name);
+        argument_col_idxs_.push_back(static_cast<int>(col - input_cols.begin()));
+    }
+
 }
 
+// 构造 GROUP BY Key
 std::string AggExecutor::make_group_key(const char *data) {
-    if (plain_agg_) return "";
+    if (plain_agg_) return ""; // 没有 GROUP BY 时直接返回
 
     std::string key;
-    std::string null_bitmap((group_cols_.size() + 7) / 8, 0);
+    std::string null_bitmap((group_cols_.size() + 7) / 8, 0); // 使用掩码判断值是否为NULL
     size_t bit_idx = 0;
 
-    for (auto &gc : group_cols_) {
-        auto it = std::find_if(prev_->cols().begin(), prev_->cols().end(),
-            [&](const ColMeta &c) {
-                return c.name == gc.col_name &&
-                       (gc.tab_name.empty() || c.tab_name == gc.tab_name);
-            });
-        if (it == prev_->cols().end()) continue;
-
-        if (is_null(data, *it)) {
+    for (const size_t input_col_idx : group_col_idxs_) {
+        const ColMeta &col = prev_->cols()[input_col_idx];
+        if (is_null(input_col_idx)) {
             null_bitmap[bit_idx / 8] |= (1 << (bit_idx % 8));
-            key.append(it->len, '\0');
+            key.append(col.len, '\0');
         } else {
-            key.append(data + it->offset, it->len);
+            key.append(data + col.offset, col.len);
         }
         bit_idx++;
     }
@@ -166,30 +182,87 @@ int AggExecutor::read_as_int(const char *data, const ColMeta &col) {
     return *(const int *)(data + col.offset);
 }
 
-bool AggExecutor::is_null(const char *data, const ColMeta &col) {
-    (void)data;
+bool AggExecutor::is_null(size_t input_col_idx) const {
     const auto *mask = prev_->null_mask();
-    if (mask == nullptr) return false;
-    const auto &input_cols = prev_->cols();
-    auto it = std::find_if(input_cols.begin(), input_cols.end(), [&](const ColMeta &candidate) {
-        return &candidate == &col ||
-               (candidate.offset == col.offset && candidate.name == col.name &&
-                candidate.tab_name == col.tab_name);
-    });
-    if (it == input_cols.end()) return false;
-    const size_t index = static_cast<size_t>(it - input_cols.begin());
-    return index < mask->size() && (*mask)[index];
+    return mask != nullptr && input_col_idx < mask->size() && (*mask)[input_col_idx];
 }
 
-std::string AggExecutor::get_agg_func_name(ast::AggType type) {
-    switch (type) {
-        case ast::AGG_COUNT: return "count";
-        case ast::AGG_MAX:   return "max";
-        case ast::AGG_MIN:   return "min";
-        case ast::AGG_SUM:   return "sum";
-        case ast::AGG_AVG:   return "avg";
+const ColMeta *AggExecutor::find_argument_col(const AggregateInfo &agg) const {
+    const size_t agg_idx = static_cast<size_t>(&agg - agg_exprs_.data());
+    if (agg_idx >= argument_col_idxs_.size() || argument_col_idxs_[agg_idx] < 0) return nullptr;
+    return &prev_->cols().at(static_cast<size_t>(argument_col_idxs_[agg_idx]));
+}
+
+void AggExecutor::update_state(const AggregateInfo &agg, AggState &st,
+                               const RmRecord &record, const ColMeta *argument_col) {
+    const auto *spec = ast::aggregate_spec(agg.type);
+    if (spec == nullptr) throw InternalError("Unknown aggregate function");
+
+    // Common SQL input policy: argument aggregates ignore NULL, and DISTINCT
+    // filters equal physical values before the transition.  New simple
+    // aggregates inherit both without another per-function branch.
+    if (!agg.is_star) {
+        if (argument_col == nullptr) throw InternalError("Aggregate argument is not bound");
+        const size_t input_col_idx = static_cast<size_t>(argument_col - prev_->cols().data());
+        if (is_null(input_col_idx)) return;
+        if (agg.distinct) {
+            std::string distinct_key(record.data + argument_col->offset, argument_col->len);
+            if (st.distinct_seen == nullptr) {
+                st.distinct_seen = std::make_unique<std::unordered_set<std::string>>();
+            }
+            if (!st.distinct_seen->insert(std::move(distinct_key)).second) return;
+        }
     }
-    return "";
+
+    if (spec->update_rule == ast::AggregateUpdateRule::COUNT) {
+        ++st.count;
+        return;
+    }
+
+    if (spec->update_rule == ast::AggregateUpdateRule::SUMMARY) {
+        if (argument_col == nullptr) throw InternalError("SUMMARY aggregate requires an argument");
+        if (argument_col->type == TYPE_INT) {
+            const int value = read_as_int(record.data, *argument_col);
+            if (!st.has_value) {
+                st.int_max = st.int_min = value;
+                st.has_value = true;
+            } else {
+                st.int_max = std::max(st.int_max, value);
+                st.int_min = std::min(st.int_min, value);
+            }
+            st.int_sum += value;
+        } else if (argument_col->type == TYPE_FLOAT) {
+            const float value = read_as_float(record.data, *argument_col);
+            if (!st.has_value) {
+                st.float_max = st.float_min = value;
+                st.has_value = true;
+            } else {
+                st.float_max = std::max(st.float_max, value);
+                st.float_min = std::min(st.float_min, value);
+            }
+            st.float_sum += value;
+        } else {
+            std::string value(record.data + argument_col->offset, argument_col->len);
+            const size_t end = value.find('\0');
+            if (end != std::string::npos) value.resize(end);
+            if (!st.has_value) {
+                st.str_max = st.str_min = value;
+                st.has_value = true;
+            } else {
+                if (value > st.str_max) st.str_max = value;
+                if (value < st.str_min) st.str_min = value;
+            }
+        }
+        ++st.sum_cnt;
+        return;
+    }
+
+    // A registry entry marked CUSTOM must add its transition in this single,
+    // adjacent switch.  Failing loudly prevents a half-registered function
+    // from returning plausible but wrong contest answers.
+    switch (agg.type) {
+        default: throw InternalError("Aggregate CUSTOM update is not implemented");
+    }
 }
 
 int AggExecutor::compare_value_by_val(const Value &a, const Value &b) {
@@ -208,8 +281,10 @@ int AggExecutor::compare_value_by_val(const Value &a, const Value &b) {
     // INT vs FLOAT: promote to float
     if ((a.type == TYPE_INT && b.type == TYPE_FLOAT) ||
         (a.type == TYPE_FLOAT && b.type == TYPE_INT)) {
-        float fa = (a.type == TYPE_INT) ? static_cast<float>(a.int_val) : a.float_val;
-        float fb = (b.type == TYPE_INT) ? static_cast<float>(b.int_val) : b.float_val;
+        const double fa = (a.type == TYPE_INT) ? static_cast<double>(a.int_val)
+                                               : static_cast<double>(a.float_val);
+        const double fb = (b.type == TYPE_INT) ? static_cast<double>(b.int_val)
+                                               : static_cast<double>(b.float_val);
         return (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
     }
     return static_cast<int>(a.type) - static_cast<int>(b.type);
@@ -228,19 +303,30 @@ bool AggExecutor::evaluate_condition(const Value &lhs, const Value &rhs, CompOp 
     }
 }
 
-Value AggExecutor::get_agg_value(const AggregateInfo &agg, const AggState &st) {
+Value AggExecutor::finalize(const AggregateInfo &agg, const AggState &st) const {
+    auto zero = [&]() {
+        switch (agg.output_type()) {
+            case TYPE_INT: return agg_make_int(0);
+            case TYPE_FLOAT: return agg_make_float(0.0f);
+            case TYPE_STRING: return agg_make_str("");
+        }
+        return agg_make_int(0);
+    };
+
+    // Second and final extension point for a simple aggregate.  Functions
+    // registered with SUMMARY can reuse the fields above and need one case.
     switch (agg.type) {
         case ast::AGG_COUNT: return agg_make_int(static_cast<int>(st.count));
         case ast::AGG_SUM:
             if (agg.arg_type == TYPE_INT) return agg_make_int(static_cast<int>(st.int_sum));
             else return agg_make_float(static_cast<float>(st.float_sum));
         case ast::AGG_MAX:
-            if (!st.has_value) return agg_make_empty();
+            if (!st.has_value) return zero();
             if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_max);
             if (agg.arg_type == TYPE_FLOAT) return agg_make_float(st.float_max);
             return agg_make_str(st.str_max);
         case ast::AGG_MIN:
-            if (!st.has_value) return agg_make_empty();
+            if (!st.has_value) return zero();
             if (agg.arg_type == TYPE_INT) return agg_make_int(st.int_min);
             if (agg.arg_type == TYPE_FLOAT) return agg_make_float(st.float_min);
             return agg_make_str(st.str_min);
@@ -251,7 +337,25 @@ Value AggExecutor::get_agg_value(const AggregateInfo &agg, const AggState &st) {
                                    : (st.float_sum / st.sum_cnt)))
                        : agg_make_float(0.0f);
     }
-    return agg_make_empty();
+    throw InternalError("Aggregate finalize is not implemented");
+}
+
+void AggExecutor::write_finalized_value(const Value &value, size_t output_col_idx) {
+    const ColMeta &column = cols_.at(output_col_idx);
+    char *slot = cur_rec_->data + column.offset;
+    switch (column.type) {
+        case TYPE_INT:
+            *(int *)slot = value.int_val;
+            break;
+        case TYPE_FLOAT:
+            *(float *)slot = value.float_val;
+            break;
+        case TYPE_STRING: {
+            const size_t bytes = std::min(value.str_val.size(), static_cast<size_t>(column.len));
+            memcpy(slot, value.str_val.data(), bytes);
+            break;
+        }
+    }
 }
 
 Value AggExecutor::get_group_col_value(size_t group_idx, const std::string &key) {
@@ -283,49 +387,25 @@ Value AggExecutor::get_group_col_value(size_t group_idx, const std::string &key)
     return agg_make_empty();
 }
 
+// 检查条件是否满足
 bool AggExecutor::satisfy_having(const std::vector<AggState> &states, const std::string &key) {
     if (having_conds_.empty()) return true;
 
-    for (auto &cond : having_conds_) {
-        Value lhs_val, rhs_val;
-        bool lhs_found = false;
-        size_t agg_idx = 0;
-
-        // 1. 先检查是否是 GROUP BY 列
-        for (size_t i = 0; i < group_cols_.size(); i++) {
-            if (group_cols_[i].col_name == cond.lhs_col.col_name &&
-                (cond.lhs_col.tab_name.empty() ||
-                 group_cols_[i].tab_name == cond.lhs_col.tab_name)) {
-                lhs_val = get_group_col_value(i, key);
-                lhs_found = true;
-                break;
-            }
+    for (const auto &cond : having_conds_) {
+        Value lhs;
+        if (cond.source == HavingSource::GROUP_COLUMN) {
+            if (cond.index >= group_cols_.size()) return false;
+            const bool is_null =
+                (static_cast<unsigned char>(key[cond.index / 8]) &
+                 (1U << (cond.index % 8))) != 0;
+            // Comparisons against NULL are UNKNOWN; HAVING retains TRUE only.
+            if (is_null) return false;
+            lhs = get_group_col_value(cond.index, key);
+        } else {
+            if (cond.index >= agg_exprs_.size() || cond.index >= states.size()) return false;
+            lhs = finalize(agg_exprs_[cond.index], states[cond.index]);
         }
-
-        // 2. 再检查是否是聚合函数（别名或函数名）
-        if (!lhs_found) {
-            auto it = alias_to_idx_.find(cond.lhs_col.col_name);
-            if (it != alias_to_idx_.end()) {
-                lhs_found = true;
-                agg_idx = it->second;
-            } else {
-                auto it2 = name_to_idx_.find(cond.lhs_col.col_name);
-                if (it2 != name_to_idx_.end()) {
-                    lhs_found = true;
-                    agg_idx = it2->second;
-                }
-            }
-            if (lhs_found) {
-                lhs_val = get_agg_value(agg_exprs_[agg_idx], states[agg_idx]);
-            }
-        }
-
-        if (!lhs_found) return false;
-
-        rhs_val = cond.rhs_val;
-        if (!evaluate_condition(lhs_val, rhs_val, cond.op)) {
-            return false;
-        }
+        if (!evaluate_condition(lhs, cond.rhs, cond.op)) return false;
     }
     return true;
 }
@@ -333,7 +413,7 @@ bool AggExecutor::satisfy_having(const std::vector<AggState> &states, const std:
 void AggExecutor::advance_to_valid() {
     while (iter_idx_ < group_order_.size() &&
            !satisfy_having(groups_[group_order_[iter_idx_]], group_order_[iter_idx_])) {
-        ++iter_idx_;
+        ++iter_idx_; // 跳过不满足条件的分组
     }
 }
 
@@ -342,7 +422,7 @@ void AggExecutor::beginTuple() {
     group_order_.clear();
     done_ = false;
 
-    prev_->beginTuple();
+    prev_->beginTuple(); // 下层执行器启动
     // MIN 索引早停：无分组、唯一聚合是 MIN(col)、无 HAVING，且子执行器保证输出按
     // col 升序（见 IndexScanExecutor::sorted_asc_on）——首个非 NULL 值即全局最小，
     // 不必耗尽子扫描。Delivery 的 min(no_o_id) 在热点长队列上从 O(队列) 降为 O(1)，
@@ -353,10 +433,10 @@ void AggExecutor::beginTuple() {
                                  having_conds_.empty() && prev_->sorted_asc_on(agg_exprs_[0].col);
 
     for (; !prev_->is_end(); prev_->nextTuple()) {
-        auto rec = prev_->Next();
+        auto rec = prev_->Next(); // 逐行读取记录
         if (!rec) continue;
 
-        std::string key = make_group_key(rec->data);
+        std::string key = make_group_key(rec->data); // 将记录中的 GROUP BY key 提取出来
 
         auto it = groups_.find(key);
         if (it == groups_.end()) {
@@ -369,78 +449,7 @@ void AggExecutor::beginTuple() {
         for (size_t i = 0; i < agg_exprs_.size(); ++i) {
             auto &agg = agg_exprs_[i];
             auto &st = states[i];
-
-            switch (agg.type) {
-                case ast::AGG_COUNT:
-                    if (agg.is_star) {
-                        st.count++;
-                    } else {
-                        auto col_it = std::find_if(prev_->cols().begin(), prev_->cols().end(),
-                            [&](const ColMeta &c) {
-                                return c.name == agg.col.col_name &&
-                                       (agg.col.tab_name.empty() || c.tab_name == agg.col.tab_name);
-                            });
-                        if (col_it != prev_->cols().end() && !is_null(rec->data, *col_it)) {
-                            if (agg.distinct) {
-                                // 决赛：COUNT(DISTINCT col) —— 按列原始字节去重后计数
-                                std::string dkey(rec->data + col_it->offset, col_it->len);
-                                if (st.distinct_seen.insert(std::move(dkey)).second) {
-                                    st.count++;
-                                }
-                            } else {
-                                st.count++;
-                            }
-                        }
-                    }
-                    break;
-
-                case ast::AGG_MAX:
-                case ast::AGG_MIN:
-                case ast::AGG_SUM:
-                case ast::AGG_AVG: {
-                    auto col_it = std::find_if(prev_->cols().begin(), prev_->cols().end(),
-                        [&](const ColMeta &c) {
-                            return c.name == agg.col.col_name &&
-                                   (agg.col.tab_name.empty() || c.tab_name == agg.col.tab_name);
-                        });
-                    if (col_it == prev_->cols().end()) break;
-                    if (is_null(rec->data, *col_it)) break;
-
-                    if (col_it->type == TYPE_INT) {
-                        int ival = read_as_int(rec->data, *col_it);
-                        if (!st.has_value) {
-                            st.int_max = st.int_min = ival;
-                            st.has_value = true;
-                        } else {
-                            st.int_max = std::max(st.int_max, ival);
-                            st.int_min = std::min(st.int_min, ival);
-                        }
-                        st.int_sum += ival;
-                    } else if (col_it->type == TYPE_FLOAT) {
-                        float fval = read_as_float(rec->data, *col_it);
-                        if (!st.has_value) {
-                            st.float_max = st.float_min = fval;
-                            st.has_value = true;
-                        } else {
-                            st.float_max = std::max(st.float_max, fval);
-                            st.float_min = std::min(st.float_min, fval);
-                        }
-                        st.float_sum += fval;
-                    } else if (col_it->type == TYPE_STRING) {
-                        std::string sval((char *)(rec->data + col_it->offset), col_it->len);
-                        sval.resize(strlen(sval.c_str()));
-                        if (!st.has_value) {
-                            st.str_max = st.str_min = sval;
-                            st.has_value = true;
-                        } else {
-                            if (sval > st.str_max) st.str_max = sval;
-                            if (sval < st.str_min) st.str_min = sval;
-                        }
-                    }
-                    st.sum_cnt++;
-                    break;
-                }
-            }
+            update_state(agg, st, *rec, find_argument_col(agg));
         }
 
         // NULL 行不置 has_value，须继续找首个非 NULL 值才能停
@@ -460,9 +469,9 @@ void AggExecutor::beginTuple() {
         }
     }
 
-    iter_idx_ = 0;
-    advance_to_valid();
-    build_cur();
+    iter_idx_ = 0; // 定位到第一个分组
+    advance_to_valid(); // 跳过不满足 HAVING 的分组
+    build_cur(); // 把当前分组转换为一条输出记录
 }
 
 void AggExecutor::nextTuple() {
@@ -482,6 +491,7 @@ std::unique_ptr<RmRecord> AggExecutor::Next() {
     return std::make_unique<RmRecord>(*cur_rec_);
 }
 
+// 把当前分组的分组 key 和聚合状态，编码为一条标准 RmRecord。
 void AggExecutor::build_cur() {
     if (iter_idx_ >= group_order_.size()) {
         cur_rec_.reset();
@@ -504,9 +514,9 @@ void AggExecutor::build_cur() {
             const bool is_null_group =
                 (static_cast<unsigned char>(key[i / 8]) & (1U << (i % 8))) != 0;
             if (is_null_group) {
-                cur_nulls_[i] = true;
+                cur_nulls_[i] = true; // 当前为 NULL
             } else {
-                memcpy(dst + cols_[i].offset, key.data() + key_off, col_len);
+                memcpy(dst + cols_[i].offset, key.data() + key_off, col_len); // 不为 NULL，则将对应结果写回记录
             }
             key_off += col_len;
         }
@@ -514,64 +524,7 @@ void AggExecutor::build_cur() {
 
     // 2. 写聚合结果列
     for (size_t i = 0; i < agg_exprs_.size(); ++i) {
-        auto &agg = agg_exprs_[i];
-        auto &st = states[i];
-        int col_idx = plain_agg_ ? i : (group_cols_.size() + i);
-        char *slot = dst + cols_[col_idx].offset;
-        ColType out_type = cols_[col_idx].type;
-
-        switch (agg.type) {
-            case ast::AGG_COUNT:
-                *(int *)slot = static_cast<int>(st.count);
-                break;
-
-            case ast::AGG_SUM:
-                if (out_type == TYPE_INT) {
-                    *(int *)slot = static_cast<int>(st.int_sum);
-                } else {
-                    // 决赛 FLOAT32：SUM 全程 binary64 累加，此处一次性舍回 binary32
-                    *(float *)slot = (agg.arg_type == TYPE_INT)
-                                         ? static_cast<float>(st.int_sum)
-                                         : static_cast<float>(st.float_sum);
-                }
-                break;
-
-            case ast::AGG_MAX:
-                // 空集输出 0（评测家族语义：P2 边界基线期望 0.000000，非 SQL 标准 NULL）
-                if (st.has_value) {
-                    if (out_type == TYPE_INT) {
-                        *(int *)slot = st.int_max;
-                    } else if (out_type == TYPE_FLOAT) {
-                        *(float *)slot = st.float_max;
-                    } else {
-                        memset(slot, 0, cols_[col_idx].len);
-                        size_t cpy = std::min(st.str_max.size(), static_cast<size_t>(cols_[col_idx].len));
-                        memcpy(slot, st.str_max.c_str(), cpy);
-                    }
-                }
-                break;
-
-            case ast::AGG_MIN:
-                if (st.has_value) {
-                    if (out_type == TYPE_INT) {
-                        *(int *)slot = st.int_min;
-                    } else if (out_type == TYPE_FLOAT) {
-                        *(float *)slot = st.float_min;
-                    } else {
-                        memset(slot, 0, cols_[col_idx].len);
-                        size_t cpy = std::min(st.str_min.size(), static_cast<size_t>(cols_[col_idx].len));
-                        memcpy(slot, st.str_min.c_str(), cpy);
-                    }
-                }
-                break;
-
-            case ast::AGG_AVG:
-                *(float *)slot = (st.sum_cnt > 0)
-                                     ? static_cast<float>((agg.arg_type == TYPE_INT)
-                                            ? (static_cast<double>(st.int_sum) / st.sum_cnt)
-                                            : (st.float_sum / st.sum_cnt))
-                                     : 0.0f;
-                break;
-        }
+        const size_t col_idx = plain_agg_ ? i : (group_cols_.size() + i);
+        write_finalized_value(finalize(agg_exprs_[i], states[i]), col_idx);
     }
 }

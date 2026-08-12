@@ -404,7 +404,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
 
     /*
         投影下推的必需列集：最终输出以及 WHERE/ON/GROUP/AGG/HAVING/ORDER
-        任一后续算子会用到的列都不能被裁掉，包括一下来源：
+        任一后续算子会用到的列都不能被裁掉，包括以下来源：
             query->cols
             query->group_by_cols
             query->aggs
@@ -425,7 +425,6 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     for (const auto &col : query->cols) require_col(col);
     for (const auto &col : query->group_by_cols) require_col(col);
     for (const auto &agg : query->aggs) if (!agg.is_star) require_col(agg.col);
-    for (const auto &cond : query->having_conds) require_cond(cond);
     for (const auto &order : query->orders) require_col(order.first);
     for (const auto &[_, conds] : scan_filters) for (const auto &cond : conds) require_cond(cond);
     for (const auto &[_, conds] : join_filters) for (const auto &cond : conds) require_cond(cond);
@@ -634,7 +633,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
     auto sel_cols = query->cols;
 
-    // 聚合+分组
+    // 存在聚合或分组都会生成 AggPlan
     if (!query->aggs.empty() || !query->group_by_cols.empty()) {
         std::vector<ColMeta> output_cols;
         int offset = 0;
@@ -653,23 +652,8 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
             ColMeta col;
             col.name = agg.alias.empty() ? agg.to_string() : agg.alias;
             col.tab_name = agg.col.tab_name;
-            if (agg.type == ast::AGG_COUNT) {
-                col.type = TYPE_INT;
-                col.len = sizeof(int);
-            } else if (agg.type == ast::AGG_AVG) {
-                col.type = TYPE_FLOAT;
-                col.len = sizeof(float);
-            } else {
-                col.type = agg.arg_type;
-                if (agg.arg_type == TYPE_INT) {
-                    col.len = sizeof(int);
-                } else if (agg.arg_type == TYPE_FLOAT) {
-                    col.len = sizeof(float);
-                } else {
-                    auto tab = sm_manager_->db_.get_table(physical_table(agg.col.tab_name));
-                    col.len = tab.get_col(agg.col.col_name)->len;
-                }
-            }
+            col.type = agg.output_type();
+            col.len = agg.output_len();
             col.offset = offset;
             offset += col.len;
             output_cols.push_back(col);
@@ -679,13 +663,13 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                                                 query->having_conds, output_cols);
         // 聚合查询中，Projection 只选择用户 SELECT 的列
         sel_cols.clear();
-        for (auto &gc : query->group_by_cols) {
-            sel_cols.push_back(gc);
+        for (auto &selected : query->cols) {
+            sel_cols.push_back(selected);
         }
         for (auto &agg : query->aggs) {
             if (agg.in_output) {
                 std::string name = agg.alias.empty() ? agg.to_string() : agg.alias;
-                sel_cols.push_back({"", name});
+                sel_cols.push_back({agg.is_star ? "" : agg.col.tab_name, name});
             }
         }
     }

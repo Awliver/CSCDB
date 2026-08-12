@@ -63,6 +63,30 @@ int main() {
         assert(select->where_conds.size() == 1);
         yy_delete_buffer(buf);
     }
+    {
+        YY_BUFFER_STATE buf = yy_scan_string(
+            "select k, count(distinct v), avg(v) from t group by k "
+            "having count(distinct v) > 1;");
+        assert(yyparse() == 0);
+        auto select = std::dynamic_pointer_cast<ast::SelectStmt>(ast::parse_tree);
+        assert(select != nullptr);
+        assert(select->aggs.size() == 2);
+        assert(select->aggs[0]->agg_type == ast::AGG_COUNT);
+        assert(select->aggs[0]->distinct);
+        assert(select->aggs[0]->to_string() == "count(distinct v)");
+        assert(select->having_conds.size() == 1);
+        assert(select->having_conds[0]->lhs_agg != nullptr);
+        assert(select->having_conds[0]->lhs_agg->distinct);
+        yy_delete_buffer(buf);
+    }
+    {
+        // Aggregate names not reserved by the lexer are accepted only when
+        // present in the central registry.  This is the parser side of the
+        // two-edit-point contest extension contract.
+        YY_BUFFER_STATE buf = yy_scan_string("select not_registered(v) from t;");
+        assert(yyparse() != 0);
+        yy_delete_buffer(buf);
+    }
     ast::parse_tree.reset();
     return 0;
 }

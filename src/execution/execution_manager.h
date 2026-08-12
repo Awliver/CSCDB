@@ -44,9 +44,6 @@ class QlManager {
     void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                         Context *context, int limit = -1);
 
-    void select_agg(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> &sel_cols,
-                    Context *context);
-
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
 
     // 性能测试：CSV 批量加载

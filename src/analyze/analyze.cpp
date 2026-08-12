@@ -150,7 +150,6 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 
         // 普通列
         for (auto &sv_sel_col : x->cols) {
-            if (sv_sel_col->agg_type != 0) continue;  // 题10 简单聚合走下方转换
             TabCol sel_col = resolve_column(
                 from_result.scope, 
                 {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name});
@@ -167,58 +166,26 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             }
         }
 
-        // p7 AggExpr 列表
+        // 遍历 SELECT 中的每一个聚合函数，并将语法层的 AggExpr 转换成语义层的 AggregateInfo
         for (auto &sv_agg : x->aggs) {
-            AggregateInfo agg;
-            agg.type = sv_agg->agg_type;
-            agg.is_star = sv_agg->is_star;
-            agg.alias = sv_agg->alias;
-            agg.distinct = sv_agg->distinct;
-            if (sv_agg->col) {
-                agg.col = resolve_column(
-                    from_result.scope,
-                    {.tab_name = sv_agg->col->tab_name, .col_name = sv_agg->col->col_name});
-                agg.arg_type = get_col_type(all_cols, agg.col);
-                if (sv_agg->agg_type != ast::AGG_COUNT &&
-                    agg.arg_type != TYPE_INT && agg.arg_type != TYPE_FLOAT &&
-                    !((sv_agg->agg_type == ast::AGG_MIN || sv_agg->agg_type == ast::AGG_MAX) &&
-                      agg.arg_type == TYPE_STRING)) {
-                    throw InternalError("failure");
-                }
-            } else {
-                agg.arg_type = TYPE_INT;
-            }
+            AggregateInfo agg = analyze_aggregate(
+                sv_agg->agg_type, sv_agg->col, sv_agg->is_star,
+                sv_agg->distinct, sv_agg->alias, from_result.scope);
             query->aggs.push_back(agg);
-            query->sel_captions.push_back(agg.alias.empty() ? (sv_agg->is_star ? "count(*)" : agg.col.col_name) : agg.alias);
-        }
-        // 题10 简单聚合（Col.agg_type）转 AggregateInfo
-        for (auto &sv_sel_col : x->cols) {
-            if (sv_sel_col->agg_type == 0) continue;
-            AggregateInfo agg;
-            static const ast::AggType map[] = {ast::AGG_COUNT, ast::AGG_COUNT, ast::AGG_MAX, ast::AGG_MIN, ast::AGG_SUM};
-            agg.type = map[sv_sel_col->agg_type];
-            agg.is_star = (sv_sel_col->col_name == "*");
-            agg.alias = sv_sel_col->alias;
-            if (agg.is_star) {
-                agg.arg_type = TYPE_INT;
-            } else {
-                agg.col = resolve_column(
-                    from_result.scope,
-                    {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name});
-                agg.arg_type = get_col_type(all_cols, agg.col);
-            }
-            query->aggs.push_back(agg);
-            query->sel_captions.push_back(!agg.alias.empty() ? agg.alias : agg.to_string());
+            query->sel_captions.push_back(agg.alias.empty() ? agg.to_string() : agg.alias);
         }
 
+        // 构造 GROUP BY 列
         for (auto &sv_gb : x->group_by_cols) {
             TabCol gb_col = resolve_column(
                 from_result.scope,
                 {.tab_name = sv_gb->tab_name, .col_name = sv_gb->col_name});
-            query->group_by_cols.push_back(gb_col);
+            query->group_by_cols.push_back(gb_col); // 支持多列分组
         }
+        check_group_by_validity(query->cols, query->aggs, query->group_by_cols);
+        analyze_having_clause(x->having_conds, query->group_by_cols, query->aggs,
+                              from_result.scope, query->having_conds);
 
-        get_clause(x->having_conds, query->having_conds);
         if (!x->orders.empty()) {
             for (auto &sv_order : x->orders) {
                 TabCol order_col = {.tab_name = sv_order->cols->tab_name, .col_name = sv_order->cols->col_name};
@@ -243,10 +210,6 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         query->limit_count = x->has_limit ? x->limit_count : (x->limit >= 0 ? x->limit : 0);
         query->limit = query->has_limit ? query->limit_count : x->limit;
 
-        check_group_by_validity(query->cols, query->aggs, query->group_by_cols);
-        if (!query->having_conds.empty()) {
-            check_having_clause(x->having_conds, query->group_by_cols, query->aggs, all_cols);
-        }
         for (auto &sel_col : query->cols) {
             query->sel_captions.push_back(sel_col.alias.empty() ? sel_col.col_name : sel_col.alias);
         }
@@ -464,7 +427,7 @@ AnalyzeScope Analyze::merge_scopes(const AnalyzeScope &left,
     return result; // 左表与右表合并作用域
 }
 
-// 统一的列解析，给col绑定一个唯一确定的table后返回
+// 统一的列解析，给col绑定作用域中唯一的table后返回
 TabCol Analyze::resolve_column(const AnalyzeScope &scope, TabCol target) {
     if (target.tab_name.empty()) { // 未指明表名前缀
         std::string binding_name;
@@ -575,10 +538,13 @@ std::vector<ColMeta> Analyze::infer_select_output_cols(const std::shared_ptr<Que
         return binding_name;
     };
     if (!query->aggs.empty() || !query->group_by_cols.empty()) {
-        for (auto &gc : query->group_by_cols) {
-            auto tab = sm_manager_->db_.get_table(physical_table(gc.tab_name));
-            auto col_it = tab.get_col(gc.col_name);
+        // UNION observes the SELECT list, not the internal GROUP BY key.
+        for (auto &selected : query->cols) {
+            auto tab = sm_manager_->db_.get_table(physical_table(selected.tab_name));
+            auto col_it = tab.get_col(selected.col_name);
             ColMeta col = *col_it;
+            col.tab_name = selected.tab_name;
+            if (!selected.alias.empty()) col.name = selected.alias;
             col.offset = offset;
             offset += col.len;
             result.push_back(col);
@@ -586,18 +552,10 @@ std::vector<ColMeta> Analyze::infer_select_output_cols(const std::shared_ptr<Que
         for (auto &agg : query->aggs) {
             if (!agg.in_output) continue;
             ColMeta col;
-            col.name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
+            col.name = agg.alias.empty() ? agg.to_string() : agg.alias;
             col.tab_name = agg.col.tab_name;
-            if (agg.type == ast::AGG_COUNT) {
-                col.type = TYPE_INT;
-                col.len = sizeof(int);
-            } else if (agg.type == ast::AGG_AVG) {
-                col.type = TYPE_FLOAT;
-                col.len = sizeof(float);
-            } else {
-                col.type = agg.arg_type;
-                col.len = agg.arg_type == TYPE_INT ? sizeof(int) : sizeof(float);
-            }
+            col.type = agg.output_type();
+            col.len = agg.output_len();
             col.offset = offset;
             offset += col.len;
             result.push_back(col);
@@ -658,7 +616,7 @@ TabCol Analyze::resolve_order_column(TabCol order_col,
                                      const std::vector<AggregateInfo> &aggs,
                                      const std::vector<ColMeta> &all_cols) {
     for (auto &agg : aggs) {
-        std::string name = agg.alias.empty() ? (agg.is_star ? "count(*)" : agg.col.col_name) : agg.alias;
+        std::string name = agg.alias.empty() ? agg.to_string() : agg.alias;
         if (order_col.col_name == name) {
             TabCol resolved;
             resolved.tab_name = "";
@@ -797,6 +755,46 @@ ColType Analyze::get_col_type(const std::vector<ColMeta> &all_cols, const TabCol
     return TYPE_INT;  // should not reach here if check_column passed
 }
 
+AggregateInfo Analyze::analyze_aggregate(ast::AggType type,
+                                         const std::shared_ptr<ast::Col> &column,
+                                         bool is_star, bool distinct,
+                                         const std::string &alias,
+                                         const AnalyzeScope &scope) {
+    const auto *spec = ast::aggregate_spec(type);
+    if (spec == nullptr || is_star != (column == nullptr) ||
+        (is_star && (!spec->accepts_star || distinct)) ||
+        (distinct && !spec->accepts_distinct)) {
+        throw InternalError("failure");
+    }
+
+    AggregateInfo agg;
+    agg.type = type;
+    agg.alias = alias;
+    agg.is_star = is_star;
+    agg.distinct = distinct;
+
+    if (is_star) {
+        // Star aggregates have no physical input slot.  INT/sizeof(int) is a
+        // stable placeholder; the registry owns their real output contract.
+        agg.arg_type = TYPE_INT;
+        agg.arg_len = sizeof(int);
+        return agg;
+    }
+
+    agg.col = resolve_column(
+        scope, {.tab_name = column->tab_name, .col_name = column->col_name});
+    const auto col_it = std::find_if(scope.cols.begin(), scope.cols.end(), [&](const ColMeta &meta) {
+        return meta.tab_name == agg.col.tab_name && meta.name == agg.col.col_name;
+    });
+    if (col_it == scope.cols.end() || !ast::aggregate_accepts_argument(type, col_it->type)) {
+        throw InternalError("failure");
+    }
+    agg.arg_type = col_it->type;
+    agg.arg_len = col_it->len;
+    return agg;
+}
+
+// 检查列是否出现 GROUP BY 中
 bool Analyze::is_in_group_by(const TabCol &col, const std::vector<TabCol> &group_by) {
     for (auto &g : group_by) {
         if (g.tab_name == col.tab_name && g.col_name == col.col_name)
@@ -805,23 +803,12 @@ bool Analyze::is_in_group_by(const TabCol &col, const std::vector<TabCol> &group
     return false;
 }
 
-bool Analyze::is_aggregate_argument(const TabCol &col, const std::vector<AggregateInfo> &aggs) {
-    for (auto &agg : aggs) {
-        if (agg.col.col_name == col.col_name &&
-            (col.tab_name.empty() || agg.col.tab_name == col.tab_name))
-            return true;
-    }
-    return false;
-}
-
 void Analyze::check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds) {
-    for (auto &expr : sv_conds) {
-        if (expr->lhs->agg_type != 0) throw InternalError("failure");
-        const std::string &n = expr->lhs->col_name;
-        if (n.find('(') != std::string::npos) throw InternalError("failure");
-    }
+    // The WHERE grammar only accepts Col on the left, not AggExpr.  Keep this
+    // hook as the semantic boundary if general expressions are added later.
+    (void)sv_conds;
 }
-
+// 检查 GROUP BY 的语义合法性，如果查询用了聚合，那么 SELECT 中直接输出的普通列必须受到 GROUP BY 的约束
 void Analyze::check_group_by_validity(const std::vector<TabCol> &sel_cols,
                                       const std::vector<AggregateInfo> &aggs,
                                       const std::vector<TabCol> &group_by) {
@@ -831,97 +818,117 @@ void Analyze::check_group_by_validity(const std::vector<TabCol> &sel_cols,
     if (!has_agg && group_by.empty()) return;  // 无聚合且无 GROUP BY，无需检查
 
     if (group_by.empty()) {
-        // R2: 无 GROUP BY，但不能有普通列
+        // sql 中，若聚合函数与普通列同时出现，则必须要有GROUP BY 约束
         if (has_plain_col) {
             throw InternalError("failure");
         }
         return;
     }
 
-    // R1: 有 GROUP BY，检查每个非聚合参数列都在 GROUP BY 中
+    // 有 GROUP BY，检查所有普通列都在 GROUP BY 中
     for (auto &col : sel_cols) {
-        if (!is_in_group_by(col, group_by) && !is_aggregate_argument(col, aggs)) {
+        if (!is_in_group_by(col, group_by)) {
             throw InternalError("failure");
         }
     }
 }
 
-// 从聚合函数字符串（如 "count(*)", "max(score)"）解析聚合信息
-static bool parse_agg_string(const std::string &s, ast::AggType &type, std::string &col_name, bool &is_star) {
-    if (s.size() < 4) return false;
-    size_t lp = s.find('(');
-    size_t rp = s.find(')');
-    if (lp == std::string::npos || rp == std::string::npos || rp != s.size() - 1) return false;
-    std::string name = s.substr(0, lp);
-    std::string arg = s.substr(lp + 1, rp - lp - 1);
-    if (name == "count") type = ast::AGG_COUNT;
-    else if (name == "max") type = ast::AGG_MAX;
-    else if (name == "min") type = ast::AGG_MIN;
-    else if (name == "sum") type = ast::AGG_SUM;
-    else if (name == "avg") type = ast::AGG_AVG;
-    else return false;
-    if (arg == "*") {
-        is_star = true;
-        col_name = "";
-    } else {
-        is_star = false;
-        col_name = arg;
-    }
-    return true;
-}
+void Analyze::analyze_having_clause(
+    const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+    const std::vector<TabCol> &group_by, std::vector<AggregateInfo> &aggs,
+    const AnalyzeScope &scope, std::vector<HavingCondition> &result) {
+    result.clear();
 
-void Analyze::check_having_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-                                  const std::vector<TabCol> &group_by,
-                                  std::vector<AggregateInfo> &aggs,
-                                  const std::vector<ColMeta> &all_cols) {
-    for (auto &expr : sv_conds) {
-        TabCol lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
-        // 检查 lhs_col 是否在 GROUP BY 中
-        bool valid = is_in_group_by(lhs_col, group_by);
-        if (!valid) {
-            // 检查是否是聚合别名或聚合函数字符串
-            for (auto &agg : aggs) {
-                if (agg.alias == lhs_col.col_name ||
-                    (lhs_col.col_name == agg.col.col_name && !agg.is_star) ||
-                    lhs_col.col_name == agg.to_string()) {
-                    valid = true;
-                    break;
-                }
-            }
+    auto same_aggregate = [](const AggregateInfo &left, const AggregateInfo &right) {
+        return left.type == right.type && left.is_star == right.is_star &&
+               left.distinct == right.distinct &&
+               left.col.tab_name == right.col.tab_name &&
+               left.col.col_name == right.col.col_name;
+    };
+    auto result_type = [&](const HavingCondition &cond) {
+        if (cond.source == HavingSource::AGGREGATE) {
+            return aggs.at(cond.index).output_type();
         }
-        if (!valid) {
-            // 尝试解析为聚合函数字符串，并添加到 aggs
-            ast::AggType agg_type;
-            std::string agg_col_name;
-            bool is_star;
-            if (parse_agg_string(lhs_col.col_name, agg_type, agg_col_name, is_star)) {
-                AggregateInfo agg;
-                agg.type = agg_type;
-                agg.is_star = is_star;
-                agg.alias = "";
-                if (!is_star) {
-                    agg.col = {.tab_name = "", .col_name = agg_col_name};
-                    agg.col = check_column(all_cols, agg.col);
-                    agg.arg_type = get_col_type(all_cols, agg.col);
-                    if (agg_type == ast::AGG_COUNT) {
-                        agg.arg_type = TYPE_INT;
-                    } else if (agg_type != ast::AGG_COUNT && agg.arg_type != TYPE_INT &&
-                               agg.arg_type != TYPE_FLOAT &&
-                               !((agg_type == ast::AGG_MIN || agg_type == ast::AGG_MAX) &&
-                                 agg.arg_type == TYPE_STRING)) {
-                        throw InternalError("failure");
-                    }
+        const TabCol &target = group_by.at(cond.index);
+        return get_col_type(scope.cols, target);
+    };
+
+    for (const auto &expr : sv_conds) {
+        auto rhs = std::dynamic_pointer_cast<ast::Value>(expr->rhs);
+        if (rhs == nullptr) {
+            // The executor supports a resolved scalar RHS only.  Rejecting a
+            // column here is safer than the previous path, which accepted it
+            // and then read an uninitialized rhs_val at execution time.
+            throw InternalError("failure");
+        }
+
+        HavingCondition cond;
+        cond.op = convert_sv_comp_op(expr->op);
+        cond.rhs = convert_sv_value(rhs);
+
+        if (expr->lhs_agg != nullptr) {
+            const auto &syntax = expr->lhs_agg;
+            AggregateInfo resolved = analyze_aggregate(
+                syntax->agg_type, syntax->col, syntax->is_star,
+                syntax->distinct, "", scope);
+            auto found = std::find_if(aggs.begin(), aggs.end(), [&](const AggregateInfo &candidate) {
+                return same_aggregate(candidate, resolved);
+            });
+            if (found == aggs.end()) {
+                resolved.in_output = false;
+                aggs.push_back(std::move(resolved));
+                cond.index = aggs.size() - 1;
+            } else {
+                cond.index = static_cast<size_t>(found - aggs.begin());
+            }
+            cond.source = HavingSource::AGGREGATE;
+        } else if (expr->lhs != nullptr) {
+            const TabCol syntax_col = {
+                .tab_name = expr->lhs->tab_name,
+                .col_name = expr->lhs->col_name,
+            };
+
+            // Unqualified SELECT aliases take precedence over source columns.
+            if (syntax_col.tab_name.empty()) {
+                auto alias = std::find_if(aggs.begin(), aggs.end(), [&](const AggregateInfo &agg) {
+                    return !agg.alias.empty() && agg.alias == syntax_col.col_name;
+                });
+                if (alias != aggs.end()) {
+                    cond.source = HavingSource::AGGREGATE;
+                    cond.index = static_cast<size_t>(alias - aggs.begin());
                 } else {
-                    agg.col = {.tab_name = "", .col_name = ""};
-                    agg.arg_type = TYPE_INT;
+                    TabCol resolved = resolve_column(scope, syntax_col);
+                    auto group = std::find_if(group_by.begin(), group_by.end(), [&](const TabCol &col) {
+                        return col.tab_name == resolved.tab_name && col.col_name == resolved.col_name;
+                    });
+                    if (group == group_by.end()) throw InternalError("failure");
+                    cond.source = HavingSource::GROUP_COLUMN;
+                    cond.index = static_cast<size_t>(group - group_by.begin());
                 }
-                agg.in_output = false;  // HAVING 中的聚合不出现在输出中
-                aggs.push_back(agg);
-                valid = true;
+            } else {
+                TabCol resolved = resolve_column(scope, syntax_col);
+                auto group = std::find_if(group_by.begin(), group_by.end(), [&](const TabCol &col) {
+                    return col.tab_name == resolved.tab_name && col.col_name == resolved.col_name;
+                });
+                if (group == group_by.end()) throw InternalError("failure");
+                cond.source = HavingSource::GROUP_COLUMN;
+                cond.index = static_cast<size_t>(group - group_by.begin());
             }
-        }
-        if (!valid) {
+        } else {
             throw InternalError("failure");
         }
+
+        const ColType lhs_type = result_type(cond);
+        if (lhs_type == TYPE_FLOAT && cond.rhs.type == TYPE_INT) {
+            cond.rhs.set_float(static_cast<float>(cond.rhs.int_val));
+        } else {
+            const bool both_numeric =
+                (lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT) &&
+                (cond.rhs.type == TYPE_INT || cond.rhs.type == TYPE_FLOAT);
+            if (lhs_type != cond.rhs.type && !both_numeric) {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(cond.rhs.type));
+            }
+        }
+        result.push_back(std::move(cond));
     }
 }
