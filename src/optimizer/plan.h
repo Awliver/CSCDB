@@ -66,12 +66,14 @@ class ScanPlan : public Plan
 {
     public:
         ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::string binding_name,
-                 std::vector<Condition> predicates, std::vector<std::string> index_col_names)
+                 ConditionExprPtr predicate, std::vector<Condition> access_conditions,
+                 std::vector<std::string> index_col_names)
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
             binding_name_ = std::move(binding_name);
-            predicates_ = std::move(predicates);
+            predicate_ = std::move(predicate);
+            access_conditions_ = std::move(access_conditions);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
             for (auto &col : cols_) col.tab_name = binding_name_;
@@ -84,7 +86,11 @@ class ScanPlan : public Plan
         std::string tab_name_;                     // 物理表名
         std::string binding_name_;                 // SQL 中的关系实例名（别名），支持自连接
         std::vector<ColMeta> cols_;                
-        std::vector<Condition> predicates_;
+        // predicate_ 是查询语义的唯一来源，扫描输出前必须完整复核。
+        ConditionExprPtr predicate_;
+        // access_conditions_ 只是从顶层正向 AND 中安全提取的原子，
+        // 仅用于选索引和构造 B+树边界，不能代替 predicate_。
+        std::vector<Condition> access_conditions_;
         size_t len_;                               
         std::vector<std::string> index_col_names_;
     
@@ -94,7 +100,7 @@ class JoinPlan : public Plan
 {
     public:
         JoinPlan(PlanTag tag, JoinType join_type, std::shared_ptr<Plan> left,
-                 std::shared_ptr<Plan> right, std::vector<Condition> on_predicates,
+                 std::shared_ptr<Plan> right, ConditionExprPtr on_predicate,
                  bool natural = false, bool lateral = false,
                  std::vector<CoalescedJoinColumn> coalesced_cols = {})
         {
@@ -103,7 +109,7 @@ class JoinPlan : public Plan
             type = join_type; // 逻辑类型 INNER, LEFT, RIGHT, FULL, CROSS
             left_ = std::move(left);
             right_ = std::move(right);
-            on_predicates_ = std::move(on_predicates);
+            on_predicate_ = std::move(on_predicate);
             natural_ = natural;
             lateral_ = lateral;
             coalesced_cols_ = std::move(coalesced_cols);
@@ -114,7 +120,7 @@ class JoinPlan : public Plan
         // 右节点
         std::shared_ptr<Plan> right_;
         // 连接条件
-        std::vector<Condition> on_predicates_;
+        ConditionExprPtr on_predicate_;
         // 逻辑连接类型，与 tag 表示的物理算法分离
         JoinType type;
         bool natural_ = false;
@@ -129,15 +135,15 @@ class JoinPlan : public Plan
     class FilterPlan : public Plan
 {
     public:
-        FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<Condition> predicates)
+        FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, ConditionExprPtr predicate)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
-            predicates_ = std::move(predicates);
+            predicate_ = std::move(predicate);
         }
         ~FilterPlan() {}
         std::shared_ptr<Plan> subplan_;
-        std::vector<Condition> predicates_;
+        ConditionExprPtr predicate_;
 };
 
 class ProjectionPlan : public Plan
@@ -172,12 +178,12 @@ class RenamePlan : public Plan
 class CorrelatedFilterPlan : public Plan
 {
     public:
-        CorrelatedFilterPlan(std::shared_ptr<Plan> subplan, std::vector<Condition> predicates)
-            : subplan_(std::move(subplan)), predicates_(std::move(predicates)) {
+        CorrelatedFilterPlan(std::shared_ptr<Plan> subplan, ConditionExprPtr predicate)
+            : subplan_(std::move(subplan)), predicate_(std::move(predicate)) {
             Plan::tag = T_CorrelatedFilter;
         }
         std::shared_ptr<Plan> subplan_;
-        std::vector<Condition> predicates_;
+        ConditionExprPtr predicate_;
 };
 
 class SortPlan : public Plan
@@ -205,21 +211,21 @@ class AggPlan : public Plan
 {
     public:
         AggPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> group_cols,
-                std::vector<AggregateInfo> agg_exprs, std::vector<HavingCondition> having_conds,
+                std::vector<AggregateInfo> agg_exprs, HavingExprPtr having_expr,
                 std::vector<ColMeta> output_cols)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
             group_cols_ = std::move(group_cols);
             agg_exprs_ = std::move(agg_exprs);
-            having_conds_ = std::move(having_conds);
+            having_expr_ = std::move(having_expr);
             output_cols_ = std::move(output_cols);
         }
         ~AggPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> group_cols_;
         std::vector<AggregateInfo> agg_exprs_;
-        std::vector<HavingCondition> having_conds_;
+        HavingExprPtr having_expr_;
         std::vector<ColMeta> output_cols_;
 };
 

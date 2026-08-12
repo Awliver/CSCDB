@@ -11,40 +11,44 @@ RMDB is licensed under Mulan PSL v2. */
 class FilterExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> child_;
-    std::vector<Condition> conds_;
+    ConditionExprPtr predicate_;
     std::unique_ptr<RmRecord> current_;
     std::vector<bool> current_nulls_;
     bool ended_ = true;
 
-    bool eval_cond(const Condition &cond, const RmRecord &record) {
+    TruthValue eval_cond(const Condition &cond, const RmRecord &record) {
         const auto &cols = child_->cols();
         auto lhs = get_col(cols, cond.lhs_col);
         const auto *child_nulls = child_->null_mask();
         const auto lhs_index = static_cast<size_t>(lhs - cols.begin());
         if (child_nulls != nullptr && lhs_index < child_nulls->size() && (*child_nulls)[lhs_index]) {
-            return false;
+            return TruthValue::UNKNOWN_VALUE;
         }
 
         const char *rhs_data = nullptr;
         if (cond.is_rhs_val) {
+            if (cond.rhs_val.raw == nullptr) {
+                throw InternalError("Filter predicate literal has no raw value");
+            }
             rhs_data = cond.rhs_val.raw->data;
         } else {
             auto rhs = get_col(cols, cond.rhs_col);
             const auto rhs_index = static_cast<size_t>(rhs - cols.begin());
             if (child_nulls != nullptr && rhs_index < child_nulls->size() && (*child_nulls)[rhs_index]) {
-                return false;
+                return TruthValue::UNKNOWN_VALUE;
             }
             rhs_data = record.data + rhs->offset;
         }
         return SeqScanExecutor::compare_value(record.data + lhs->offset, rhs_data,
-                                              lhs->len, lhs->type, cond.op);
+                                              lhs->len, lhs->type, cond.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
     }
 
     bool matches(const RmRecord &record) {
-        for (const auto &cond : conds_) {
-            if (!eval_cond(cond, record)) return false;
-        }
-        return true;
+        return evaluate_bool_expr(predicate_, [&](const Condition &cond) {
+                   return eval_cond(cond, record);
+               }) == TruthValue::TRUE_VALUE;
     }
 
     void seek_match() {
@@ -64,8 +68,12 @@ class FilterExecutor : public AbstractExecutor {
     }
 
    public:
+    FilterExecutor(std::unique_ptr<AbstractExecutor> child, ConditionExprPtr predicate)
+        : child_(std::move(child)), predicate_(std::move(predicate)) {}
+
     FilterExecutor(std::unique_ptr<AbstractExecutor> child, std::vector<Condition> conds)
-        : child_(std::move(child)), conds_(std::move(conds)) {}
+        : FilterExecutor(std::move(child),
+                         SeqScanExecutor::conditions_to_expr(std::move(conds))) {}
 
     void beginTuple() override {
         child_->beginTuple();

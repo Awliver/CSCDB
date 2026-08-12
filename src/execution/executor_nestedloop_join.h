@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "executor_seq_scan.h"
 #include "index/ix.h"
 #include "parser/ast.h"
 #include "system/sm.h"
@@ -39,7 +40,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     JoinType join_type_ = INNER_JOIN;
     size_t len_ = 0;
     std::vector<ColMeta> cols_;
-    std::vector<Condition> on_predicates_;
+    ConditionExprPtr on_predicate_;
     std::vector<CoalescedRuntimeColumn> coalesced_cols_;
     bool isend_ = true;
 
@@ -190,27 +191,38 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         return {};
     }
 
-    // SQL 三值逻辑：ON 中任一操作数为 NULL 时结果是 UNKNOWN，
-    // 对 JOIN 匹配而言与 false 相同。
+    TruthValue eval_join_atom(const Condition &cond, const RmRecord *left_rec,
+                              const RmRecord *right_rec, size_t right_index) const {
+        const auto lhs = find_operand(cond.lhs_col, left_rec, right_rec, right_index);
+        if (!lhs.found) throw ColumnNotFoundError(cond.lhs_col.col_name);
+        if (lhs.is_null) return TruthValue::UNKNOWN_VALUE;
+
+        const char *rhs_data = nullptr;
+        int rhs_len = lhs.len;
+        if (cond.is_rhs_val) {
+            if (cond.rhs_val.raw == nullptr) {
+                throw InternalError("JOIN predicate literal has no raw value");
+            }
+            rhs_data = cond.rhs_val.raw->data;
+        } else {
+            const auto rhs = find_operand(cond.rhs_col, left_rec, right_rec, right_index);
+            if (!rhs.found) throw ColumnNotFoundError(cond.rhs_col.col_name);
+            if (rhs.is_null) return TruthValue::UNKNOWN_VALUE;
+            rhs_data = rhs.data;
+            rhs_len = rhs.len;
+        }
+        return compare_value(lhs.data, lhs.len, rhs_data, rhs_len, lhs.type, cond.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
+    }
+
+    // ON 只有整棵树计算为 TRUE 才构成匹配；UNKNOWN 不构成匹配，
+    // 但必须继续参与 NOT/AND/OR 的 SQL 三值组合。
     bool eval_join_conds(const RmRecord *left_rec, const RmRecord *right_rec,
                          size_t right_index) const {
-        for (const auto &cond : on_predicates_) {
-            const auto lhs = find_operand(cond.lhs_col, left_rec, right_rec, right_index);
-            if (!lhs.found || lhs.is_null) return false;
-
-            const char *rhs_data = nullptr;
-            int rhs_len = lhs.len;
-            if (cond.is_rhs_val) {
-                rhs_data = cond.rhs_val.raw->data;
-            } else {
-                const auto rhs = find_operand(cond.rhs_col, left_rec, right_rec, right_index);
-                if (!rhs.found || rhs.is_null) return false;
-                rhs_data = rhs.data;
-                rhs_len = rhs.len;
-            }
-            if (!compare_value(lhs.data, lhs.len, rhs_data, rhs_len, lhs.type, cond.op)) return false;
-        }
-        return true;
+        return evaluate_bool_expr(on_predicate_, [&](const Condition &cond) {
+                   return eval_join_atom(cond, left_rec, right_rec, right_index);
+               }) == TruthValue::TRUE_VALUE;
     }
 
     bool left_source_is_null(const CoalescedRuntimeColumn &column, OutputKind kind) const {
@@ -373,11 +385,11 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left,
                            std::unique_ptr<AbstractExecutor> right,
-                           std::vector<Condition> conds,
+                           ConditionExprPtr on_predicate,
                            JoinType join_type = INNER_JOIN,
                            std::vector<CoalescedJoinColumn> coalesced_cols = {})
         : left_(std::move(left)), right_(std::move(right)), join_type_(join_type),
-          on_predicates_(std::move(conds)) {
+          on_predicate_(std::move(on_predicate)) {
         if (outputs_left_only()) {
             len_ = left_->tupleLen();
             cols_ = left_->cols();
@@ -421,6 +433,15 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             coalesced_cols_.push_back(std::move(runtime));
         }
     }
+
+    NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left,
+                           std::unique_ptr<AbstractExecutor> right,
+                           std::vector<Condition> conds,
+                           JoinType join_type = INNER_JOIN,
+                           std::vector<CoalescedJoinColumn> coalesced_cols = {})
+        : NestedLoopJoinExecutor(std::move(left), std::move(right),
+                                 SeqScanExecutor::conditions_to_expr(std::move(conds)),
+                                 join_type, std::move(coalesced_cols)) {}
 
     void beginTuple() override {
         isend_ = true;

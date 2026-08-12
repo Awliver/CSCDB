@@ -31,6 +31,11 @@ enum SvCompOp {
     SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE
 };
 
+enum class LogicalOp {
+    AND,
+    OR,
+};
+
 enum OrderByDir {
     OrderBy_DEFAULT,
     OrderBy_ASC,
@@ -126,6 +131,11 @@ struct DropIndex : public TreeNode {
 struct Expr : public TreeNode {
 };
 
+// A condition clause is represented by one BoolExpr root. Parentheses are
+// reflected by the shape of this tree and therefore need no dedicated node.
+struct BoolExpr : public Expr {
+};
+
 struct Value : public Expr {
 };
 
@@ -192,7 +202,8 @@ struct SetClause : public TreeNode {
             col_name(std::move(col_name_)), val(std::move(val_)), is_arith(true), rhs_col(std::move(rhs_col_)), arith_neg(neg_) {}
 };
 
-struct BinaryExpr : public TreeNode {
+// A comparison remains the atom at the leaves of a boolean expression tree.
+struct BinaryExpr : public BoolExpr {
     std::shared_ptr<Col> lhs;
     std::shared_ptr<AggExpr> lhs_agg;  // HAVING 以结构化形式保留聚合表达式
     SvCompOp op;
@@ -202,6 +213,22 @@ struct BinaryExpr : public TreeNode {
             lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
     BinaryExpr(std::shared_ptr<AggExpr> lhs_agg_, SvCompOp op_, std::shared_ptr<Expr> rhs_) :
             lhs_agg(std::move(lhs_agg_)), op(op_), rhs(std::move(rhs_)) {}
+};
+
+struct LogicalExpr : public BoolExpr {
+    LogicalOp op;
+    std::shared_ptr<BoolExpr> left;
+    std::shared_ptr<BoolExpr> right;
+
+    LogicalExpr(LogicalOp op_, std::shared_ptr<BoolExpr> left_,
+                std::shared_ptr<BoolExpr> right_)
+        : op(op_), left(std::move(left_)), right(std::move(right_)) {}
+};
+
+struct NotExpr : public BoolExpr {
+    std::shared_ptr<BoolExpr> child;
+
+    explicit NotExpr(std::shared_ptr<BoolExpr> child_) : child(std::move(child_)) {}
 };
 
 struct OrderBy : public TreeNode
@@ -226,21 +253,22 @@ struct InsertStmt : public TreeNode {
 
 struct DeleteStmt : public TreeNode {
     std::string tab_name;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
+    std::shared_ptr<BoolExpr> where_expr;
 
-    DeleteStmt(std::string tab_name_, std::vector<std::shared_ptr<BinaryExpr>> conds_) :
-            tab_name(std::move(tab_name_)), conds(std::move(conds_)) {}
+    DeleteStmt(std::string tab_name_, std::shared_ptr<BoolExpr> where_expr_) :
+            tab_name(std::move(tab_name_)), where_expr(std::move(where_expr_)) {}
 };
 
 struct UpdateStmt : public TreeNode {
     std::string tab_name;
     std::vector<std::shared_ptr<SetClause>> set_clauses;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
+    std::shared_ptr<BoolExpr> where_expr;
 
     UpdateStmt(std::string tab_name_,
                std::vector<std::shared_ptr<SetClause>> set_clauses_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_) :
-            tab_name(std::move(tab_name_)), set_clauses(std::move(set_clauses_)), conds(std::move(conds_)) {}
+               std::shared_ptr<BoolExpr> where_expr_) :
+            tab_name(std::move(tab_name_)), set_clauses(std::move(set_clauses_)),
+            where_expr(std::move(where_expr_)) {}
 };
 
 struct FromExpr : TreeNode {
@@ -267,18 +295,18 @@ struct JoinExpr : FromExpr {
     JoinType type; // 连接类型
     std::shared_ptr<FromExpr> left; // 左表
     std::shared_ptr<FromExpr> right; // 右表
-    std::vector<std::shared_ptr<BinaryExpr>> on_conds; // on 条件
+    std::shared_ptr<BoolExpr> on_expr; // ON 布尔表达式；nullptr 表示未写 ON
     // NATURAL 和 LATERAL 都是 JOIN 的正交修饰，不应挤占 JoinType。
     bool natural = false;
     bool lateral = false;
-    bool on_true = false;  // 显式 ON TRUE；空 on_conds 本身仍表示“未写 ON”。
+    bool on_true = false;  // 显式 ON TRUE；空 on_expr 本身仍表示“未写 ON”。
 
     JoinExpr(JoinType type_, std::shared_ptr<FromExpr> left_,
              std::shared_ptr<FromExpr> right_,
-             std::vector<std::shared_ptr<BinaryExpr>> on_conds_,
+             std::shared_ptr<BoolExpr> on_expr_,
              bool natural_ = false, bool lateral_ = false, bool on_true_ = false)
         : type(type_), left(std::move(left_)), right(std::move(right_)),
-          on_conds(std::move(on_conds_)), natural(natural_), lateral(lateral_),
+          on_expr(std::move(on_expr_)), natural(natural_), lateral(lateral_),
           on_true(on_true_) {}
 }; // 定义专门的连接表达式结构
 
@@ -287,9 +315,9 @@ struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<AggExpr>> aggs;
     // 将 FROM 后的 ON 条件与 WHERE 后的 WHERE 条件区分
     std::shared_ptr<FromExpr> from;
-    std::vector<std::shared_ptr<BinaryExpr>> where_conds;
+    std::shared_ptr<BoolExpr> where_expr;
     std::vector<std::shared_ptr<Col>> group_by_cols;
-    std::vector<std::shared_ptr<BinaryExpr>> having_conds;
+    std::shared_ptr<BoolExpr> having_expr;
 
     bool has_sort;
     std::shared_ptr<OrderBy> order;                      // 单 ORDER BY（题4/题10 兼容）
@@ -301,14 +329,14 @@ struct SelectStmt : public TreeNode {
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
                std::vector<std::shared_ptr<AggExpr>> aggs_,
                std::shared_ptr<FromExpr> from_,
-               std::vector<std::shared_ptr<BinaryExpr>> where_conds_,
+               std::shared_ptr<BoolExpr> where_expr_,
                std::vector<std::shared_ptr<Col>> group_by_cols_,
-               std::vector<std::shared_ptr<BinaryExpr>> having_conds_,
+               std::shared_ptr<BoolExpr> having_expr_,
                std::vector<std::shared_ptr<OrderBy>> orders_,
                bool has_limit_, int limit_count_)
         : cols(std::move(cols_)), aggs(std::move(aggs_)), from(std::move(from_)),
-          where_conds(std::move(where_conds_)),
-          group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
+          where_expr(std::move(where_expr_)),
+          group_by_cols(std::move(group_by_cols_)), having_expr(std::move(having_expr_)),
           orders(std::move(orders_)), has_limit(has_limit_), limit_count(limit_count_) {
         has_sort = !orders.empty();
         if (!orders.empty()) order = orders[0];
@@ -386,8 +414,7 @@ struct SemValue {
     std::shared_ptr<SetClause> sv_set_clause;
     std::vector<std::shared_ptr<SetClause>> sv_set_clauses;
 
-    std::shared_ptr<BinaryExpr> sv_cond;
-    std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
+    std::shared_ptr<BoolExpr> sv_bool_expr;
 
     std::shared_ptr<OrderBy> sv_orderby;
     std::vector<std::shared_ptr<OrderBy>> sv_orderbys;

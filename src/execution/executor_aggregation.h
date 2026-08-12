@@ -71,7 +71,7 @@ private:
     std::vector<size_t> group_col_idxs_;
     std::vector<AggregateInfo> agg_exprs_;
     std::vector<int> argument_col_idxs_;  // 星号参数记为 -1；只绑定一次，不逐输入行查找
-    std::vector<HavingCondition> having_conds_;
+    HavingExprPtr having_expr_;
     std::vector<ColMeta> cols_;
     size_t len_;
     bool plain_agg_;
@@ -96,7 +96,26 @@ private:
     inline void write_finalized_value(const Value &value, size_t output_col_idx);
     inline Value get_group_col_value(size_t group_idx, const std::string &key);
 
+    static HavingExprPtr having_conditions_to_expr(std::vector<HavingCondition> conditions) {
+        HavingExprPtr result;
+        for (auto &condition : conditions) {
+            auto atom = make_bool_atom<HavingCondition>(std::move(condition));
+            result = result == nullptr
+                         ? std::move(atom)
+                         : make_bool_binary<HavingCondition>(BoolExprType::AND,
+                                                             std::move(result),
+                                                             std::move(atom));
+        }
+        return result;
+    }
+
 public:
+    inline AggExecutor(std::unique_ptr<AbstractExecutor> prev,
+                       const std::vector<TabCol> &group_cols,
+                       const std::vector<AggregateInfo> &agg_exprs,
+                       HavingExprPtr having_expr,
+                       std::vector<ColMeta> output_cols);
+
     inline AggExecutor(std::unique_ptr<AbstractExecutor> prev,
                        const std::vector<TabCol> &group_cols,
                        const std::vector<AggregateInfo> &agg_exprs,
@@ -116,12 +135,12 @@ public:
 AggExecutor::AggExecutor(std::unique_ptr<AbstractExecutor> prev,
                          const std::vector<TabCol> &group_cols,
                          const std::vector<AggregateInfo> &agg_exprs,
-                         const std::vector<HavingCondition> &having_conds,
+                         HavingExprPtr having_expr,
                          std::vector<ColMeta> output_cols) {
     prev_ = std::move(prev);
     group_cols_ = group_cols;
     agg_exprs_ = agg_exprs;
-    having_conds_ = having_conds;
+    having_expr_ = std::move(having_expr);
     cols_ = std::move(output_cols);
     len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
     plain_agg_ = group_cols_.empty();
@@ -152,6 +171,14 @@ AggExecutor::AggExecutor(std::unique_ptr<AbstractExecutor> prev,
     }
 
 }
+
+AggExecutor::AggExecutor(std::unique_ptr<AbstractExecutor> prev,
+                         const std::vector<TabCol> &group_cols,
+                         const std::vector<AggregateInfo> &agg_exprs,
+                         const std::vector<HavingCondition> &having_conds,
+                         std::vector<ColMeta> output_cols)
+    : AggExecutor(std::move(prev), group_cols, agg_exprs,
+                  having_conditions_to_expr(having_conds), std::move(output_cols)) {}
 
 // 构造 GROUP BY Key
 std::string AggExecutor::make_group_key(const char *data) {
@@ -435,25 +462,27 @@ Value AggExecutor::get_group_col_value(size_t group_idx, const std::string &key)
 
 // 检查条件是否满足
 bool AggExecutor::satisfy_having(const std::vector<AggState> &states, const std::string &key) {
-    if (having_conds_.empty()) return true;
-
-    for (const auto &cond : having_conds_) {
+    const TruthValue result = evaluate_bool_expr(having_expr_, [&](const HavingCondition &cond) {
         Value lhs;
         if (cond.source == HavingSource::GROUP_COLUMN) {
-            if (cond.index >= group_cols_.size()) return false;
+            if (cond.index >= group_cols_.size()) return TruthValue::FALSE_VALUE;
             const bool is_null =
                 (static_cast<unsigned char>(key[cond.index / 8]) &
                  (1U << (cond.index % 8))) != 0;
-            // 与 NULL 比较的结果是 UNKNOWN，而 HAVING 只保留结果为 TRUE 的分组。
-            if (is_null) return false;
+            if (is_null) return TruthValue::UNKNOWN_VALUE;
             lhs = get_group_col_value(cond.index, key);
         } else {
-            if (cond.index >= agg_exprs_.size() || cond.index >= states.size()) return false;
+            if (cond.index >= agg_exprs_.size() || cond.index >= states.size()) {
+                return TruthValue::FALSE_VALUE;
+            }
             lhs = finalize(agg_exprs_[cond.index], states[cond.index]);
         }
-        if (!evaluate_condition(lhs, cond.rhs, cond.op)) return false;
-    }
-    return true;
+        return evaluate_condition(lhs, cond.rhs, cond.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
+    });
+    // HAVING 与 WHERE 一样只保留 TRUE；NOT UNKNOWN 仍为 UNKNOWN。
+    return result == TruthValue::TRUE_VALUE;
 }
 
 void AggExecutor::advance_to_valid() {
@@ -476,7 +505,7 @@ void AggExecutor::beginTuple() {
     static const bool min_es_off = std::getenv("RMDB_NO_MIN_EARLYSTOP") != nullptr;  // A/B 归因开关
     const bool min_early_stop_ = !min_es_off && plain_agg_ && agg_exprs_.size() == 1 &&
                                  agg_exprs_[0].type == ast::AGG_MIN && !agg_exprs_[0].is_star &&
-                                 having_conds_.empty() && prev_->sorted_asc_on(agg_exprs_[0].col);
+                                 having_expr_ == nullptr && prev_->sorted_asc_on(agg_exprs_[0].col);
 
     for (; !prev_->is_end(); prev_->nextTuple()) {
         auto rec = prev_->Next(); // 逐行读取记录

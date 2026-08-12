@@ -229,7 +229,7 @@ static bool fp_parse_uint(const char *&p, int &out) {
     return true;
 }
 
-static bool fp_parse_where_eq(const char *&p, std::vector<std::shared_ptr<ast::BinaryExpr>> &conds) {
+static bool fp_parse_where_eq(const char *&p, std::shared_ptr<ast::BoolExpr> &where_expr) {
     if (!fp_kw(p, "where")) return true;
     while (true) {
         std::string col;
@@ -238,7 +238,11 @@ static bool fp_parse_where_eq(const char *&p, std::vector<std::shared_ptr<ast::B
         std::shared_ptr<ast::Value> val;
         if (!fp_parse_value(p, val)) return false;
         auto lhs = std::make_shared<ast::Col>("", col);
-        conds.push_back(std::make_shared<ast::BinaryExpr>(lhs, ast::SV_OP_EQ, val));
+        auto atom = std::make_shared<ast::BinaryExpr>(lhs, ast::SV_OP_EQ, val);
+        where_expr = where_expr == nullptr
+                         ? std::static_pointer_cast<ast::BoolExpr>(atom)
+                         : std::make_shared<ast::LogicalExpr>(
+                               ast::LogicalOp::AND, std::move(where_expr), atom);
         p = fp_skipws(p);
         if (fp_kw(p, "and")) continue;
         break;
@@ -290,8 +294,8 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_select(const char *s) {
     std::string tab;
     if (!fp_ident(p, tab)) return nullptr;
 
-    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
-    if (!fp_parse_where_eq(p, conds)) return nullptr;
+    std::shared_ptr<ast::BoolExpr> where_expr;
+    if (!fp_parse_where_eq(p, where_expr)) return nullptr;
 
     std::vector<std::shared_ptr<ast::OrderBy>> orders;
     bool has_limit = false;
@@ -312,8 +316,8 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_select(const char *s) {
     if (!fp_trailing_ok(p)) return nullptr;
 
     return std::make_shared<ast::SelectStmt>(
-        cols, aggs, std::make_shared<ast::TableRef>(tab, ""), conds,
-        std::vector<std::shared_ptr<ast::Col>>{}, std::vector<std::shared_ptr<ast::BinaryExpr>>{},
+        cols, aggs, std::make_shared<ast::TableRef>(tab, ""), where_expr,
+        std::vector<std::shared_ptr<ast::Col>>{}, nullptr,
         orders, has_limit, limit_count);
 }
 
@@ -368,11 +372,11 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_update(const char *s) {
         break;
     }
 
-    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
-    if (!fp_parse_where_eq(p, conds)) return nullptr;
+    std::shared_ptr<ast::BoolExpr> where_expr;
+    if (!fp_parse_where_eq(p, where_expr)) return nullptr;
     if (!fp_trailing_ok(p)) return nullptr;
 
-    return std::make_shared<ast::UpdateStmt>(tab, sets, conds);
+    return std::make_shared<ast::UpdateStmt>(tab, sets, where_expr);
 }
 
 static std::shared_ptr<ast::TreeNode> try_fast_parse_delete(const char *s) {
@@ -381,10 +385,10 @@ static std::shared_ptr<ast::TreeNode> try_fast_parse_delete(const char *s) {
     if (!fp_kw(p, "from")) return nullptr;
     std::string tab;
     if (!fp_ident(p, tab)) return nullptr;
-    std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
-    if (!fp_parse_where_eq(p, conds)) return nullptr;
+    std::shared_ptr<ast::BoolExpr> where_expr;
+    if (!fp_parse_where_eq(p, where_expr)) return nullptr;
     if (!fp_trailing_ok(p)) return nullptr;
-    return std::make_shared<ast::DeleteStmt>(tab, conds);
+    return std::make_shared<ast::DeleteStmt>(tab, where_expr);
 }
 
 static std::shared_ptr<ast::TreeNode> try_fast_parse_insert(const char *s);

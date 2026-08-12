@@ -51,8 +51,9 @@ class Planner {
     std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context *context);
 
 
-    // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
-    bool get_index_cols(std::string tab_name, std::vector<Condition> curr_conds,
+    // access_conditions 只包含从完整布尔树中安全提取的正向合取原子。
+    bool get_index_cols(const std::string &tab_name,
+                        const std::vector<Condition> &access_conditions,
                         std::vector<std::string>& index_col_names,
                         const std::string &binding_name = "");
     bool get_join_index_cols(const std::string &right_table, const std::string &right_binding,
@@ -60,7 +61,7 @@ class Planner {
                              const std::vector<Condition> &join_conds,
                              std::vector<std::string> &index_col_names);
     std::shared_ptr<Plan> make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
-                                         std::vector<Condition> join_conds,
+                                         ConditionExprPtr join_predicate,
                                          JoinType join_type = INNER_JOIN,
                                          Context *context = nullptr,
                                          bool natural = false, bool lateral = false,

@@ -53,6 +53,9 @@ struct HavingCondition {
     Value rhs;
 };
 
+using HavingExpr = BoolExpr<HavingCondition>;
+using HavingExprPtr = BoolExprPtr<HavingCondition>;
+
 /*
     TableBinding 用于区分连接中的不同关系实例。例如，同一张 employee
     物理表分别使用别名 e1 和 e2 时，两者属于不同的关系实例。
@@ -78,7 +81,7 @@ struct AnalyzedFrom {
     bool lateral = false;
     std::shared_ptr<AnalyzedFrom> left;
     std::shared_ptr<AnalyzedFrom> right;
-    std::vector<Condition> on_conds;
+    ConditionExprPtr on_expr;
     std::vector<CoalescedJoinColumn> coalesced_cols;
 
     // 半连接/反连接的 bindings 只包含保留侧；all_bindings 包含实际读取的全部关系。
@@ -102,7 +105,7 @@ class Query {
 public:
     std::shared_ptr<ast::TreeNode> parse;
     std::shared_ptr<AnalyzedFrom> from;
-    std::vector<Condition> where_conds;
+    ConditionExprPtr where_expr;
 
     std::vector<TabCol> cols;
     std::vector<SetClause> set_clauses;
@@ -110,7 +113,7 @@ public:
 
     std::vector<AggregateInfo> aggs;
     std::vector<TabCol> group_by_cols;
-    std::vector<HavingCondition> having_conds;
+    HavingExprPtr having_expr;
     std::vector<std::pair<TabCol, ast::OrderByDir>> orders;
 
     bool has_limit = false;
@@ -123,7 +126,7 @@ public:
     std::string union_alias;
 
     // 横向派生查询中引用外层行的 WHERE 条件。
-    std::vector<Condition> correlated_conds;
+    ConditionExprPtr correlated_expr;
 
     // 稳定的查询输出模式，供派生表、UNION 和 EXPLAIN 使用。
     std::vector<ColMeta> output_cols;
@@ -153,10 +156,7 @@ private:
 
     TabCol check_column(const std::vector<ColMeta> &all_cols, TabCol target);
     void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
-    void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-                    std::vector<Condition> &conds);
-    void check_clause(const std::vector<std::string> &tab_names,
-                      std::vector<Condition> &conds);
+    Condition convert_condition_atom(const std::shared_ptr<ast::BinaryExpr> &sv_cond);
     AnalyzedFromResult analyze_from(const std::shared_ptr<ast::FromExpr> &from,
                                     const AnalyzeScope *outer_scope = nullptr);
     AnalyzedFromResult analyze_lateral_ref(const std::shared_ptr<ast::LateralRef> &lateral,
@@ -167,9 +167,12 @@ private:
     TabCol resolve_column(const AnalyzeScope &scope, TabCol target);
     TabCol resolve_lateral_column(const AnalyzeScope &local, const AnalyzeScope &outer,
                                   TabCol target, bool *is_outer);
-    std::vector<Condition> analyze_conditions(
-        const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-        const AnalyzeScope &scope);
+    ConditionExprPtr analyze_conditions(const std::shared_ptr<ast::BoolExpr> &sv_expr,
+                                        const AnalyzeScope &scope);
+    ConditionExprPtr analyze_lateral_conditions(
+        const std::shared_ptr<ast::BoolExpr> &sv_expr,
+        const AnalyzeScope &local, const AnalyzeScope &outer,
+        const AnalyzeScope &type_scope, bool *uses_outer);
     void check_condition_types(const AnalyzeScope &scope, std::vector<Condition> &conds);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
@@ -185,14 +188,12 @@ private:
                                  const std::vector<AggregateInfo> &aggs,
                                  const std::vector<TabCol> &group_by);
     bool is_in_group_by(const TabCol &col, const std::vector<TabCol> &group_by);
-    void analyze_having_clause(
-        const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+    HavingExprPtr analyze_having_clause(
+        const std::shared_ptr<ast::BoolExpr> &sv_expr,
         const std::vector<TabCol> &group_by,
         std::vector<AggregateInfo> &aggs,
-        const AnalyzeScope &scope,
-        std::vector<HavingCondition> &result);
-    void check_where_no_aggregate(
-        const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds);
+        const AnalyzeScope &scope);
+    void check_where_no_aggregate(const std::shared_ptr<ast::BoolExpr> &sv_expr);
     TabCol resolve_order_column(TabCol order_col,
                                 const std::vector<TabCol> &sel_cols,
                                 const std::vector<TabCol> &group_by_cols,

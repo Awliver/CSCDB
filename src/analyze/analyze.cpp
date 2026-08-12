@@ -84,6 +84,34 @@ bool coerce_float_val_to_int(Value &v) {
     return true;
 }
 
+// Parentheses are encoded by tree shape, so only an actual AND at the current
+// root is safe to split for LATERAL predicate pushdown. OR and NOT subtrees
+// deliberately remain indivisible.
+void split_ast_top_level_and(const std::shared_ptr<ast::BoolExpr> &expr,
+                             std::vector<std::shared_ptr<ast::BoolExpr>> &out) {
+    if (expr == nullptr) return;
+    auto logical = std::dynamic_pointer_cast<ast::LogicalExpr>(expr);
+    if (logical != nullptr && logical->op == ast::LogicalOp::AND) {
+        split_ast_top_level_and(logical->left, out);
+        split_ast_top_level_and(logical->right, out);
+        return;
+    }
+    out.push_back(expr);
+}
+
+std::shared_ptr<ast::BoolExpr> combine_ast_with_and(
+    const std::vector<std::shared_ptr<ast::BoolExpr>> &parts) {
+    std::shared_ptr<ast::BoolExpr> result;
+    for (const auto &part : parts) {
+        if (part == nullptr) continue;
+        result = result == nullptr
+                     ? part
+                     : std::make_shared<ast::LogicalExpr>(ast::LogicalOp::AND,
+                                                          result, part);
+    }
+    return result;
+}
+
 }  // namespace
 
 /**
@@ -196,8 +224,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             query->group_by_cols.push_back(gb_col); // 支持多列分组
         }
         check_group_by_validity(query->cols, query->aggs, query->group_by_cols);
-        analyze_having_clause(x->having_conds, query->group_by_cols, query->aggs,
-                              from_result.scope, query->having_conds);
+        query->having_expr = analyze_having_clause(
+            x->having_expr, query->group_by_cols, query->aggs, from_result.scope);
 
         if (!x->orders.empty()) {
             for (auto &sv_order : x->orders) {
@@ -227,8 +255,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             query->sel_captions.push_back(sel_col.alias.empty() ? sel_col.col_name : sel_col.alias);
         }
 
-        query->where_conds = analyze_conditions(x->where_conds, from_result.scope);
-        check_where_no_aggregate(x->where_conds);
+        query->where_expr = analyze_conditions(x->where_expr, from_result.scope);
+        check_where_no_aggregate(x->where_expr);
 } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
     // 处理 SET 子句
     TabMeta& tab_meta = sm_manager_->db_.get_table(x->tab_name);
@@ -317,14 +345,20 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         query->set_clauses.push_back(set);
     }
 
-    // 处理 WHERE 条件
-    get_clause(x->conds, query->where_conds);
-    check_clause({x->tab_name}, query->where_conds);
+    // 处理 WHERE 布尔表达式。UPDATE/DELETE 也走与 SELECT 相同的
+    // 递归条件分析，避免再将根节点压平成隐式 AND。
+    AnalyzeScope table_scope;
+    table_scope.bindings.push_back({x->tab_name, x->tab_name});
+    get_all_cols({x->tab_name}, table_scope.cols);
+    table_scope.output_cols = table_scope.cols;
+    query->where_expr = analyze_conditions(x->where_expr, table_scope);
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
-        //处理where条件
-        get_clause(x->conds, query->where_conds);
-        check_clause({x->tab_name}, query->where_conds);
+        AnalyzeScope table_scope;
+        table_scope.bindings.push_back({x->tab_name, x->tab_name});
+        get_all_cols({x->tab_name}, table_scope.cols);
+        table_scope.output_cols = table_scope.cols;
+        query->where_expr = analyze_conditions(x->where_expr, table_scope);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
         std::vector<Value> raw_vals;
@@ -424,13 +458,13 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
     const auto input_scope = merge_scopes(left.scope, right.scope);
     const auto all_bindings = merge_all_bindings(left.node->all_bindings,
                                                  right.node->all_bindings);
-    if (join->type == CROSS_JOIN && !join->on_conds.empty()) {
+    if (join->type == CROSS_JOIN && join->on_expr != nullptr) {
         throw InternalError("CROSS JOIN cannot have an ON clause");
     }
-    if (!join->natural && join->type != CROSS_JOIN && join->on_conds.empty() && !join->on_true) {
+    if (!join->natural && join->type != CROSS_JOIN && join->on_expr == nullptr && !join->on_true) {
         throw InternalError("JOIN requires an ON clause");
     }
-    if (join->natural && !join->on_conds.empty()) {
+    if (join->natural && join->on_expr != nullptr) {
         throw InternalError("NATURAL JOIN cannot have an ON clause");
     }
     if (join->natural && join->type == CROSS_JOIN) {
@@ -480,7 +514,13 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
             cond.op = OP_EQ;
             cond.is_rhs_val = false;
             cond.rhs_col = {right_col.tab_name, right_col.name};
-            result.node->on_conds.push_back(cond);
+            auto atom = make_bool_atom(std::move(cond));
+            result.node->on_expr = result.node->on_expr == nullptr
+                                       ? std::move(atom)
+                                       : make_bool_binary(
+                                             BoolExprType::AND,
+                                             std::move(result.node->on_expr),
+                                             std::move(atom));
 
             ColMeta output = left_col;
             output.tab_name = synthetic_binding;
@@ -506,8 +546,8 @@ Analyze::AnalyzedFromResult Analyze::analyze_from(const std::shared_ptr<ast::Fro
                                  result.scope.output_cols.begin() + result.node->coalesced_cols.size());
         result.scope.bindings = input_scope.bindings;
     } else {
-        check_where_no_aggregate(join->on_conds);
-        result.node->on_conds = analyze_conditions(join->on_conds, input_scope);
+        check_where_no_aggregate(join->on_expr);
+        result.node->on_expr = analyze_conditions(join->on_expr, input_scope);
 
         switch (join->type) {
             case LEFT_SEMI_JOIN:
@@ -543,39 +583,33 @@ Analyze::AnalyzedFromResult Analyze::analyze_lateral_ref(
     const AnalyzeScope &outer = outer_scope == nullptr ? empty_outer : *outer_scope;
     // 先取得子查询自己的名字空间，用 local-first 规则识别 WHERE 中的相关列。
     auto local_from = analyze_from(lateral->subquery->from);
-    std::vector<std::shared_ptr<ast::BinaryExpr>> local_where;
-    std::vector<std::shared_ptr<ast::BinaryExpr>> correlated_where;
+    std::vector<std::shared_ptr<ast::BoolExpr>> local_where;
+    std::vector<std::shared_ptr<ast::BoolExpr>> correlated_where;
 
     AnalyzeScope type_scope = local_from.scope;
     type_scope.cols.insert(type_scope.cols.end(), outer.cols.begin(), outer.cols.end());
     type_scope.output_cols.insert(type_scope.output_cols.end(), outer.output_cols.begin(),
                                   outer.output_cols.end());
 
-    for (const auto &sv_cond : lateral->subquery->where_conds) {
-        std::vector<Condition> one;
-        get_clause({sv_cond}, one);
-        bool lhs_outer = false;
-        bool rhs_outer = false;
-        one[0].lhs_col = resolve_lateral_column(local_from.scope, outer,
-                                                one[0].lhs_col, &lhs_outer);
-        if (!one[0].is_rhs_val) {
-            one[0].rhs_col = resolve_lateral_column(local_from.scope, outer,
-                                                    one[0].rhs_col, &rhs_outer);
-        }
-        check_condition_types(type_scope, one);
-        // 防御性处理：若后续规整规则消去某个恒真谓词，无需再分类。
-        if (one.empty()) continue;
-        if (lhs_outer || rhs_outer) {
-            correlated_where.push_back(sv_cond);
+    std::vector<std::shared_ptr<ast::BoolExpr>> conjuncts;
+    split_ast_top_level_and(lateral->subquery->where_expr, conjuncts);
+    for (const auto &part : conjuncts) {
+        bool uses_outer = false;
+        // 递归访问整个合取项的比较叶。只要 OR/NOT 子树中任意叶
+        // 引用外层，整棵子树都必须留在 correlated 侧。
+        (void)analyze_lateral_conditions(part, local_from.scope, outer,
+                                         type_scope, &uses_outer);
+        if (uses_outer) {
+            correlated_where.push_back(part);
         } else {
-            local_where.push_back(sv_cond);
+            local_where.push_back(part);
         }
     }
 
     // 复用完整 SELECT Analyzer；仅把相关 WHERE 留给参数化 Filter。SELECT/GROUP/
     // HAVING/内部 ON 中的外层引用仍会按普通未知列报错，这是当前明确的支持边界。
     auto local_select = std::make_shared<ast::SelectStmt>(*lateral->subquery);
-    local_select->where_conds = std::move(local_where);
+    local_select->where_expr = combine_ast_with_and(local_where);
     auto subquery = do_analyze(local_select);
 
     // 子查询会被完整分析一次；若其 FROM 含 NATURAL JOIN，内部 synthetic
@@ -589,23 +623,17 @@ Analyze::AnalyzedFromResult Analyze::analyze_lateral_ref(
     final_type_scope.cols.insert(final_type_scope.cols.end(), outer.cols.begin(), outer.cols.end());
     final_type_scope.output_cols.insert(final_type_scope.output_cols.end(), outer.output_cols.begin(),
                                         outer.output_cols.end());
-    for (const auto &sv_cond : correlated_where) {
-        std::vector<Condition> one;
-        get_clause({sv_cond}, one);
-        bool lhs_outer = false;
-        bool rhs_outer = false;
-        one[0].lhs_col = resolve_lateral_column(final_local, outer, one[0].lhs_col, &lhs_outer);
-        if (!one[0].is_rhs_val) {
-            one[0].rhs_col = resolve_lateral_column(final_local, outer,
-                                                    one[0].rhs_col, &rhs_outer);
-        }
-        if (!lhs_outer && !rhs_outer) {
+    std::vector<ConditionExprPtr> correlated_parts;
+    for (const auto &part : correlated_where) {
+        bool uses_outer = false;
+        auto analyzed = analyze_lateral_conditions(
+            part, final_local, outer, final_type_scope, &uses_outer);
+        if (!uses_outer) {
             throw InternalError("LATERAL correlated predicate lost its outer reference");
         }
-        check_condition_types(final_type_scope, one);
-        if (one.empty()) continue;
-        subquery->correlated_conds.push_back(std::move(one[0]));
+        correlated_parts.push_back(std::move(analyzed));
     }
+    subquery->correlated_expr = combine_with_and(correlated_parts);
 
     AnalyzedFromResult result;
     result.node = std::make_shared<AnalyzedFrom>();
@@ -743,20 +771,73 @@ TabCol Analyze::resolve_column(const AnalyzeScope &scope, TabCol target) {
     throw ColumnNotFoundError(target.col_name);
 }
 
-// 为 ON 和 WHERE 建立统一的条件分析流程
-std::vector<Condition> Analyze::analyze_conditions(
-    const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-    const AnalyzeScope &scope) {
-    std::vector<Condition> conds;
-    get_clause(sv_conds, conds); // 转换为 condition
-    for (auto &cond : conds) {
-        cond.lhs_col = resolve_column(scope, cond.lhs_col); // 解析左侧列
-        if (!cond.is_rhs_val) {
-            cond.rhs_col = resolve_column(scope, cond.rhs_col); // 解析右侧列
+// 为 ON/WHERE/UPDATE/DELETE 建立统一的递归分析流程。每个比较
+// 叶完成列绑定与类型改写，逻辑节点只保留拓扑。
+ConditionExprPtr Analyze::analyze_conditions(
+    const std::shared_ptr<ast::BoolExpr> &sv_expr, const AnalyzeScope &scope) {
+    if (sv_expr == nullptr) return nullptr;
+
+    if (auto atom = std::dynamic_pointer_cast<ast::BinaryExpr>(sv_expr)) {
+        std::vector<Condition> one{convert_condition_atom(atom)};
+        one[0].lhs_col = resolve_column(scope, one[0].lhs_col);
+        if (!one[0].is_rhs_val) {
+            one[0].rhs_col = resolve_column(scope, one[0].rhs_col);
         }
+        check_condition_types(scope, one);
+        if (one.empty()) return nullptr;
+        return make_bool_atom(std::move(one[0]));
     }
-    check_condition_types(scope, conds); // 检查左右类型是否匹配
-    return conds;
+    if (auto logical = std::dynamic_pointer_cast<ast::LogicalExpr>(sv_expr)) {
+        const BoolExprType type = logical->op == ast::LogicalOp::AND
+                                      ? BoolExprType::AND
+                                      : BoolExprType::OR;
+        return make_bool_binary(
+            type, analyze_conditions(logical->left, scope),
+            analyze_conditions(logical->right, scope));
+    }
+    if (auto negated = std::dynamic_pointer_cast<ast::NotExpr>(sv_expr)) {
+        return make_bool_not(analyze_conditions(negated->child, scope));
+    }
+    throw InternalError("Unexpected boolean expression node");
+}
+
+ConditionExprPtr Analyze::analyze_lateral_conditions(
+    const std::shared_ptr<ast::BoolExpr> &sv_expr,
+    const AnalyzeScope &local, const AnalyzeScope &outer,
+    const AnalyzeScope &type_scope, bool *uses_outer) {
+    if (sv_expr == nullptr) return nullptr;
+
+    if (auto atom = std::dynamic_pointer_cast<ast::BinaryExpr>(sv_expr)) {
+        std::vector<Condition> one{convert_condition_atom(atom)};
+        bool lhs_outer = false;
+        bool rhs_outer = false;
+        one[0].lhs_col = resolve_lateral_column(local, outer, one[0].lhs_col,
+                                                &lhs_outer);
+        if (!one[0].is_rhs_val) {
+            one[0].rhs_col = resolve_lateral_column(local, outer, one[0].rhs_col,
+                                                    &rhs_outer);
+        }
+        if (uses_outer != nullptr && (lhs_outer || rhs_outer)) *uses_outer = true;
+        check_condition_types(type_scope, one);
+        if (one.empty()) return nullptr;
+        return make_bool_atom(std::move(one[0]));
+    }
+    if (auto logical = std::dynamic_pointer_cast<ast::LogicalExpr>(sv_expr)) {
+        const BoolExprType type = logical->op == ast::LogicalOp::AND
+                                      ? BoolExprType::AND
+                                      : BoolExprType::OR;
+        return make_bool_binary(
+            type,
+            analyze_lateral_conditions(logical->left, local, outer,
+                                       type_scope, uses_outer),
+            analyze_lateral_conditions(logical->right, local, outer,
+                                       type_scope, uses_outer));
+    }
+    if (auto negated = std::dynamic_pointer_cast<ast::NotExpr>(sv_expr)) {
+        return make_bool_not(analyze_lateral_conditions(
+            negated->child, local, outer, type_scope, uses_outer));
+    }
+    throw InternalError("Unexpected boolean expression node");
 }
 
 // 
@@ -937,89 +1018,28 @@ void Analyze::get_all_cols(const std::vector<std::string> &tab_names, std::vecto
     }
 }
 
-void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds) {
-    conds.clear();
-    for (auto &expr : sv_conds) {
-        Condition cond;
-        cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
-        cond.op = convert_sv_comp_op(expr->op);
-        if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs)) {
-            cond.is_rhs_val = true;
-            cond.rhs_val = convert_sv_value(rhs_val);
-            cond.rhs_is_float_lit = (std::dynamic_pointer_cast<ast::FloatLit>(rhs_val) != nullptr);
-        } else if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs)) {
-            cond.is_rhs_val = false;
-            cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
-        }
-        conds.push_back(cond);
+Condition Analyze::convert_condition_atom(
+    const std::shared_ptr<ast::BinaryExpr> &expr) {
+    if (expr == nullptr || expr->lhs == nullptr) {
+        throw InternalError("Invalid comparison atom outside HAVING");
     }
-}
-
-void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds) {
-    // auto all_cols = get_all_cols(tab_names);
-    std::vector<ColMeta> all_cols;
-    get_all_cols(tab_names, all_cols);
-    // Get raw values in where clause
-    std::vector<Condition> kept;
-    kept.reserve(conds.size());
-    for (auto &cond : conds) {
-        // Infer table name from column name
-        cond.lhs_col = check_column(all_cols, cond.lhs_col);
-        if (!cond.is_rhs_val) {
-            cond.rhs_col = check_column(all_cols, cond.rhs_col);
-        }
-        TabMeta &lhs_tab = sm_manager_->db_.get_table(cond.lhs_col.tab_name);
-        auto lhs_col = lhs_tab.get_col(cond.lhs_col.col_name);
-        ColType lhs_type = lhs_col->type;
-        ColType rhs_type;
-        if (cond.is_rhs_val) {
-            bool rewritten_to_self = false;
-            // 类型提升
-            if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
-                cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
-            } else if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_FLOAT &&
-                       std::isnan(cond.rhs_val.float_val)) {
-                // float 列 vs NaN 字面量（wire NaN 参数经 NAN 关键字进来）：执行器的
-                // 三值比较（<、> 皆假则判相等）不符合 IEEE NaN 语义，须在此改写——
-                // <> 恒真（删除条件），其余恒假（col < -inf 对任何 float 值恒假）。
-                if (cond.op == OP_NE) {
-                    rewrite_true_for_non_null(cond);
-                    rewritten_to_self = true;
-                } else {
-                    cond.op = OP_LT;
-                    cond.rhs_val.set_float(-INFINITY);
-                }
-            } else if (lhs_type == TYPE_INT && cond.rhs_val.type == TYPE_FLOAT) {
-                // int 列 vs float 字面量：按数值比较语义改写为纯 int 比较
-                // （直接截断字面量会改变 <、> 的语义，如 k > 0.5 ≠ k > 0）
-                IntFloatRewrite rw = rewrite_int_col_float_val(cond);
-                if (rw == IntFloatRewrite::ALWAYS_TRUE) {
-                    rewrite_true_for_non_null(cond);
-                    rewritten_to_self = true;
-                } else if (rw == IntFloatRewrite::ALWAYS_FALSE) {
-                    cond.op = OP_LT;                                 // k < INT32_MIN 恒假
-                    cond.rhs_val.set_int(INT32_MIN);
-                }
-            }
-            if (rewritten_to_self) {
-                rhs_type = lhs_type;
-            } else {
-                cond.rhs_val.init_raw(lhs_col->len);
-                rhs_type = cond.rhs_val.type;
-            }
-        } else {
-            TabMeta &rhs_tab = sm_manager_->db_.get_table(cond.rhs_col.tab_name);
-            auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
-            rhs_type = rhs_col->type;
-        }
-        if (lhs_type != rhs_type) {
-            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
-        }
-        kept.push_back(std::move(cond));
+    Condition cond;
+    cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
+    cond.op = convert_sv_comp_op(expr->op);
+    if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs)) {
+        cond.is_rhs_val = true;
+        cond.rhs_val = convert_sv_value(rhs_val);
+        cond.rhs_is_float_lit =
+            (std::dynamic_pointer_cast<ast::FloatLit>(rhs_val) != nullptr);
+    } else if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs)) {
+        cond.is_rhs_val = false;
+        cond.rhs_col = {.tab_name = rhs_col->tab_name,
+                        .col_name = rhs_col->col_name};
+    } else {
+        throw InternalError("Unexpected comparison right-hand side");
     }
-    conds.swap(kept);
+    return cond;
 }
-
 
 Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
     Value val;
@@ -1100,10 +1120,10 @@ bool Analyze::is_in_group_by(const TabCol &col, const std::vector<TabCol> &group
     return false;
 }
 
-void Analyze::check_where_no_aggregate(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds) {
+void Analyze::check_where_no_aggregate(const std::shared_ptr<ast::BoolExpr> &sv_expr) {
     // 当前 WHERE 语法左侧只接受 Col，不接受 AggExpr。保留此入口，作为以后加入
     // 通用表达式时的语义边界。
-    (void)sv_conds;
+    (void)sv_expr;
 }
 // 检查 GROUP BY 的语义合法性，如果查询用了聚合，那么 SELECT 中直接输出的普通列必须受到 GROUP BY 的约束
 void Analyze::check_group_by_validity(const std::vector<TabCol> &sel_cols,
@@ -1130,11 +1150,29 @@ void Analyze::check_group_by_validity(const std::vector<TabCol> &sel_cols,
     }
 }
 
-void Analyze::analyze_having_clause(
-    const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+HavingExprPtr Analyze::analyze_having_clause(
+    const std::shared_ptr<ast::BoolExpr> &sv_expr,
     const std::vector<TabCol> &group_by, std::vector<AggregateInfo> &aggs,
-    const AnalyzeScope &scope, std::vector<HavingCondition> &result) {
-    result.clear();
+    const AnalyzeScope &scope) {
+    if (sv_expr == nullptr) return nullptr;
+
+    if (auto logical = std::dynamic_pointer_cast<ast::LogicalExpr>(sv_expr)) {
+        const BoolExprType type = logical->op == ast::LogicalOp::AND
+                                      ? BoolExprType::AND
+                                      : BoolExprType::OR;
+        // Analyze left-to-right so hidden aggregate slots receive stable,
+        // deterministic indexes independent of function argument ordering.
+        auto left = analyze_having_clause(logical->left, group_by, aggs, scope);
+        auto right = analyze_having_clause(logical->right, group_by, aggs, scope);
+        return make_bool_binary<HavingCondition>(type, std::move(left),
+                                                 std::move(right));
+    }
+    if (auto negated = std::dynamic_pointer_cast<ast::NotExpr>(sv_expr)) {
+        return make_bool_not<HavingCondition>(
+            analyze_having_clause(negated->child, group_by, aggs, scope));
+    }
+    auto expr = std::dynamic_pointer_cast<ast::BinaryExpr>(sv_expr);
+    if (expr == nullptr) throw InternalError("Unexpected HAVING expression node");
 
     auto same_aggregate = [](const AggregateInfo &left, const AggregateInfo &right) {
         return left.type == right.type && left.is_star == right.is_star &&
@@ -1150,7 +1188,6 @@ void Analyze::analyze_having_clause(
         return get_col_type(scope.cols, target);
     };
 
-    for (const auto &expr : sv_conds) {
         auto rhs = std::dynamic_pointer_cast<ast::Value>(expr->rhs);
         if (rhs == nullptr) {
             // 执行器只支持已经解析的标量右操作数。这里直接拒绝列，比旧路径先
@@ -1225,6 +1262,5 @@ void Analyze::analyze_having_clause(
                 throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(cond.rhs.type));
             }
         }
-        result.push_back(std::move(cond));
-    }
+        return make_bool_atom<HavingCondition>(std::move(cond));
 }

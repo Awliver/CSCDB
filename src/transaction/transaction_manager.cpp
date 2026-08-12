@@ -1093,31 +1093,6 @@ static bool ser_cmp(const char *a, const char *b, int len, ColType type, CompOp 
     return false;
 }
 
-bool TransactionManager::ser_record_matches(const std::string &tab, const char *data,
-                                            const std::vector<Condition> &conds) {
-    if (conds.empty()) return true;   // 空谓词(全表扫描)匹配所有记录
-    TabMeta &meta = sm_manager_->db_.get_table(tab);
-    for (const auto &cond : conds) {
-        auto it = std::find_if(meta.cols.begin(), meta.cols.end(), [&](const ColMeta &c) {
-            return c.name == cond.lhs_col.col_name &&
-                   (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
-        });
-        if (it == meta.cols.end()) return false;
-        const char *lhs = data + it->offset;
-        const char *rhs;
-        if (cond.is_rhs_val) {
-            rhs = cond.rhs_val.raw->data;
-        } else {
-            auto rit = std::find_if(meta.cols.begin(), meta.cols.end(),
-                                    [&](const ColMeta &c) { return c.name == cond.rhs_col.col_name; });
-            if (rit == meta.cols.end()) return false;
-            rhs = data + rit->offset;
-        }
-        if (!ser_cmp(lhs, rhs, it->len, it->type, cond.op)) return false;
-    }
-    return true;
-}
-
 void TransactionManager::ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid) {
     std::scoped_lock<std::mutex> lck(ser_latch_);
     txn_id_t id = txn->get_transaction_id();
@@ -1129,55 +1104,102 @@ void TransactionManager::ser_record_read(Transaction *txn, const std::string &ta
 }
 
 void TransactionManager::ser_record_pred(Transaction *txn, const std::string &tab,
-                                         const std::vector<Condition> &conds) {
+                                         const ConditionExprPtr &predicate) {
     std::scoped_lock<std::mutex> lck(ser_latch_);
     txn_id_t id = txn->get_transaction_id();
     SerInfo &info = ser_[id];
     info.read_ts = txn->get_read_ts();
-    info.read_preds.push_back({tab, conds});
+    info.read_preds.push_back({tab, predicate});
     // 预编译（列偏移解析一次）后进按表分桶的反查索引；编译失败＝谓词引用不存在的列，
-    // 旧的 ser_record_matches 对其恒返回 false（永不命中），故直接不登记，语义等价。
-    std::vector<SerCompiledCond> cc;
-    if (ser_compile_pred(tab, conds, cc)) {
-        ser_pred_readers_[tab][id].push_back(std::move(cc));
+    // 分析层正常会拦截未知列；若仍编译失败，不登记该谓词。
+    SerCompiledExprPtr compiled;
+    if (ser_compile_pred(tab, predicate, compiled)) {
+        ser_pred_readers_[tab][id].push_back(std::move(compiled));
     }
 }
 
-bool TransactionManager::ser_compile_pred(const std::string &tab, const std::vector<Condition> &conds,
-                                          std::vector<SerCompiledCond> &out) {
+bool TransactionManager::ser_compile_pred(const std::string &tab,
+                                          const ConditionExprPtr &predicate,
+                                          SerCompiledExprPtr &out) {
     TabMeta &meta = sm_manager_->db_.get_table(tab);
-    for (const auto &cond : conds) {
-        auto it = std::find_if(meta.cols.begin(), meta.cols.end(), [&](const ColMeta &c) {
-            return c.name == cond.lhs_col.col_name &&
-                   (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
-        });
-        if (it == meta.cols.end()) return false;
-        SerCompiledCond cc;
-        cc.lhs_off = it->offset;
-        cc.lhs_len = it->len;
-        cc.type = it->type;
-        cc.op = cond.op;
-        cc.rhs_is_val = cond.is_rhs_val;
-        cc.rhs_off = -1;
-        if (cond.is_rhs_val) {
-            cc.rhs_val.assign(cond.rhs_val.raw->data, it->len);
-        } else {
-            auto rit = std::find_if(meta.cols.begin(), meta.cols.end(),
-                                    [&](const ColMeta &c) { return c.name == cond.rhs_col.col_name; });
-            if (rit == meta.cols.end()) return false;
-            cc.rhs_off = rit->offset;
+    out.reset();
+
+    std::function<bool(const ConditionExprPtr &, SerCompiledExprPtr &)> compile =
+        [&](const ConditionExprPtr &source, SerCompiledExprPtr &compiled) -> bool {
+        if (source == nullptr) {
+            compiled.reset();       // 空谓词在各层均表示恒真
+            return true;
         }
-        out.push_back(std::move(cc));
-    }
-    return true;
+
+        auto node = std::make_shared<SerCompiledExpr>();
+        node->type = source->type;
+        node->constant = source->constant;
+        switch (source->type) {
+            case BoolExprType::CONSTANT:
+                break;
+            case BoolExprType::ATOM: {
+                const Condition &cond = source->atom;
+                auto it = std::find_if(meta.cols.begin(), meta.cols.end(),
+                                       [&](const ColMeta &c) {
+                    return c.name == cond.lhs_col.col_name &&
+                           (cond.lhs_col.tab_name.empty() ||
+                            c.tab_name == cond.lhs_col.tab_name);
+                });
+                if (it == meta.cols.end()) return false;
+
+                SerCompiledCond cc;
+                cc.lhs_off = it->offset;
+                cc.lhs_len = it->len;
+                cc.type = it->type;
+                cc.op = cond.op;
+                cc.rhs_is_val = cond.is_rhs_val;
+                cc.rhs_off = -1;
+                if (cond.is_rhs_val) {
+                    cc.rhs_val.assign(cond.rhs_val.raw->data, it->len);
+                } else {
+                    auto rit = std::find_if(meta.cols.begin(), meta.cols.end(),
+                                            [&](const ColMeta &c) {
+                        return c.name == cond.rhs_col.col_name &&
+                               (cond.rhs_col.tab_name.empty() ||
+                                c.tab_name == cond.rhs_col.tab_name);
+                    });
+                    if (rit == meta.cols.end()) return false;
+                    cc.rhs_off = rit->offset;
+                }
+                node->atom = std::move(cc);
+                break;
+            }
+            case BoolExprType::NOT:
+                if (!compile(source->left, node->left)) return false;
+                break;
+            case BoolExprType::AND:
+            case BoolExprType::OR:
+                if (!compile(source->left, node->left) ||
+                    !compile(source->right, node->right)) {
+                    return false;
+                }
+                break;
+        }
+        compiled = std::move(node);
+        return true;
+    };
+
+    return compile(predicate, out);
 }
 
-bool TransactionManager::ser_compiled_match(const char *data, const std::vector<SerCompiledCond> &cs) {
-    for (const auto &c : cs) {                    // 空谓词(全表扫描)匹配所有记录
+bool TransactionManager::ser_compiled_match(const char *data,
+                                            const SerCompiledExprPtr &predicate) {
+    const TruthValue result = evaluate_bool_expr(
+        predicate, [data](const SerCompiledCond &c) {
+        if (data == nullptr) return TruthValue::FALSE_VALUE;
         const char *rhs = c.rhs_is_val ? c.rhs_val.data() : data + c.rhs_off;
-        if (!ser_cmp(data + c.lhs_off, rhs, c.lhs_len, c.type, c.op)) return false;
-    }
-    return true;
+        return ser_cmp(data + c.lhs_off, rhs, c.lhs_len, c.type, c.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
+    });
+    // 基础表记录当前无 NULL，比较叶只产生 TRUE/FALSE；若常量树产生
+    // UNKNOWN，也按 SQL WHERE 语义不匹配。空树由 evaluate_bool_expr 视为 TRUE。
+    return result == TruthValue::TRUE_VALUE;
 }
 
 void TransactionManager::ser_unindex(txn_id_t id, const SerInfo &info) {
@@ -1332,15 +1354,15 @@ bool TransactionManager::ser_read_check(Transaction *txn, const std::string &tab
 // 读时(谓词)：扫描本表版本链，找匹配谓词、但本事务快照不可见的他事务写(尤其幻影插入)，
 // 建立 me ->rw writer。补齐 ser_read_check(只查已读 rid) 无法发现的"看不到的新行"。
 bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string &tab,
-                                             const std::vector<Condition> &conds) {
+                                             const ConditionExprPtr &predicate) {
     // 门：表无在飞写者且最近写提交 <= 本快照 ⇒ 整跳（item 等只读表）。
     // 调用方保证先 ser_record_pred 再调本函数——门后出现的匹配写由写方 ser_write_check 建边。
     if (!ser_needs_read_check(txn, tab)) return false;
 
     // 谓词只依赖 schema：编译一次后循环内用 O(1) 偏移比较，避免每条记录重复 find_if。
     // 编译失败＝引用不存在的列，旧 ser_record_matches 对任何记录恒 false，语义等价。
-    std::vector<SerCompiledCond> cc;
-    if (!ser_compile_pred(tab, conds, cc)) return false;
+    SerCompiledExprPtr compiled;
+    if (!ser_compile_pred(tab, predicate, compiled)) return false;
 
     txn_id_t me = txn->get_transaction_id();
     timestamp_t rts = txn->get_read_ts();
@@ -1373,14 +1395,14 @@ bool TransactionManager::ser_read_pred_check(Transaction *txn, const std::string
         MvccChain &ch = cit->second;
         // 其他事务未提交的插入/更新，其新值匹配谓词 → 该写会改变本次查询结果
         if (ch.writer != INVALID_TXN_ID && ch.writer != me && !ch.writer_del &&
-            !ch.writer_data.empty() && ser_compiled_match(ch.writer_data.data(), cc)) {
+            !ch.writer_data.empty() && ser_compiled_match(ch.writer_data.data(), compiled)) {
             hit_writers.push_back(ch.writer);
         }
         // 已提交但对本事务快照不可见(commit_ts>read_ts)的写，其值匹配谓词
         for (auto &v : ch.hist) {
             if (v.commit_ts > rts && !v.is_deleted && !v.data.empty() &&
                 v.writer_txn != INVALID_TXN_ID && v.writer_txn != me &&
-                ser_compiled_match(v.data.data(), cc)) {
+                ser_compiled_match(v.data.data(), compiled)) {
                 hit_writers.push_back(v.writer_txn);
             }
         }

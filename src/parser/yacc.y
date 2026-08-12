@@ -43,7 +43,7 @@ static bool is_lateral_ref(const std::shared_ptr<ast::FromExpr> &from) {
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND OR NOT JOIN ON EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 %token COUNT MAX MIN SUM AVG AS GROUP HAVING LIMIT UNION DISTINCT
 %token LEFT RIGHT INNER OUTER CROSS FULL NATURAL SEMI ANTI LATERAL
 // non-keywords
@@ -73,8 +73,9 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_cols> colList
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
-%type <sv_cond> condition having_condition
-%type <sv_conds> whereClause optWhereClause having_clause
+%type <sv_bool_expr> condition whereClause where_or_expr where_and_expr where_not_expr
+%type <sv_bool_expr> optWhereClause having_condition having_clause
+%type <sv_bool_expr> having_or_expr having_and_expr having_not_expr opt_having
 %type <sv_orderby>  order_clause
 %type <sv_orderbys> opt_order_clause order_list
 %type <sv_orderby_dir> opt_asc_desc
@@ -82,7 +83,6 @@ WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON EXIT HE
 %type <sv_agg_exprs> agg_list
 %type <sv_str> agg_name
 %type <sv_cols> opt_group_by group_by_list
-%type <sv_conds> opt_having
 %type <sv_int> opt_limit
 %type <sv_str> opt_alias required_alias
 %type <sv_setKnobType> set_knob_type
@@ -358,7 +358,10 @@ condition:
     ;
 
 optWhereClause:
-        /* epsilon */ { /* ignore*/ }
+        /* epsilon */
+    {
+        $$ = nullptr;
+    }
     |   WHERE whereClause
     {
         $$ = $2;
@@ -366,13 +369,46 @@ optWhereClause:
     ;
 
 whereClause:
-        condition 
+        where_or_expr
     {
-        $$ = std::vector<std::shared_ptr<BinaryExpr>>{$1};
+        $$ = $1;
     }
-    |   whereClause AND condition
+    ;
+
+where_or_expr:
+        where_or_expr OR where_and_expr
     {
-        $$.push_back($3);
+        $$ = std::make_shared<LogicalExpr>(LogicalOp::OR, $1, $3);
+    }
+    |   where_and_expr
+    {
+        $$ = $1;
+    }
+    ;
+
+where_and_expr:
+        where_and_expr AND where_not_expr
+    {
+        $$ = std::make_shared<LogicalExpr>(LogicalOp::AND, $1, $3);
+    }
+    |   where_not_expr
+    {
+        $$ = $1;
+    }
+    ;
+
+where_not_expr:
+        NOT where_not_expr
+    {
+        $$ = std::make_shared<NotExpr>($2);
+    }
+    |   '(' whereClause ')'
+    {
+        $$ = $2;
+    }
+    |   condition
+    {
+        $$ = $1;
     }
     ;
 
@@ -624,13 +660,13 @@ joined_table:
     {
         if (!$5) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            INNER_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{},
+            INNER_JOIN, $1, $3, nullptr,
             false, is_lateral_ref($3), true);
     }
     | joined_table JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{},
+            CROSS_JOIN, $1, $3, nullptr,
             false, is_lateral_ref($3));
     }
     | joined_table INNER JOIN table_ref ON whereClause
@@ -642,7 +678,7 @@ joined_table:
     {
         if (!$6) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            INNER_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            INNER_JOIN, $1, $4, nullptr,
             false, is_lateral_ref($4), true);
     }
     | joined_table LEFT opt_outer JOIN table_ref ON whereClause
@@ -654,7 +690,7 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            LEFT_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            LEFT_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table RIGHT opt_outer JOIN table_ref ON whereClause
@@ -666,7 +702,7 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            RIGHT_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            RIGHT_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table FULL opt_outer JOIN table_ref ON whereClause
@@ -678,43 +714,43 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            FULL_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            FULL_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table CROSS JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            CROSS_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            CROSS_JOIN, $1, $4, nullptr,
             false, is_lateral_ref($4));
     }
     | joined_table NATURAL JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            INNER_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            INNER_JOIN, $1, $4, nullptr,
             true, is_lateral_ref($4));
     }
     | joined_table NATURAL INNER JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            INNER_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            INNER_JOIN, $1, $5, nullptr,
             true, is_lateral_ref($5));
     }
     | joined_table NATURAL LEFT opt_outer JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            LEFT_JOIN, $1, $6, std::vector<std::shared_ptr<BinaryExpr>>{},
+            LEFT_JOIN, $1, $6, nullptr,
             true, is_lateral_ref($6));
     }
     | joined_table NATURAL RIGHT opt_outer JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            RIGHT_JOIN, $1, $6, std::vector<std::shared_ptr<BinaryExpr>>{},
+            RIGHT_JOIN, $1, $6, nullptr,
             true, is_lateral_ref($6));
     }
     | joined_table NATURAL FULL opt_outer JOIN table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            FULL_JOIN, $1, $6, std::vector<std::shared_ptr<BinaryExpr>>{},
+            FULL_JOIN, $1, $6, nullptr,
             true, is_lateral_ref($6));
     }
     | joined_table SEMI JOIN table_ref ON whereClause
@@ -726,7 +762,7 @@ joined_table:
     {
         if (!$6) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            LEFT_SEMI_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            LEFT_SEMI_JOIN, $1, $4, nullptr,
             false, is_lateral_ref($4), true);
     }
     | joined_table LEFT SEMI JOIN table_ref ON whereClause
@@ -738,7 +774,7 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            LEFT_SEMI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            LEFT_SEMI_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table RIGHT SEMI JOIN table_ref ON whereClause
@@ -750,7 +786,7 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            RIGHT_SEMI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            RIGHT_SEMI_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table ANTI JOIN table_ref ON whereClause
@@ -762,7 +798,7 @@ joined_table:
     {
         if (!$6) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            LEFT_ANTI_JOIN, $1, $4, std::vector<std::shared_ptr<BinaryExpr>>{},
+            LEFT_ANTI_JOIN, $1, $4, nullptr,
             false, is_lateral_ref($4), true);
     }
     | joined_table LEFT ANTI JOIN table_ref ON whereClause
@@ -774,7 +810,7 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            LEFT_ANTI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            LEFT_ANTI_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table RIGHT ANTI JOIN table_ref ON whereClause
@@ -786,13 +822,13 @@ joined_table:
     {
         if (!$7) YYERROR;
         $$ = std::make_shared<JoinExpr>(
-            RIGHT_ANTI_JOIN, $1, $5, std::vector<std::shared_ptr<BinaryExpr>>{},
+            RIGHT_ANTI_JOIN, $1, $5, nullptr,
             false, is_lateral_ref($5), true);
     }
     | joined_table ',' table_ref
     {
         $$ = std::make_shared<JoinExpr>(
-            CROSS_JOIN, $1, $3, std::vector<std::shared_ptr<BinaryExpr>>{},
+            CROSS_JOIN, $1, $3, nullptr,
             false, is_lateral_ref($3));
     }
     ;
@@ -837,20 +873,53 @@ having_condition:
     ;
 
 having_clause:
-        having_condition
+        having_or_expr
     {
-        $$ = std::vector<std::shared_ptr<BinaryExpr>>{$1};
+        $$ = $1;
     }
-    |   having_clause AND having_condition
+    ;
+
+having_or_expr:
+        having_or_expr OR having_and_expr
     {
-        $$.push_back($3);
+        $$ = std::make_shared<LogicalExpr>(LogicalOp::OR, $1, $3);
+    }
+    |   having_and_expr
+    {
+        $$ = $1;
+    }
+    ;
+
+having_and_expr:
+        having_and_expr AND having_not_expr
+    {
+        $$ = std::make_shared<LogicalExpr>(LogicalOp::AND, $1, $3);
+    }
+    |   having_not_expr
+    {
+        $$ = $1;
+    }
+    ;
+
+having_not_expr:
+        NOT having_not_expr
+    {
+        $$ = std::make_shared<NotExpr>($2);
+    }
+    |   '(' having_clause ')'
+    {
+        $$ = $2;
+    }
+    |   having_condition
+    {
+        $$ = $1;
     }
     ;
 
 opt_having:
         /* epsilon */
     {
-        $$ = {};
+        $$ = nullptr;
     }
     |   HAVING having_clause
     {

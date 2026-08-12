@@ -20,7 +20,8 @@ class SeqScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;              // 表的名称
     std::string binding_name_;          // SQL 中的关系实例名
-    std::vector<Condition> predicates_; // 当前 Scan 执行的局部谓词
+    // 扫描谓词的完整布尔树。nullptr 表示恒真。
+    ConditionExprPtr predicate_;
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
     size_t len_;                        // scan后生成的每条记录的长度
@@ -47,7 +48,7 @@ class SeqScanExecutor : public AbstractExecutor {
         const char *rhs_val_data;
         int rhs_offset;
     };
-    std::vector<CompiledCond> compiled_;
+    BoolExprPtr<CompiledCond> compiled_predicate_;
 
     // 优化 2：跨记录复用 page handle
     int cached_page_no_ = -1;
@@ -58,15 +59,16 @@ class SeqScanExecutor : public AbstractExecutor {
     SmManager *sm_manager_;
 
    public:
-    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context)
-        : SeqScanExecutor(sm_manager, tab_name, tab_name, std::move(conds), context) {}
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name,
+                    ConditionExprPtr predicate, Context *context)
+        : SeqScanExecutor(sm_manager, tab_name, tab_name, std::move(predicate), context) {}
 
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::string binding_name,
-                    std::vector<Condition> conds, Context *context) {
+                    ConditionExprPtr predicate, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         binding_name_ = std::move(binding_name);
-        predicates_ = std::move(conds);
+        predicate_ = std::move(predicate);
         TabMeta &tab = sm_manager_->db_.get_table(tab_name_);
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab.cols;
@@ -75,49 +77,92 @@ class SeqScanExecutor : public AbstractExecutor {
 
         context_ = context;
 
-        compile_conds();
+        compiled_predicate_ = compile_expr(predicate_);
     }
 
-     void compile_conds() {
-        compiled_.clear();
-        compiled_.reserve(predicates_.size());
-        for (const auto &cond : predicates_) {
-            auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                return c.name == cond.lhs_col.col_name &&
-                       (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
-            });
-            if (lhs_it == cols_.end()) continue;
-            CompiledCond cc;
-            cc.lhs_offset = lhs_it->offset;
-            cc.lhs_len = lhs_it->len;
-            cc.lhs_type = lhs_it->type;
-            cc.op = cond.op;
-            cc.is_rhs_val = cond.is_rhs_val;
-            if (cond.is_rhs_val) {
-                cc.rhs_val_data = cond.rhs_val.raw->data;
-                cc.rhs_offset = -1;
-            } else {
-                auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                    return c.name == cond.rhs_col.col_name &&
-                           (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
-                });
-                if (rhs_it == cols_.end()) continue;
-                cc.rhs_val_data = nullptr;
-                cc.rhs_offset = rhs_it->offset;
-            }
-            compiled_.push_back(cc);
+    // 旧调用点的 vector 重载仅做边界适配：进入执行器后的
+    // 唯一语义源仍是一棵完整表达式树。
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name,
+                    std::vector<Condition> conds, Context *context)
+        : SeqScanExecutor(sm_manager, std::move(tab_name),
+                          conditions_to_expr(std::move(conds)), context) {}
+
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::string binding_name,
+                    std::vector<Condition> conds, Context *context)
+        : SeqScanExecutor(sm_manager, std::move(tab_name), std::move(binding_name),
+                          conditions_to_expr(std::move(conds)), context) {}
+
+    static ConditionExprPtr conditions_to_expr(std::vector<Condition> conds) {
+        ConditionExprPtr result;
+        for (auto &cond : conds) {
+            auto atom = make_bool_atom<Condition>(std::move(cond));
+            result = result == nullptr
+                         ? std::move(atom)
+                         : make_bool_binary<Condition>(BoolExprType::AND, std::move(result),
+                                                       std::move(atom));
         }
+        return result;
+    }
+
+    CompiledCond compile_atom(const Condition &cond) const {
+        auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+            return c.name == cond.lhs_col.col_name &&
+                   (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
+        });
+        if (lhs_it == cols_.end()) throw ColumnNotFoundError(cond.lhs_col.col_name);
+
+        CompiledCond cc{};
+        cc.lhs_offset = lhs_it->offset;
+        cc.lhs_len = lhs_it->len;
+        cc.lhs_type = lhs_it->type;
+        cc.op = cond.op;
+        cc.is_rhs_val = cond.is_rhs_val;
+        if (cond.is_rhs_val) {
+            if (cond.rhs_val.raw == nullptr) {
+                throw InternalError("Scan predicate literal has no raw value");
+            }
+            cc.rhs_val_data = cond.rhs_val.raw->data;
+            cc.rhs_offset = -1;
+        } else {
+            auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+                return c.name == cond.rhs_col.col_name &&
+                       (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
+            });
+            if (rhs_it == cols_.end()) throw ColumnNotFoundError(cond.rhs_col.col_name);
+            cc.rhs_val_data = nullptr;
+            cc.rhs_offset = rhs_it->offset;
+        }
+        return cc;
+    }
+
+    BoolExprPtr<CompiledCond> compile_expr(const ConditionExprPtr &expr) const {
+        if (expr == nullptr) return nullptr;
+        switch (expr->type) {
+            case BoolExprType::CONSTANT:
+                return make_bool_constant<CompiledCond>(expr->constant);
+            case BoolExprType::ATOM:
+                return make_bool_atom<CompiledCond>(compile_atom(expr->atom));
+            case BoolExprType::NOT:
+                return make_bool_not<CompiledCond>(compile_expr(expr->left));
+            case BoolExprType::AND:
+            case BoolExprType::OR:
+                return make_bool_binary<CompiledCond>(expr->type, compile_expr(expr->left),
+                                                       compile_expr(expr->right));
+        }
+        throw InternalError("Unknown scan boolean expression node");
     }
 
     bool eval_compiled(const char *data) const {
-        for (const auto &cc : compiled_) {
+        const TruthValue result = evaluate_bool_expr(
+            compiled_predicate_, [&](const CompiledCond &cc) {
             const char *lhs = data + cc.lhs_offset;
             const char *rhs = cc.is_rhs_val ? cc.rhs_val_data : data + cc.rhs_offset;
-            if (!compare_value(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)) {
-                return false;
-            }
-        }
-        return true;
+            return compare_value(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)
+                       ? TruthValue::TRUE_VALUE
+                       : TruthValue::FALSE_VALUE;
+        });
+        // WHERE/ON/HAVING 都只保留 TRUE，UNKNOWN 与 FALSE 一样被过滤。
+        return result == TruthValue::TRUE_VALUE;
     }
 
     void position_to_next_match() {
@@ -229,14 +274,15 @@ class SeqScanExecutor : public AbstractExecutor {
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
         if (ser_on_) {
-            auto physical_conds = predicates_;
-            for (auto &cond : physical_conds) {
+            auto physical_predicate = map_bool_atoms<Condition>(predicate_, [&](const Condition &input) {
+                Condition cond = input;
                 if (cond.lhs_col.tab_name == binding_name_) cond.lhs_col.tab_name = tab_name_;
                 if (!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_) cond.rhs_col.tab_name = tab_name_;
-            }
-            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, physical_conds);   // 题9 SER 谓词读(含空结果)
+                return cond;
+            });
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, physical_predicate);   // 题9 SER 谓词读(含空结果)
             // 读侧(谓词)：检测匹配本谓词但快照不可见的他事务写(幻影插入)→ rw 反依赖；成 SSI 危险结构则 abort
-            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, physical_conds))
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, physical_predicate))
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                 AbortReason::SSI_DANGEROUS_STRUCTURE);
         }

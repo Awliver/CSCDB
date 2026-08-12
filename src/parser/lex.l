@@ -95,6 +95,8 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."|"+"|"-"
 "FLOAT" { return FLOAT; }
 "INDEX" { return INDEX; }
 "AND" { return AND; }
+"OR" { return OR; }
+"NOT" { return NOT; }
 "JOIN" {return JOIN;}
 "LEFT" { return LEFT; }
 "RIGHT" { return RIGHT; }

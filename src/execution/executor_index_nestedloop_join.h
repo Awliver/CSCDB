@@ -24,8 +24,11 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     std::vector<ColMeta> right_cols_;
     size_t len_;
     std::vector<ColMeta> cols_;
-    std::vector<Condition> join_conds_;
-    std::vector<Condition> right_conds_;
+    ConditionExprPtr on_predicate_;
+    ConditionExprPtr right_predicate_;
+    // 只有顶层正向 AND 上的原子才可用于构造精确索引 key。
+    std::vector<Condition> on_access_conditions_;
+    std::vector<Condition> right_access_conditions_;
 
     std::unique_ptr<RmRecord> left_rec_;
     std::vector<bool> left_nulls_;
@@ -51,44 +54,139 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
     // 把依赖当前外表行的 join 条件实例化为纯右表谓词。
     // 例如 r.id = s.id 在 r.id=7 时登记为 s.id = 7，不能用整表读替代，
     // 否则会把 INLJ 的点查冲突集无谓扩大。
-    void build_right_ser_pred(std::vector<Condition> &pred) {
-        pred = right_conds_;
-        pred.reserve(right_conds_.size() + join_conds_.size());
-        for (const auto &cond : join_conds_) {
-            if (cond.is_rhs_val) continue;
-
-            TabCol right_col;
-            TabCol left_col;
-            CompOp op;
-            if (cond.lhs_col.tab_name == right_binding_ && cond.rhs_col.tab_name != right_binding_) {
-                right_col = cond.lhs_col;
-                left_col = cond.rhs_col;
-                op = cond.op;
-            } else if (cond.rhs_col.tab_name == right_binding_ && cond.lhs_col.tab_name != right_binding_) {
-                right_col = cond.rhs_col;
-                left_col = cond.lhs_col;
-                op = swap_comp_op(cond.op);
-            } else {
-                continue;
-            }
-
-            auto left_it = get_col(left_->cols(), left_col);
-            auto right_it = get_col(right_cols_, right_col);
+    Condition instantiate_right_atom(const Condition &input) const {
+        Condition cond = input;
+        auto instantiate_operand = [&](const TabCol &column, Value &value) {
+            auto left_it = std::find_if(left_->cols().begin(), left_->cols().end(),
+                                        [&](const ColMeta &candidate) {
+                return candidate.name == column.col_name &&
+                       (column.tab_name.empty() || candidate.tab_name == column.tab_name);
+            });
+            if (left_it == left_->cols().end()) throw ColumnNotFoundError(column.col_name);
             const size_t left_index = static_cast<size_t>(left_it - left_->cols().begin());
-            if (left_index < left_nulls_.size() && left_nulls_[left_index]) continue;
-            Condition instantiated;
-            instantiated.lhs_col = right_col;
-            instantiated.op = op;
-            instantiated.is_rhs_val = true;
-            instantiated.rhs_val.type = right_it->type;
-            instantiated.rhs_val.raw = std::make_shared<RmRecord>(right_it->len);
-            memcpy(instantiated.rhs_val.raw->data, left_rec_->data + left_it->offset, right_it->len);
-            pred.push_back(std::move(instantiated));
+            if (left_index < left_nulls_.size() && left_nulls_[left_index]) {
+                throw InternalError("NULL outer operand reached INLJ SSI atom instantiation");
+            }
+            value.type = left_it->type;
+            value.raw = std::make_shared<RmRecord>(left_it->len);
+            memcpy(value.raw->data, left_rec_->data + left_it->offset, left_it->len);
+        };
+
+        const bool lhs_right = cond.lhs_col.tab_name == right_binding_;
+        const bool rhs_right = !cond.is_rhs_val && cond.rhs_col.tab_name == right_binding_;
+        if (lhs_right && !cond.is_rhs_val && !rhs_right) {
+            Value value;
+            instantiate_operand(cond.rhs_col, value);
+            cond.is_rhs_val = true;
+            cond.rhs_val = std::move(value);
+        } else if (!lhs_right && rhs_right) {
+            Value value;
+            instantiate_operand(cond.lhs_col, value);
+            cond.lhs_col = cond.rhs_col;
+            cond.op = swap_comp_op(cond.op);
+            cond.is_rhs_val = true;
+            cond.rhs_val = std::move(value);
         }
-        for (auto &cond : pred) {
-            if (cond.lhs_col.tab_name == right_binding_) cond.lhs_col.tab_name = right_table_;
-            if (!cond.is_rhs_val && cond.rhs_col.tab_name == right_binding_) cond.rhs_col.tab_name = right_table_;
+        if (cond.lhs_col.tab_name == right_binding_) cond.lhs_col.tab_name = right_table_;
+        if (!cond.is_rhs_val && cond.rhs_col.tab_name == right_binding_) {
+            cond.rhs_col.tab_name = right_table_;
         }
+        return cond;
+    }
+
+    bool outer_operand_is_null(const TabCol &column) const {
+        auto it = std::find_if(left_->cols().begin(), left_->cols().end(),
+                               [&](const ColMeta &candidate) {
+            return candidate.name == column.col_name &&
+                   (column.tab_name.empty() || candidate.tab_name == column.tab_name);
+        });
+        if (it == left_->cols().end()) throw ColumnNotFoundError(column.col_name);
+        const size_t index = static_cast<size_t>(it - left_->cols().begin());
+        return index < left_nulls_.size() && left_nulls_[index];
+    }
+
+    // 把 ON 树中依赖当前外表行的原子递归实例化：混合原子改成
+    // 右列-vs-字面量，纯左原子改成 TRUE/FALSE/UNKNOWN 常量。因此在
+    // NOT/OR 下也不会丢失 SQL 三值语义。
+    ConditionExprPtr instantiate_right_expr(const ConditionExprPtr &expr) const {
+        if (expr == nullptr) return nullptr;
+        switch (expr->type) {
+            case BoolExprType::CONSTANT:
+                return make_bool_constant<Condition>(expr->constant);
+            case BoolExprType::NOT:
+                return make_bool_not<Condition>(instantiate_right_expr(expr->left));
+            case BoolExprType::AND:
+            case BoolExprType::OR:
+                return make_bool_binary<Condition>(expr->type,
+                                                    instantiate_right_expr(expr->left),
+                                                    instantiate_right_expr(expr->right));
+            case BoolExprType::ATOM: {
+                const Condition &cond = expr->atom;
+                const bool lhs_right = cond.lhs_col.tab_name == right_binding_;
+                const bool rhs_right = !cond.is_rhs_val &&
+                                       cond.rhs_col.tab_name == right_binding_;
+                if (!lhs_right && !rhs_right) {
+                    std::vector<char> joined(len_, 0);
+                    memcpy(joined.data(), left_rec_->data, left_->tupleLen());
+                    return make_bool_constant<Condition>(eval_cond(cond, joined.data()));
+                }
+                if (!cond.is_rhs_val && lhs_right != rhs_right) {
+                    const TabCol &outer_col = lhs_right ? cond.rhs_col : cond.lhs_col;
+                    if (outer_operand_is_null(outer_col)) {
+                        return make_bool_constant<Condition>(TruthValue::UNKNOWN_VALUE);
+                    }
+                }
+                return make_bool_atom<Condition>(instantiate_right_atom(cond));
+            }
+        }
+        throw InternalError("Unknown INLJ SSI boolean expression node");
+    }
+
+    // 递归实例化完整的右表谓词 AND ON 树，保留 OR/NOT 拓扑。
+    ConditionExprPtr build_right_ser_pred() const {
+        auto physical_right = instantiate_right_expr(right_predicate_);
+        auto physical_on = instantiate_right_expr(on_predicate_);
+        if (physical_right == nullptr) return physical_on;
+        if (physical_on == nullptr) return physical_right;
+        return make_bool_binary<Condition>(BoolExprType::AND, std::move(physical_right),
+                                           std::move(physical_on));
+    }
+
+    bool condition_supplies_right_key(const Condition &cond, const ColMeta &idx_col,
+                                      const char *&value) const {
+        value = nullptr;
+        if (cond.op != OP_EQ) return false;
+        if (cond.is_rhs_val) {
+            if (cond.lhs_col.tab_name == right_binding_ &&
+                cond.lhs_col.col_name == idx_col.name && cond.rhs_val.raw != nullptr) {
+                value = cond.rhs_val.raw->data;
+                return true;
+            }
+            return false;
+        }
+
+        TabCol left_col;
+        if (cond.lhs_col.tab_name == right_binding_ &&
+            cond.lhs_col.col_name == idx_col.name &&
+            cond.rhs_col.tab_name != right_binding_) {
+            left_col = cond.rhs_col;
+        } else if (cond.rhs_col.tab_name == right_binding_ &&
+                   cond.rhs_col.col_name == idx_col.name &&
+                   cond.lhs_col.tab_name != right_binding_) {
+            left_col = cond.lhs_col;
+        } else {
+            return false;
+        }
+        auto left_it = std::find_if(left_->cols().begin(), left_->cols().end(),
+                                    [&](const ColMeta &candidate) {
+            return candidate.name == left_col.col_name &&
+                   (left_col.tab_name.empty() || candidate.tab_name == left_col.tab_name);
+        });
+        if (left_it == left_->cols().end()) throw ColumnNotFoundError(left_col.col_name);
+        const size_t left_index = static_cast<size_t>(left_it - left_->cols().begin());
+        if (left_index < left_nulls_.size() && left_nulls_[left_index]) return false;
+        value = left_rec_->data + left_it->offset;
+        return true;
     }
 
     bool build_lookup_key(std::vector<char> &key) {
@@ -96,32 +194,21 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         size_t key_off = 0;
         for (auto &idx_col : index_meta_.cols) {
             bool filled = false;
-            for (auto &cond : right_conds_) {
-                if (cond.op != OP_EQ || !cond.is_rhs_val) continue;
-                if (cond.lhs_col.tab_name != right_binding_ || cond.lhs_col.col_name != idx_col.name) continue;
-                memcpy(key.data() + key_off, cond.rhs_val.raw->data, idx_col.len);
-                filled = true;
-                break;
-            }
-            if (!filled) {
-                for (auto &cond : join_conds_) {
-                    if (cond.op != OP_EQ || cond.is_rhs_val) continue;
-                    TabCol left_col;
-                    bool matched = false;
-                    if (cond.lhs_col.tab_name == right_binding_ && cond.lhs_col.col_name == idx_col.name) {
-                        left_col = cond.rhs_col;
-                        matched = true;
-                    } else if (cond.rhs_col.tab_name == right_binding_ && cond.rhs_col.col_name == idx_col.name) {
-                        left_col = cond.lhs_col;
-                        matched = true;
-                    }
-                    if (!matched) continue;
-                    auto left_it = get_col(left_->cols(), left_col);
-                    const size_t left_index = static_cast<size_t>(left_it - left_->cols().begin());
-                    if (left_index < left_nulls_.size() && left_nulls_[left_index]) return false;
-                    memcpy(key.data() + key_off, left_rec_->data + left_it->offset, idx_col.len);
+            const char *value = nullptr;
+            for (const auto &cond : right_access_conditions_) {
+                if (condition_supplies_right_key(cond, idx_col, value)) {
+                    memcpy(key.data() + key_off, value, idx_col.len);
                     filled = true;
                     break;
+                }
+            }
+            if (!filled) {
+                for (const auto &cond : on_access_conditions_) {
+                    if (condition_supplies_right_key(cond, idx_col, value)) {
+                        memcpy(key.data() + key_off, value, idx_col.len);
+                        filled = true;
+                        break;
+                    }
                 }
             }
             if (!filled) return false;
@@ -130,42 +217,50 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         return true;
     }
 
-    bool eval_joined_conds(const RmRecord *right_rec) {
+    bool eval_joined_conds(const RmRecord *right_rec) const {
         std::vector<char> joined(len_);
         memcpy(joined.data(), left_rec_->data, left_->tupleLen());
         memcpy(joined.data() + left_->tupleLen(), right_rec->data, right_record_size_);
-        for (auto &cond : right_conds_) {
-            if (!eval_cond(cond, joined.data())) return false;
-        }
-        for (auto &cond : join_conds_) {
-            if (!eval_cond(cond, joined.data())) return false;
-        }
-        return true;
+        const auto evaluate_tree = [&](const ConditionExprPtr &expr) {
+            return evaluate_bool_expr(expr, [&](const Condition &cond) {
+                       return eval_cond(cond, joined.data());
+                   }) == TruthValue::TRUE_VALUE;
+        };
+        return evaluate_tree(right_predicate_) && evaluate_tree(on_predicate_);
     }
 
-    bool eval_cond(const Condition &cond, const char *data) const {
+    TruthValue eval_cond(const Condition &cond, const char *data) const {
         auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
             return c.name == cond.lhs_col.col_name &&
                    (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
         });
-        if (lhs_it == cols_.end()) return false;
+        if (lhs_it == cols_.end()) throw ColumnNotFoundError(cond.lhs_col.col_name);
         const size_t lhs_index = static_cast<size_t>(lhs_it - cols_.begin());
-        if (lhs_index < left_nulls_.size() && left_nulls_[lhs_index]) return false;
+        if (lhs_index < left_nulls_.size() && left_nulls_[lhs_index]) {
+            return TruthValue::UNKNOWN_VALUE;
+        }
         const char *lhs = data + lhs_it->offset;
         const char *rhs = nullptr;
         if (cond.is_rhs_val) {
+            if (cond.rhs_val.raw == nullptr) {
+                throw InternalError("INLJ predicate literal has no raw value");
+            }
             rhs = cond.rhs_val.raw->data;
         } else {
             auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
                 return c.name == cond.rhs_col.col_name &&
                        (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
             });
-            if (rhs_it == cols_.end()) return false;
+            if (rhs_it == cols_.end()) throw ColumnNotFoundError(cond.rhs_col.col_name);
             const size_t rhs_index = static_cast<size_t>(rhs_it - cols_.begin());
-            if (rhs_index < left_nulls_.size() && left_nulls_[rhs_index]) return false;
+            if (rhs_index < left_nulls_.size() && left_nulls_[rhs_index]) {
+                return TruthValue::UNKNOWN_VALUE;
+            }
             rhs = data + rhs_it->offset;
         }
-        return SeqScanExecutor::compare_value(lhs, rhs, lhs_it->len, lhs_it->type, cond.op);
+        return SeqScanExecutor::compare_value(lhs, rhs, lhs_it->len, lhs_it->type, cond.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
     }
 
     void probe_right_index() {
@@ -174,8 +269,7 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         std::vector<char> key;
         if (!build_lookup_key(key)) return;
         if (ser_on_) {
-            std::vector<Condition> pred;
-            build_right_ser_pred(pred);
+            ConditionExprPtr pred = build_right_ser_pred();
             context_->txn_mgr_->ser_record_pred(context_->txn_, right_table_, pred);
             if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, right_table_, pred)) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
@@ -270,7 +364,8 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
 
    public:
     IndexNestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, SmManager *sm_manager,
-                                const ScanPlan &right_scan, std::vector<Condition> join_conds, Context *context) {
+                                const ScanPlan &right_scan, ConditionExprPtr on_predicate,
+                                Context *context) {
         left_ = std::move(left);
         sm_manager_ = sm_manager;
         context_ = context;
@@ -282,8 +377,10 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         right_record_size_ = right_fh_->get_file_hdr().record_size;
         right_cols_ = right_tab_.cols;
         for (auto &col : right_cols_) col.tab_name = right_binding_;
-        join_conds_ = std::move(join_conds);
-        right_conds_ = right_scan.predicates_;
+        on_predicate_ = std::move(on_predicate);
+        right_predicate_ = right_scan.predicate_;
+        right_access_conditions_ = right_scan.access_conditions_;
+        extract_conjunctive_atoms(on_predicate_, on_access_conditions_);
 
         len_ = left_->tupleLen() + right_record_size_;
         cols_ = left_->cols();
@@ -291,6 +388,13 @@ class IndexNestedLoopJoinExecutor : public AbstractExecutor {
         for (auto &col : shifted_right_cols) col.offset += left_->tupleLen();
         cols_.insert(cols_.end(), shifted_right_cols.begin(), shifted_right_cols.end());
     }
+
+    IndexNestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, SmManager *sm_manager,
+                                const ScanPlan &right_scan,
+                                std::vector<Condition> join_conds, Context *context)
+        : IndexNestedLoopJoinExecutor(
+              std::move(left), sm_manager, right_scan,
+              SeqScanExecutor::conditions_to_expr(std::move(join_conds)), context) {}
 
     void beginTuple() override {
         // 题9：内表进入 MVCC 脏态后必须按快照重建可见版本

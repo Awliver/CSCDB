@@ -277,13 +277,15 @@ public:
     bool is_ser(Transaction *txn);
     /* 记录 SER 事务的一次记录读 / 谓词读（仅 SELECT 调用） */
     void ser_record_read(Transaction *txn, const std::string &tab, const Rid &rid);
-    void ser_record_pred(Transaction *txn, const std::string &tab, const std::vector<Condition> &conds);
+    void ser_record_pred(Transaction *txn, const std::string &tab,
+                         const ConditionExprPtr &predicate);
     /* 写时：被写记录 vs 其他 SER 事务的读 → 建 rw 反依赖；成危险结构返回 true（调用方 abort 本事务） */
     bool ser_write_check(Transaction *txn, const std::string &tab, const Rid &rid, const char *data);
     /* 读时：本次读到的记录 vs 其他 SER 事务对它的不可见写 → 建 rw 反依赖；危险结构返回 true */
     bool ser_read_check(Transaction *txn, const std::string &tab, const Rid &rid);
     /* 读时(谓词)：版本存储中匹配本次谓词、但本事务快照不可见的他事务写(含幻影插入) → rw 反依赖 */
-    bool ser_read_pred_check(Transaction *txn, const std::string &tab, const std::vector<Condition> &conds);
+    bool ser_read_pred_check(Transaction *txn, const std::string &tab,
+                             const ConditionExprPtr &predicate);
 
     void release_statement_writes(Transaction *txn);
 
@@ -431,7 +433,7 @@ private:
         timestamp_t commit_ts = 0;     // 0 = 未提交(活跃)
         bool committed = false;
         std::vector<std::pair<std::string, int64_t>> read_rids;                   // (table, ridkey)
-        std::vector<std::pair<std::string, std::vector<Condition>>> read_preds;   // (table, 谓词)
+        std::vector<std::pair<std::string, ConditionExprPtr>> read_preds;         // (table, 谓词树)
         std::unordered_set<txn_id_t> in_rw;    // X ->rw 本事务
         std::unordered_set<txn_id_t> out_rw;   // 本事务 ->rw Y
     };
@@ -451,12 +453,15 @@ private:
         int rhs_off;              // rhs 为列时的偏移
         std::string rhs_val;      // rhs 为字面量时的字节
     };
+    using SerCompiledExpr = BoolExpr<SerCompiledCond>;
+    using SerCompiledExprPtr = BoolExprPtr<SerCompiledCond>;
     std::unordered_map<std::string, std::unordered_map<int64_t, std::unordered_set<txn_id_t>>> ser_rid_readers_;
-    std::unordered_map<std::string, std::unordered_map<txn_id_t, std::vector<std::vector<SerCompiledCond>>>> ser_pred_readers_;
+    std::unordered_map<std::string,
+        std::unordered_map<txn_id_t, std::vector<SerCompiledExprPtr>>> ser_pred_readers_;
     void ser_unindex(txn_id_t id, const SerInfo &info);
-    bool ser_compile_pred(const std::string &tab, const std::vector<Condition> &conds,
-                          std::vector<SerCompiledCond> &out);
-    static bool ser_compiled_match(const char *data, const std::vector<SerCompiledCond> &cs);
+    bool ser_compile_pred(const std::string &tab, const ConditionExprPtr &predicate,
+                          SerCompiledExprPtr &out);
+    static bool ser_compiled_match(const char *data, const SerCompiledExprPtr &predicate);
 
     void ser_begin(txn_id_t id, timestamp_t read_ts);
     void ser_finish(txn_id_t id, bool committed, timestamp_t commit_ts,
@@ -464,7 +469,6 @@ private:
     bool ser_add_edge(txn_id_t reader, txn_id_t writer);    // 加 rw 边 + 查危险结构(true=危险)
     bool ser_overlap(txn_id_t a, txn_id_t b);
     bool ser_dangerous(txn_id_t tin, txn_id_t tpiv, txn_id_t tout);
-    bool ser_record_matches(const std::string &tab, const char *data, const std::vector<Condition> &conds);
     size_t mvcc_shard_idx(const std::string &tab, int64_t rid_key = 0) const {
         size_t h = std::hash<std::string>{}(tab);
         if (rid_key) {

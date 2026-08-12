@@ -25,7 +25,10 @@ class IndexScanExecutor : public AbstractExecutor {
     std::string tab_name_;                      // 物理表名
     std::string binding_name_;                  // SQL 中的关系实例名
     TabMeta tab_;                               // 表的元数据
-    std::vector<Condition> predicates_;         // 当前 Scan 执行的局部谓词
+    // predicate_ 是查询语义的唯一来源；access_conditions_ 只能用来
+    // 收紧 B+树访问边界，不能代替逐行复核。
+    ConditionExprPtr predicate_;
+    std::vector<Condition> access_conditions_;
     RmFileHandle *fh_;                          // 表的数据文件句柄
     std::vector<ColMeta> cols_;                 // 需要读取的字段
     size_t len_;                                // 选取出来的一条记录的长度
@@ -76,8 +79,8 @@ class IndexScanExecutor : public AbstractExecutor {
         const char *rhs_val_data;
         int rhs_offset;
     };
-    std::vector<CompiledCond> compiled_;
-    bool need_eval_ = true;             // false = 所有 cond 都被 index range 吸收，跳过 eval
+    BoolExprPtr<CompiledCond> compiled_predicate_;
+    bool need_eval_ = true;             // 完整树始终残余复核；仅无谓词时为 false
     bool need_prefix_check_ = true;     // false = hi 是精确的（EQ 全匹配 或 range 上界），EQ 前缀检查冗余
 
     // 题9 MVCC：索引扫描与 SeqScan 同等对待——表进入 MVCC 脏态后，堆上的裸记录可能
@@ -90,20 +93,34 @@ class IndexScanExecutor : public AbstractExecutor {
     bool ser_on_ = false;
 
    public:
-    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
+    static ConditionExprPtr conditions_to_expr(std::vector<Condition> conditions) {
+        ConditionExprPtr result;
+        for (auto &condition : conditions) {
+            auto atom = make_bool_atom<Condition>(std::move(condition));
+            result = result == nullptr
+                         ? std::move(atom)
+                         : make_bool_binary<Condition>(BoolExprType::AND,
+                                                       std::move(result), std::move(atom));
+        }
+        return result;
+    }
+
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name,
+                      ConditionExprPtr predicate, std::vector<Condition> access_conditions,
                       std::vector<std::string> index_col_names, Context *context)
-        : IndexScanExecutor(sm_manager, tab_name, tab_name, std::move(conds),
-                            std::move(index_col_names), context) {}
+        : IndexScanExecutor(sm_manager, tab_name, tab_name, std::move(predicate),
+                            std::move(access_conditions), std::move(index_col_names), context) {}
 
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::string binding_name,
-                      std::vector<Condition> conds, std::vector<std::string> index_col_names,
-                      Context *context) {
+                      ConditionExprPtr predicate, std::vector<Condition> access_conditions,
+                      std::vector<std::string> index_col_names, Context *context) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
         binding_name_ = std::move(binding_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
-        predicates_ = std::move(conds);
+        predicate_ = std::move(predicate);
+        access_conditions_ = std::move(access_conditions);
         // index_no_ = index_no;
         index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
@@ -115,10 +132,12 @@ class IndexScanExecutor : public AbstractExecutor {
             {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
         };
 
-        for (auto &cond : predicates_) {
-            if (cond.lhs_col.tab_name != binding_name_) {
+        for (auto &cond : access_conditions_) {
+            if (!cond.lhs_col.tab_name.empty() && cond.lhs_col.tab_name != binding_name_) {
                 // lhs is on other table, now rhs must be on this table
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_);
+                if (cond.is_rhs_val || cond.rhs_col.tab_name != binding_name_) {
+                    throw InternalError("Index access condition does not reference scan binding");
+                }
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = swap_op.at(cond.op);
@@ -126,6 +145,22 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         table_record_size_ = fh_->get_file_hdr().record_size;
     }
+
+    // 兼容旧的 AND-vector 调用点。适配后仍立即构造完整树，
+    // 不在执行路径中保留第二套语义。
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name,
+                      std::vector<Condition> conds,
+                      std::vector<std::string> index_col_names, Context *context)
+        : IndexScanExecutor(sm_manager, std::move(tab_name),
+                            conditions_to_expr(conds), conds,
+                            std::move(index_col_names), context) {}
+
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::string binding_name,
+                      std::vector<Condition> conds,
+                      std::vector<std::string> index_col_names, Context *context)
+        : IndexScanExecutor(sm_manager, std::move(tab_name), std::move(binding_name),
+                            conditions_to_expr(conds), conds,
+                            std::move(index_col_names), context) {}
 
     ~IndexScanExecutor() override { release_table_page(); }
 
@@ -184,39 +219,14 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     /**
-     * 用 predicates_ 中的所有等值条件对单条记录做过滤
-     */
-    bool eval_conds(const RmRecord *rec) const {
-        for (const auto &cond : predicates_) {
-            auto col_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                return c.name == cond.lhs_col.col_name;
-            });
-            if (col_it == cols_.end()) return false;
-            const char *lhs = rec->data + col_it->offset;
-            const char *rhs;
-            if (cond.is_rhs_val) {
-                rhs = cond.rhs_val.raw->data;
-            } else {
-                auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                    return c.name == cond.rhs_col.col_name;
-                });
-                if (rhs_it == cols_.end()) return false;
-                rhs = rec->data + rhs_it->offset;
-            }
-            if (!cmp_bytes(lhs, rhs, col_it->len, col_it->type, cond.op)) return false;
-        }
-        return true;
-    }
-
-    /**
-     * 按索引列顺序分析 predicates_：找出前缀有多少 EQ 条件，并构造 EQ 前缀字节
+     * 按索引列顺序分析 access_conditions_：找出前缀有多少 EQ 条件，并构造 EQ 前缀字节
      */
     void analyze_conditions() {
         eq_match_count_ = 0;
         eq_prefix_data_.clear();
         for (const auto &col : index_meta_.cols) {
             bool found_eq = false;
-            for (const auto &cond : predicates_) {
+            for (const auto &cond : access_conditions_) {
                 if (cond.is_rhs_val && cond.op == OP_EQ &&
                     cond.lhs_col.tab_name == binding_name_ &&
                     cond.lhs_col.col_name == col.name) {
@@ -236,7 +246,7 @@ class IndexScanExecutor : public AbstractExecutor {
         skip_eq_data_.clear();
         if (eq_match_count_ == 0 && index_meta_.cols.size() >= 2) {
             bool first_has_cond = false;
-            for (const auto &cond : predicates_) {
+            for (const auto &cond : access_conditions_) {
                 if (cond.is_rhs_val && cond.lhs_col.tab_name == binding_name_ &&
                     cond.lhs_col.col_name == index_meta_.cols[0].name) {
                     first_has_cond = true;
@@ -247,7 +257,7 @@ class IndexScanExecutor : public AbstractExecutor {
                 for (size_t ci = 1; ci < index_meta_.cols.size(); ci++) {
                     const auto &col = index_meta_.cols[ci];
                     bool found_eq = false;
-                    for (const auto &cond : predicates_) {
+                    for (const auto &cond : access_conditions_) {
                         if (cond.is_rhs_val && cond.op == OP_EQ &&
                             cond.lhs_col.tab_name == binding_name_ &&
                             cond.lhs_col.col_name == col.name) {
@@ -469,67 +479,64 @@ class IndexScanExecutor : public AbstractExecutor {
         }
     }
 
-    /**
-     * 在 slot 指针上直接评估条件（无 alloc 版）
-     */
-    bool eval_conds_on_slot(const char *slot) const {
-        for (const auto &cond : predicates_) {
-            auto col_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                return c.name == cond.lhs_col.col_name;
-            });
-            if (col_it == cols_.end()) return false;
-            const char *lhs = slot + col_it->offset;
-            const char *rhs;
-            if (cond.is_rhs_val) {
-                rhs = cond.rhs_val.raw->data;
-            } else {
-                auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                    return c.name == cond.rhs_col.col_name;
-                });
-                if (rhs_it == cols_.end()) return false;
-                rhs = slot + rhs_it->offset;
+    CompiledCond compile_atom(const Condition &cond) const {
+        auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+            return c.name == cond.lhs_col.col_name &&
+                   (cond.lhs_col.tab_name.empty() || c.tab_name == cond.lhs_col.tab_name);
+        });
+        if (lhs_it == cols_.end()) throw ColumnNotFoundError(cond.lhs_col.col_name);
+
+        CompiledCond cc{};
+        cc.lhs_offset = lhs_it->offset;
+        cc.lhs_len = lhs_it->len;
+        cc.lhs_type = lhs_it->type;
+        cc.op = cond.op;
+        cc.is_rhs_val = cond.is_rhs_val;
+        if (cond.is_rhs_val) {
+            if (cond.rhs_val.raw == nullptr) {
+                throw InternalError("Index scan predicate literal has no raw value");
             }
-            if (!cmp_bytes(lhs, rhs, col_it->len, col_it->type, cond.op)) return false;
+            cc.rhs_val_data = cond.rhs_val.raw->data;
+            cc.rhs_offset = -1;
+        } else {
+            auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
+                return c.name == cond.rhs_col.col_name &&
+                       (cond.rhs_col.tab_name.empty() || c.tab_name == cond.rhs_col.tab_name);
+            });
+            if (rhs_it == cols_.end()) throw ColumnNotFoundError(cond.rhs_col.col_name);
+            cc.rhs_val_data = nullptr;
+            cc.rhs_offset = rhs_it->offset;
         }
-        return true;
+        return cc;
     }
 
-    void compile_conds() {
-        compiled_.clear();
-        compiled_.reserve(predicates_.size());
-        for (const auto &cond : predicates_) {
-            auto lhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                return c.name == cond.lhs_col.col_name;
-            });
-            if (lhs_it == cols_.end()) continue;
-            CompiledCond cc;
-            cc.lhs_offset = lhs_it->offset;
-            cc.lhs_len = lhs_it->len;
-            cc.lhs_type = lhs_it->type;
-            cc.op = cond.op;
-            cc.is_rhs_val = cond.is_rhs_val;
-            if (cond.is_rhs_val) {
-                cc.rhs_val_data = cond.rhs_val.raw->data;
-                cc.rhs_offset = -1;
-            } else {
-                auto rhs_it = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &c) {
-                    return c.name == cond.rhs_col.col_name;
-                });
-                if (rhs_it == cols_.end()) continue;
-                cc.rhs_val_data = nullptr;
-                cc.rhs_offset = rhs_it->offset;
-            }
-            compiled_.push_back(cc);
+    BoolExprPtr<CompiledCond> compile_expr(const ConditionExprPtr &expr) const {
+        if (expr == nullptr) return nullptr;
+        switch (expr->type) {
+            case BoolExprType::CONSTANT:
+                return make_bool_constant<CompiledCond>(expr->constant);
+            case BoolExprType::ATOM:
+                return make_bool_atom<CompiledCond>(compile_atom(expr->atom));
+            case BoolExprType::NOT:
+                return make_bool_not<CompiledCond>(compile_expr(expr->left));
+            case BoolExprType::AND:
+            case BoolExprType::OR:
+                return make_bool_binary<CompiledCond>(expr->type, compile_expr(expr->left),
+                                                       compile_expr(expr->right));
         }
+        throw InternalError("Unknown index scan boolean expression node");
     }
 
     bool eval_compiled(const char *slot) const {
-        for (const auto &cc : compiled_) {
+        const TruthValue result = evaluate_bool_expr(
+            compiled_predicate_, [&](const CompiledCond &cc) {
             const char *lhs = slot + cc.lhs_offset;
             const char *rhs = cc.is_rhs_val ? cc.rhs_val_data : slot + cc.rhs_offset;
-            if (!cmp_bytes(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)) return false;
-        }
-        return true;
+            return cmp_bytes(lhs, rhs, cc.lhs_len, cc.lhs_type, cc.op)
+                       ? TruthValue::TRUE_VALUE
+                       : TruthValue::FALSE_VALUE;
+        });
+        return result == TruthValue::TRUE_VALUE;
     }
 
     /**
@@ -580,14 +587,15 @@ class IndexScanExecutor : public AbstractExecutor {
         ser_on_ = context_ && context_->txn_mgr_ && context_->txn_ && context_->ser_in_select_ &&
                   context_->txn_mgr_->is_ser(context_->txn_);
         if (ser_on_) {
-            auto physical_conds = predicates_;
-            for (auto &cond : physical_conds) {
+            auto physical_predicate = map_bool_atoms<Condition>(predicate_, [&](const Condition &input) {
+                Condition cond = input;
                 if (cond.lhs_col.tab_name == binding_name_) cond.lhs_col.tab_name = tab_name_;
                 if (!cond.is_rhs_val && cond.rhs_col.tab_name == binding_name_) cond.rhs_col.tab_name = tab_name_;
-            }
-            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, physical_conds);
+                return cond;
+            });
+            context_->txn_mgr_->ser_record_pred(context_->txn_, tab_name_, physical_predicate);
             // 读侧(谓词)：匹配本谓词但快照不可见的他事务写(幻影插入) → rw 反依赖；危险结构则 abort
-            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, physical_conds))
+            if (context_->txn_mgr_->ser_read_pred_check(context_->txn_, tab_name_, physical_predicate))
                 throw TransactionAbortException(context_->txn_->get_transaction_id(),
                                                 AbortReason::SSI_DANGEROUS_STRUCTURE);
         }
@@ -595,7 +603,7 @@ class IndexScanExecutor : public AbstractExecutor {
             sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
 
         analyze_conditions();
-        compile_conds();
+        compiled_predicate_ = compile_expr(predicate_);
         range_exhausted_ = false;
         positioned_ = false;   // 嵌套循环 join 会反复 beginTuple，须清上轮定位态
         ih_ = ih;
@@ -603,7 +611,7 @@ class IndexScanExecutor : public AbstractExecutor {
         if (skip_mode_) {
             // index skip scan：从索引最小首列值起逐值枚举
             skip_done_ = false;
-            need_eval_ = !predicates_.empty();
+            need_eval_ = predicate_ != nullptr;
             need_prefix_check_ = true;
             if ((int)cur_key_buf_.size() < index_meta_.col_tot_len) {
                 cur_key_buf_.resize(index_meta_.col_tot_len);
@@ -637,7 +645,7 @@ class IndexScanExecutor : public AbstractExecutor {
         bool lower_inclusive = false, upper_inclusive = false;
         if (eq_match_count_ < (int)index_meta_.cols.size()) {
             const auto &range_col = index_meta_.cols[eq_match_count_];
-            for (const auto &cond : predicates_) {
+            for (const auto &cond : access_conditions_) {
                 if (!cond.is_rhs_val) continue;
                 if (cond.lhs_col.tab_name != binding_name_) continue;
                 if (cond.lhs_col.col_name != range_col.name) continue;
@@ -688,7 +696,7 @@ class IndexScanExecutor : public AbstractExecutor {
         }
 
         // 逐行防线不变：所有值条件始终 eval；EQ 前缀检查始终开启（早期硬停）。
-        need_eval_ = !predicates_.empty();
+        need_eval_ = predicate_ != nullptr;
         need_prefix_check_ = (eq_match_count_ > 0);
 
         scan_ = std::make_unique<IxScan>(ih, start_key.data(), end_key.data(), end_incl,

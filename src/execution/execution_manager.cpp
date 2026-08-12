@@ -51,7 +51,12 @@ const char *help_info = "Supported SQL syntax:\n"
                    "type:\n"
                    "  {INT | FLOAT | CHAR(n)}\n"
                    "where_clause:\n"
-                   "  condition [AND condition ...]\n"
+                   "  boolean_expression\n"
+                   "boolean_expression:\n"
+                   "  condition | NOT boolean_expression | (boolean_expression)\n"
+                   "  boolean_expression AND boolean_expression\n"
+                   "  boolean_expression OR boolean_expression\n"
+                   "  (precedence: NOT, AND, OR)\n"
                    "condition:\n"
                    "  column op {column | value}\n"
                    "column:\n"
@@ -216,9 +221,65 @@ std::string cond_to_string(const Condition &cond) {
     return os.str();
 }
 
+int predicate_precedence(BoolExprType type) {
+    switch (type) {
+        case BoolExprType::OR: return 1;
+        case BoolExprType::AND: return 2;
+        case BoolExprType::NOT: return 3;
+        case BoolExprType::CONSTANT:
+        case BoolExprType::ATOM: return 4;
+    }
+    return 0;
+}
+
+std::string predicate_to_string(const ConditionExprPtr &predicate, int parent_precedence = 0) {
+    if (predicate == nullptr) return "TRUE";
+    const int precedence = predicate_precedence(predicate->type);
+    std::string text;
+    switch (predicate->type) {
+        case BoolExprType::CONSTANT:
+            if (predicate->constant == TruthValue::TRUE_VALUE) text = "TRUE";
+            else if (predicate->constant == TruthValue::FALSE_VALUE) text = "FALSE";
+            else text = "UNKNOWN";
+            break;
+        case BoolExprType::ATOM:
+            text = cond_to_string(predicate->atom);
+            break;
+        case BoolExprType::NOT:
+            text = "NOT " + predicate_to_string(predicate->left, precedence);
+            break;
+        case BoolExprType::AND:
+        case BoolExprType::OR: {
+            const char *op = predicate->type == BoolExprType::AND ? " AND " : " OR ";
+            text = predicate_to_string(predicate->left, precedence) + op +
+                   predicate_to_string(predicate->right, precedence);
+            break;
+        }
+    }
+    if (precedence < parent_precedence) return "(" + text + ")";
+    return text;
+}
+
+// 保持已有纯 AND EXPLAIN 输出的逗号列表格式；一旦出现 OR/NOT，
+// 则按优先级渲染完整树，避免展示结果暗示错误的合取语义。
+std::string predicate_list_to_string(const ConditionExprPtr &predicate) {
+    if (predicate == nullptr) return "";
+    std::vector<ConditionExprPtr> conjuncts;
+    split_top_level_and(predicate, conjuncts);
+    if (std::all_of(conjuncts.begin(), conjuncts.end(), [](const ConditionExprPtr &part) {
+            return part != nullptr && part->type == BoolExprType::ATOM;
+        })) {
+        std::vector<std::string> conditions;
+        conditions.reserve(conjuncts.size());
+        for (const auto &part : conjuncts) conditions.push_back(cond_to_string(part->atom));
+        return join_strings_sorted(std::move(conditions));
+    }
+    return predicate_to_string(predicate);
+}
+
 size_t count_scan_rows(SmManager *sm_manager, const ScanPlan &scan) {
     size_t count = 0;
-    SeqScanExecutor exec(sm_manager, scan.tab_name_, scan.binding_name_, scan.predicates_, nullptr);
+    SeqScanExecutor exec(sm_manager, scan.tab_name_, scan.binding_name_, scan.predicate_, nullptr);
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) count++;
     return count;
 }
@@ -257,14 +318,14 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
     if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
         auto child = make_explain_executor(sm_manager, filter->subplan_, correlated);
         if (child == nullptr) return nullptr;
-        return std::make_unique<FilterExecutor>(std::move(child), filter->predicates_);
+        return std::make_unique<FilterExecutor>(std::move(child), filter->predicate_);
     }
     if (auto filter = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
         if (correlated == nullptr) return nullptr;
         auto child = make_explain_executor(sm_manager, filter->subplan_, correlated);
         if (child == nullptr) return nullptr;
         return std::make_unique<CorrelatedFilterExecutor>(
-            std::move(child), filter->predicates_, correlated);
+            std::move(child), filter->predicate_, correlated);
     }
     if (auto rename = std::dynamic_pointer_cast<RenamePlan>(plan)) {
         auto child = make_explain_executor(sm_manager, rename->subplan_, correlated);
@@ -275,7 +336,7 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
         // 统计只关心真实输出行；统一用顺序扫描可避免把 EXPLAIN 绑定到某个
         // 物理索引游标，同时仍执行完全相同的局部谓词。
         return std::make_unique<SeqScanExecutor>(sm_manager, scan->tab_name_, scan->binding_name_,
-                                                 scan->predicates_, nullptr);
+                                                 scan->predicate_, nullptr);
     }
     if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         auto left = make_explain_executor(sm_manager, join->left_, correlated);
@@ -285,21 +346,21 @@ std::unique_ptr<AbstractExecutor> make_explain_executor(SmManager *sm_manager,
             auto right = make_explain_executor(sm_manager, join->right_, lateral_context);
             if (right == nullptr) return nullptr;
             return std::make_unique<LateralNestedLoopJoinExecutor>(
-                std::move(left), std::move(right), join->on_predicates_, join->type,
+                std::move(left), std::move(right), join->on_predicate_, join->type,
                 std::move(lateral_context));
         }
         auto right = make_explain_executor(sm_manager, join->right_, correlated);
         if (right == nullptr) return nullptr;
         return std::make_unique<NestedLoopJoinExecutor>(
             std::move(left), std::move(right),
-            join->on_predicates_, join->type, join->coalesced_cols_);
+            join->on_predicate_, join->type, join->coalesced_cols_);
     }
     if (auto agg = std::dynamic_pointer_cast<AggPlan>(plan)) {
         auto child = make_explain_executor(sm_manager, agg->subplan_, correlated);
         if (child == nullptr) return nullptr;
         return std::make_unique<AggExecutor>(
             std::move(child), agg->group_cols_, agg->agg_exprs_,
-            agg->having_conds_, agg->output_cols_);
+            agg->having_expr_, agg->output_cols_);
     }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         auto child = make_explain_executor(sm_manager, sort->subplan_, correlated);
@@ -433,10 +494,8 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         return;
     }
     if (auto filter = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
-        std::vector<std::string> conds;
-        for (const auto &cond : filter->predicates_) conds.push_back(cond_to_string(cond));
         lines.push_back(std::string(depth, '\t') + "CorrelatedFilter(condition=[" +
-                        join_strings_sorted(conds) + "])");
+                        predicate_list_to_string(filter->predicate_) + "])");
         render_explain_plan(sm_manager, filter->subplan_, depth + 1, outer_rows,
                             forced_rows, false, lines, correlated_rows);
         return;
@@ -449,10 +508,8 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         return;
     }
     if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
-        std::vector<std::string> conds;
-        for (const auto &cond : filter->predicates_) conds.push_back(cond_to_string(cond));
         lines.push_back(std::string(depth, '\t') + "Filter(condition=[" +
-                        join_strings_sorted(conds) + "])");
+                        predicate_list_to_string(filter->predicate_) + "])");
         render_explain_plan(sm_manager, filter->subplan_, depth + 1, outer_rows,
                             forced_rows, false, lines, correlated_rows);
         return;
@@ -492,10 +549,9 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         const std::string relation = scan->binding_name_ == scan->tab_name_
                                          ? scan->tab_name_
                                          : scan->tab_name_ + " AS " + scan->binding_name_;
-        if (!scan->predicates_.empty()) {
-            std::vector<std::string> predicates;
-            for (const auto &cond : scan->predicates_) predicates.push_back(cond_to_string(cond));
-            lines.push_back(indent + "Filter(condition=[" + join_strings_sorted(predicates) +
+        if (scan->predicate_ != nullptr) {
+            lines.push_back(indent + "Filter(condition=[" +
+                            predicate_list_to_string(scan->predicate_) +
                             "], rows=" + std::to_string(rows) + ")");
             indent.push_back('\t');
         }
@@ -504,7 +560,7 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         if (fh != sm_manager->fhs_.end() && fh->second != nullptr) {
             for (RmScan raw_scan(fh->second.get()); !raw_scan.is_end(); raw_scan.next()) raw_rows++;
         }
-        std::string scan_line = std::string(depth + (scan->predicates_.empty() ? 0 : 1), '\t') +
+        std::string scan_line = std::string(depth + (scan->predicate_ == nullptr ? 0 : 1), '\t') +
                                 "Scan(table=" + relation + ", type=" +
                                 (scan->tag == T_IndexScan ? "IndexScan" : "SeqScan");
         if (scan->tag == T_IndexScan && !scan->index_col_names_.empty()) {
@@ -525,8 +581,6 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         size_t join_rows = count_plan_output(sm_manager, plan, correlated_rows);
         auto tables = plan_table_set(plan);
         std::vector<std::string> table_names(tables.begin(), tables.end());
-        std::vector<std::string> conds;
-        for (auto &cond : join->on_predicates_) conds.push_back(cond_to_string(cond));
         static const std::map<JoinType, std::string> join_types = {
             {INNER_JOIN, "INNER"}, {LEFT_JOIN, "LEFT"}, {RIGHT_JOIN, "RIGHT"},
             {FULL_JOIN, "FULL"}, {CROSS_JOIN, "CROSS"},
@@ -544,7 +598,8 @@ void render_explain_plan(SmManager *sm_manager, const std::shared_ptr<Plan> &pla
         const std::string type_field = legacy_inner ? "" : "type=" + type_name + ", ";
         lines.push_back(indent + "Join(" + type_field + "tables=[" +
                         join_strings_sorted(table_names) + "], condition=[" +
-                        join_strings_sorted(conds) + "], rows=" + std::to_string(join_rows) + ")");
+                        predicate_list_to_string(join->on_predicate_) + "], rows=" +
+                        std::to_string(join_rows) + ")");
         render_explain_plan(sm_manager, join->left_, depth + 1, 1, -1, false, lines,
                             correlated_rows);
         bool inlj = join->tag == T_IndexNestLoop;

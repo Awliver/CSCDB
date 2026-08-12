@@ -33,7 +33,7 @@ class LateralNestedLoopJoinExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> left_;
     std::unique_ptr<AbstractExecutor> right_;
-    std::vector<Condition> on_predicates_;
+    ConditionExprPtr on_predicate_;
     JoinType join_type_ = INNER_JOIN;
     std::shared_ptr<CorrelatedTupleContext> correlated_;
 
@@ -104,27 +104,33 @@ class LateralNestedLoopJoinExecutor : public AbstractExecutor {
         return result;
     }
 
-    bool matches_on(const RmRecord &right_record) const {
-        for (const auto &predicate : on_predicates_) {
-            const auto lhs = require_join_operand(predicate.lhs_col, right_record);
-            if (lhs.is_null) return false;
+    TruthValue evaluate_on_atom(const Condition &predicate,
+                                const RmRecord &right_record) const {
+        const auto lhs = require_join_operand(predicate.lhs_col, right_record);
+        if (lhs.is_null) return TruthValue::UNKNOWN_VALUE;
 
-            CorrelatedTupleContext::Operand rhs;
-            if (predicate.is_rhs_val) {
-                if (predicate.rhs_val.raw == nullptr) {
-                    throw InternalError("LATERAL JOIN predicate literal has no raw value");
-                }
-                rhs.data = predicate.rhs_val.raw->data;
-                rhs.len = predicate.rhs_val.raw->size;
-                rhs.type = predicate.rhs_val.type;
-                rhs.found = true;
-            } else {
-                rhs = require_join_operand(predicate.rhs_col, right_record);
-                if (rhs.is_null) return false;
+        CorrelatedTupleContext::Operand rhs;
+        if (predicate.is_rhs_val) {
+            if (predicate.rhs_val.raw == nullptr) {
+                throw InternalError("LATERAL JOIN predicate literal has no raw value");
             }
-            if (!correlated_executor_detail::compare_operands(lhs, rhs, predicate.op)) return false;
+            rhs.data = predicate.rhs_val.raw->data;
+            rhs.len = predicate.rhs_val.raw->size;
+            rhs.type = predicate.rhs_val.type;
+            rhs.found = true;
+        } else {
+            rhs = require_join_operand(predicate.rhs_col, right_record);
+            if (rhs.is_null) return TruthValue::UNKNOWN_VALUE;
         }
-        return true;
+        return correlated_executor_detail::compare_operands(lhs, rhs, predicate.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
+    }
+
+    bool matches_on(const RmRecord &right_record) const {
+        return evaluate_bool_expr(on_predicate_, [&](const Condition &predicate) {
+                   return evaluate_on_atom(predicate, right_record);
+               }) == TruthValue::TRUE_VALUE;
     }
 
     void set_output_nulls(bool null_extend_right) {
@@ -208,11 +214,11 @@ class LateralNestedLoopJoinExecutor : public AbstractExecutor {
    public:
     LateralNestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left,
                                   std::unique_ptr<AbstractExecutor> right,
-                                  std::vector<Condition> on_predicates,
+                                  ConditionExprPtr on_predicate,
                                   JoinType join_type,
                                   std::shared_ptr<CorrelatedTupleContext> correlated)
         : left_(std::move(left)), right_(std::move(right)),
-          on_predicates_(std::move(on_predicates)), join_type_(join_type),
+          on_predicate_(std::move(on_predicate)), join_type_(join_type),
           correlated_(std::move(correlated)) {
         if (left_ == nullptr || right_ == nullptr || correlated_ == nullptr) {
             throw InternalError("LateralNestedLoopJoinExecutor requires children and context");
@@ -220,7 +226,7 @@ class LateralNestedLoopJoinExecutor : public AbstractExecutor {
         if (join_type_ != INNER_JOIN && join_type_ != CROSS_JOIN && join_type_ != LEFT_JOIN) {
             throw InternalError("LATERAL JOIN supports only INNER, CROSS, and LEFT");
         }
-        if (join_type_ == CROSS_JOIN && !on_predicates_.empty()) {
+        if (join_type_ == CROSS_JOIN && on_predicate_ != nullptr) {
             throw InternalError("CROSS JOIN LATERAL cannot have an ON predicate");
         }
 
@@ -230,6 +236,16 @@ class LateralNestedLoopJoinExecutor : public AbstractExecutor {
         for (auto &column : right_columns) column.offset += left_->tupleLen();
         cols_.insert(cols_.end(), right_columns.begin(), right_columns.end());
     }
+
+    LateralNestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left,
+                                  std::unique_ptr<AbstractExecutor> right,
+                                  std::vector<Condition> on_predicates,
+                                  JoinType join_type,
+                                  std::shared_ptr<CorrelatedTupleContext> correlated)
+        : LateralNestedLoopJoinExecutor(
+              std::move(left), std::move(right),
+              SeqScanExecutor::conditions_to_expr(std::move(on_predicates)), join_type,
+              std::move(correlated)) {}
 
     ~LateralNestedLoopJoinExecutor() override { correlated_->clear(); }
 

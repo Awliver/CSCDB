@@ -201,24 +201,25 @@ class Portal
                                                         x->sel_cols_);
         } else if (auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
             return std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context, correlated),
-                                                    x->predicates_);
+                                                    x->predicate_);
         } else if (auto x = std::dynamic_pointer_cast<CorrelatedFilterPlan>(plan)) {
             if (correlated == nullptr) {
                 throw InternalError("Correlated filter used outside LATERAL JOIN");
             }
             return std::make_unique<CorrelatedFilterExecutor>(
-                convert_plan_executor(x->subplan_, context, correlated), x->predicates_, correlated);
+                convert_plan_executor(x->subplan_, context, correlated), x->predicate_, correlated);
         } else if (auto x = std::dynamic_pointer_cast<RenamePlan>(plan)) {
             return std::make_unique<RenameExecutor>(
                 convert_plan_executor(x->subplan_, context, correlated), x->output_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->binding_name_,
-                                                         x->predicates_, context);
+                                                         x->predicate_, context);
             }
             else {
                 return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->binding_name_,
-                                                           x->predicates_, x->index_col_names_, context);
+                                                           x->predicate_, x->access_conditions_,
+                                                           x->index_col_names_, context);
             } 
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context, correlated);
@@ -227,19 +228,19 @@ class Portal
                 std::unique_ptr<AbstractExecutor> right =
                     convert_plan_executor(x->right_, context, lateral_context);
                 return std::make_unique<LateralNestedLoopJoinExecutor>(
-                    std::move(left), std::move(right), x->on_predicates_, x->type,
+                    std::move(left), std::move(right), x->on_predicate_, x->type,
                     std::move(lateral_context));
             }
             if (x->tag == T_IndexNestLoop) {
                 auto right_scan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
                 if (right_scan == nullptr) throw InternalError("Unexpected INLJ right plan");
                 return std::make_unique<IndexNestedLoopJoinExecutor>(std::move(left), sm_manager_, *right_scan,
-                                                                     x->on_predicates_, context);
+                                                                     x->on_predicate_, context);
             }
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context, correlated);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                                 std::move(left), 
-                                std::move(right), x->on_predicates_, x->type,
+                                std::move(right), x->on_predicate_, x->type,
                                 x->coalesced_cols_);
             return join;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
@@ -264,7 +265,7 @@ class Portal
         } else if(auto x = std::dynamic_pointer_cast<AggPlan>(plan)) {
             return std::make_unique<AggExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                  x->group_cols_, x->agg_exprs_,
-                                                 x->having_conds_, x->output_cols_);
+                                                 x->having_expr_, x->output_cols_);
         } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
             return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context, correlated),
                                                    x->limit_);

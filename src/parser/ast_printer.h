@@ -90,7 +90,9 @@ private:
     static void print_node(const std::shared_ptr<TreeNode> &node, int offset) {
         std::cout << offset2string(offset);
         offset += 2;
-        if (auto x = std::dynamic_pointer_cast<Help>(node)) {
+        if (node == nullptr) {
+            std::cout << "NONE\n";
+        } else if (auto x = std::dynamic_pointer_cast<Help>(node)) {
             std::cout << "HELP\n";
         } else if (auto x = std::dynamic_pointer_cast<ShowTables>(node)) {
             std::cout << "SHOW_TABLES\n";
@@ -150,6 +152,13 @@ private:
             else print_node(x->lhs, offset);
             print_val(op2str(x->op), offset);
             print_node(x->rhs, offset);
+        } else if (auto x = std::dynamic_pointer_cast<LogicalExpr>(node)) {
+            std::cout << (x->op == LogicalOp::AND ? "AND\n" : "OR\n");
+            print_node(x->left, offset);
+            print_node(x->right, offset);
+        } else if (auto x = std::dynamic_pointer_cast<NotExpr>(node)) {
+            std::cout << "NOT\n";
+            print_node(x->child, offset);
         } else if (auto x = std::dynamic_pointer_cast<InsertStmt>(node)) {
             std::cout << "INSERT\n";
             print_val(x->tab_name, offset);
@@ -157,12 +166,12 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<DeleteStmt>(node)) {
             std::cout << "DELETE\n";
             print_val(x->tab_name, offset);
-            print_node_list(x->conds, offset);
+            print_node(x->where_expr, offset);
         } else if (auto x = std::dynamic_pointer_cast<UpdateStmt>(node)) {
             std::cout << "UPDATE\n";
             print_val(x->tab_name, offset);
             print_node_list(x->set_clauses, offset);
-            print_node_list(x->conds, offset);
+            print_node(x->where_expr, offset);
         } else if (auto x = std::dynamic_pointer_cast<TableRef>(node)) {
             std::cout << "TABLE_REF\n";
             print_val(x->tab_name, offset);
@@ -181,7 +190,7 @@ private:
                 if (x->on_true) {
                     print_val("TRUE", offset + 2);
                 } else {
-                    print_node_list(x->on_conds, offset + 2);
+                    print_node(x->on_expr, offset + 2);
                 }
             }
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
@@ -190,7 +199,15 @@ private:
             print_val("FROM", offset);
             print_node(x->from, offset + 2);
             print_val("WHERE", offset);
-            print_node_list(x->where_conds, offset + 2);
+            print_node(x->where_expr, offset + 2);
+            if (!x->group_by_cols.empty()) {
+                print_val("GROUP_BY", offset);
+                print_node_list(x->group_by_cols, offset + 2);
+            }
+            if (x->having_expr != nullptr) {
+                print_val("HAVING", offset);
+                print_node(x->having_expr, offset + 2);
+            }
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

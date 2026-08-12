@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "executor_abstract.h"
+#include "executor_seq_scan.h"
 
 /*
  * A non-owning view of the current outer tuple of a correlated subquery.
@@ -137,7 +138,7 @@ inline bool compare_operands(const CorrelatedTupleContext::Operand &lhs,
 class CorrelatedFilterExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> child_;
-    std::vector<Condition> predicates_;
+    ConditionExprPtr predicate_;
     std::shared_ptr<CorrelatedTupleContext> correlated_;
     std::unique_ptr<RmRecord> current_;
     std::vector<bool> current_nulls_;
@@ -172,10 +173,10 @@ class CorrelatedFilterExecutor : public AbstractExecutor {
         throw ColumnNotFoundError(target.col_name);
     }
 
-    bool evaluate(const Condition &predicate, const RmRecord &record,
-                  const std::vector<bool> &nulls) const {
+    TruthValue evaluate(const Condition &predicate, const RmRecord &record,
+                        const std::vector<bool> &nulls) const {
         const auto lhs = find_operand(predicate.lhs_col, record, nulls);
-        if (lhs.is_null) return false;
+        if (lhs.is_null) return TruthValue::UNKNOWN_VALUE;
 
         CorrelatedTupleContext::Operand rhs;
         if (predicate.is_rhs_val) {
@@ -188,16 +189,17 @@ class CorrelatedFilterExecutor : public AbstractExecutor {
             rhs.found = true;
         } else {
             rhs = find_operand(predicate.rhs_col, record, nulls);
-            if (rhs.is_null) return false;
+            if (rhs.is_null) return TruthValue::UNKNOWN_VALUE;
         }
-        return correlated_executor_detail::compare_operands(lhs, rhs, predicate.op);
+        return correlated_executor_detail::compare_operands(lhs, rhs, predicate.op)
+                   ? TruthValue::TRUE_VALUE
+                   : TruthValue::FALSE_VALUE;
     }
 
     bool matches(const RmRecord &record, const std::vector<bool> &nulls) const {
-        for (const auto &predicate : predicates_) {
-            if (!evaluate(predicate, record, nulls)) return false;
-        }
-        return true;
+        return evaluate_bool_expr(predicate_, [&](const Condition &predicate) {
+                   return evaluate(predicate, record, nulls);
+               }) == TruthValue::TRUE_VALUE;
     }
 
     void seek_match() {
@@ -223,14 +225,21 @@ class CorrelatedFilterExecutor : public AbstractExecutor {
 
    public:
     CorrelatedFilterExecutor(std::unique_ptr<AbstractExecutor> child,
-                             std::vector<Condition> predicates,
+                             ConditionExprPtr predicate,
                              std::shared_ptr<CorrelatedTupleContext> correlated)
-        : child_(std::move(child)), predicates_(std::move(predicates)),
+        : child_(std::move(child)), predicate_(std::move(predicate)),
           correlated_(std::move(correlated)) {
         if (child_ == nullptr || correlated_ == nullptr) {
             throw InternalError("CorrelatedFilterExecutor requires child and context");
         }
     }
+
+    CorrelatedFilterExecutor(std::unique_ptr<AbstractExecutor> child,
+                             std::vector<Condition> predicates,
+                             std::shared_ptr<CorrelatedTupleContext> correlated)
+        : CorrelatedFilterExecutor(
+              std::move(child), SeqScanExecutor::conditions_to_expr(std::move(predicates)),
+              std::move(correlated)) {}
 
     void beginTuple() override {
         child_->beginTuple();

@@ -38,7 +38,8 @@ bool mvcc_force_seqscan(Context *context, const std::string &tab, size_t n_table
 // 最左匹配规则：对表上每条索引按 cols 顺序贪心匹配前缀。
 // 列要么能找到 OP_EQ 条件（继续匹配后续列），要么找到 OP_LT/GT/LE/GE 条件（匹配此列后停止）。
 // 跨多条索引时选匹配前缀最长的。
-bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds,
+bool Planner::get_index_cols(const std::string &tab_name,
+                             const std::vector<Condition> &curr_conds,
                              std::vector<std::string>& index_col_names,
                              const std::string &binding_name) {
     index_col_names.clear();
@@ -118,7 +119,7 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
 
     if (best_match_len == 0) return false;
     // 输出整条索引的全部 col_names（让 get_index_meta 能完整命中）
-    // IndexScanExecutor 自己再分析 predicates_ 决定能用几列做 key
+    // IndexScanExecutor 自己再分析 access_conditions_ 决定能用几列做 key
     for (auto& col : best_index->cols) {
         index_col_names.push_back(col.name);
     }
@@ -143,10 +144,10 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::str
         return false;
     };
 
-    int best_match_len = 0;
+    size_t best_match_len = 0;
     const IndexMeta *best_index = nullptr;
     for (auto &index : tab.indexes) {
-        int match_len = 0;
+        size_t match_len = 0;
         for (auto &idx_col : index.cols) {
             bool matched = false;
             for (auto &cond : scan_conds) {
@@ -160,28 +161,27 @@ bool Planner::get_join_index_cols(const std::string &right_table, const std::str
             if (!matched) break;
             match_len++;
         }
-        if (match_len > best_match_len) {
+        // INLJ uses an exact B+tree get_value probe, so every component of a
+        // composite key must be supplied by a positive equality conjunct.
+        // A normal IndexScan can use a prefix/range; an INLJ exact probe cannot.
+        if (match_len != index.cols.size()) continue;
+        const bool has_join_key = std::any_of(
+            index.cols.begin(), index.cols.end(),
+            [&](const ColMeta &col) { return is_join_eq_on_col(col.name); });
+        if (has_join_key && match_len > best_match_len) {
             best_match_len = match_len;
             best_index = &index;
         }
     }
 
-    if (best_match_len == 0 || best_index == nullptr) return false;
-    bool has_join_key = false;
-    for (auto &col : best_index->cols) {
-        if (is_join_eq_on_col(col.name)) {
-            has_join_key = true;
-            break;
-        }
-    }
-    if (!has_join_key) return false;
+    if (best_index == nullptr) return false;
 
     for (auto &col : best_index->cols) index_col_names.push_back(col.name);
     return true;
 }
 
 std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
-                                              std::vector<Condition> join_conds,
+                                              ConditionExprPtr join_predicate,
                                               JoinType join_type, Context *context,
                                               bool natural, bool lateral,
                                               std::vector<CoalescedJoinColumn> coalesced_cols) {
@@ -191,11 +191,15 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
         right_scan = std::dynamic_pointer_cast<ScanPlan>(right_projection->subplan_);
     }
     if (join_type == INNER_JOIN && !natural && !lateral && right_scan != nullptr &&
-        !mvcc_force_seqscan(context, right_scan->tab_name_, 2, right_scan->predicates_)) {
-            // 只有 INNER JOIN 才选择 INLJ
+        !mvcc_force_seqscan(context, right_scan->tab_name_, 2,
+                            right_scan->access_conditions_)) {
+        // 只有 INNER JOIN 才选择 INLJ
+        std::vector<Condition> join_access_conditions;
+        extract_conjunctive_atoms(join_predicate, join_access_conditions);
         std::vector<std::string> index_col_names;
         if (get_join_index_cols(right_scan->tab_name_, right_scan->binding_name_,
-                                right_scan->predicates_, join_conds, index_col_names)) {
+                                right_scan->access_conditions_, join_access_conditions,
+                                index_col_names)) {
             right_scan->tag = T_IndexScan;
             right_scan->index_col_names_ = std::move(index_col_names);
             // IndexNestedLoopJoinExecutor 需要直接接收 ScanPlan。若逻辑优化已在
@@ -206,16 +210,17 @@ std::shared_ptr<Plan> Planner::make_join_plan(std::shared_ptr<Plan> left, std::s
                 output_cols.insert(output_cols.end(), right_projection->sel_cols_.begin(),
                                    right_projection->sel_cols_.end());
                 auto join = std::make_shared<JoinPlan>(T_IndexNestLoop, join_type, std::move(left),
-                                                       std::move(right_scan), std::move(join_conds));
+                                                       std::move(right_scan),
+                                                       std::move(join_predicate));
                 return std::make_shared<ProjectionPlan>(T_Projection, std::move(join),
                                                         std::move(output_cols));
             }
             return std::make_shared<JoinPlan>(T_IndexNestLoop, join_type, std::move(left), std::move(right),
-                                              std::move(join_conds));
+                                              std::move(join_predicate));
         }
     }
     return std::make_shared<JoinPlan>(T_NestLoop, join_type, std::move(left), std::move(right),
-                                      std::move(join_conds), natural, lateral,
+                                      std::move(join_predicate), natural, lateral,
                                       std::move(coalesced_cols));
 }
 
@@ -282,8 +287,9 @@ static bool has_range_cond(const std::vector<Condition> &conds, const std::strin
 // 题9：SER 显式事务下是否强制 SeqScan（放弃 IndexScan）。仅影响显式 SER 事务
 // （is_ser 要求 txn_mode）；autocommit 单语句不走此分支。
 //
-// 两种情况必须强制 SeqScan：
-//   1) join（n_tables>1）：INLJ 内表读尚无 SSI 跟踪钩子，走索引会漏检危险结构；
+// 两种情况继续强制 SeqScan：
+//   1) join（n_tables>1）：保留显式 SER 事务既有的保守读集/输出顺序契约；
+//      INLJ 现在虽已能登记完整谓词树，这里仍不改变事务计划选择策略；
 //   2) 单表【范围查询】：IndexScan 按索引序返回、SeqScan 按堆(插入)序返回，行序不同；
 //      题九并发测试逐字比对 SELECT 输出、期望值是旧的强制 SeqScan(插入序)所生成，
 //      范围查询改走 IndexScan 会因行序不符而失败。
@@ -326,9 +332,12 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         }
     }
 
-    auto condition_bindings = [](const Condition &cond) {
-        BindingSet result{cond.lhs_col.tab_name};
-        if (!cond.is_rhs_val) result.insert(cond.rhs_col.tab_name);
+    auto condition_bindings = [](const ConditionExprPtr &expr) {
+        BindingSet result;
+        visit_bool_atoms(expr, [&](const Condition &cond) {
+            result.insert(cond.lhs_col.tab_name);
+            if (!cond.is_rhs_val) result.insert(cond.rhs_col.tab_name);
+        });
         result.erase("");
         return result;
     };
@@ -347,8 +356,9 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         return is_inner_group(node->left) && is_inner_group(node->right);
     };
 
-    std::map<std::string, std::vector<Condition>> scan_filters; // 对应表的 ScabPlan
-    std::map<const AnalyzedFrom *, std::vector<Condition>> join_filters; // 对应 JoinPlan 的 ON 条件
+    // 优化器只拆最外层 AND；每个 OR/NOT 子树在以下容器中始终是一个整体。
+    std::map<std::string, std::vector<ConditionExprPtr>> scan_filters;
+    std::map<const AnalyzedFrom *, std::vector<ConditionExprPtr>> join_filters;
 
     /*
         ON 条件只在不改变外连接补行语义时下推
@@ -366,8 +376,10 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         prepare_on(node->right); // 递归处理右子树
         const auto left_names = node_bindings(node->left);
         const auto right_names = node_bindings(node->right);
-        for (const auto &cond : node->on_conds) {
-            const auto names = condition_bindings(cond);
+        std::vector<ConditionExprPtr> conjuncts;
+        split_top_level_and(node->on_expr, conjuncts);
+        for (const auto &predicate : conjuncts) {
+            const auto names = condition_bindings(predicate);
             if (names.size() == 1) {
                 const auto &name = *names.begin();
                 const bool in_left = left_names.count(name) != 0; // 单表条件是在左侧
@@ -377,11 +389,11 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
                 const bool push_right = !node->lateral && in_right && is_inner_group(node->right) &&
                     (node->join_type == INNER_JOIN || node->join_type == LEFT_JOIN);
                 if (push_left || push_right) {
-                    scan_filters[name].push_back(cond); // 能下推
+                    scan_filters[name].push_back(predicate); // 能下推
                     continue;
                 }
             }
-            join_filters[node.get()].push_back(cond); // 不能下推
+            join_filters[node.get()].push_back(predicate); // 不能下推
         }
     };
     prepare_on(query->from);
@@ -408,16 +420,18 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         return false;
     };
 
-    std::vector<Condition> post_join_filters; // 整颗 jointree 上发的 FilterPlan
-    for (const auto &cond : query->where_conds) { // 最终分类
-        const auto names = condition_bindings(cond);
+    std::vector<ConditionExprPtr> post_join_filters; // 整颗 jointree 上发的 FilterPlan
+    std::vector<ConditionExprPtr> where_conjuncts;
+    split_top_level_and(query->where_expr, where_conjuncts);
+    for (const auto &predicate : where_conjuncts) { // 最终分类
+        const auto names = condition_bindings(predicate);
         if (names.size() == 1 && where_pushable(query->from, *names.begin())) {
-            scan_filters[*names.begin()].push_back(cond); // 只涉及到一张表，且路径安全，则可下推
+            scan_filters[*names.begin()].push_back(predicate); // 只涉及到一张表，且路径安全，则可下推
         } else if (names.size() > 1 && is_inner_group(query->from)) {
             // 将笛卡尔积转化为 INNER JOIN
-            join_filters[query->from.get()].push_back(cond);
+            join_filters[query->from.get()].push_back(predicate);
         } else {
-            post_join_filters.push_back(cond); // 否则放入 JoinPlan
+            post_join_filters.push_back(predicate); // 否则放入 JoinPlan
         }
     }
 
@@ -427,7 +441,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
             query->cols
             query->group_by_cols
             query->aggs
-            query->having_conds
+            query->having_expr
             query->orders
             scan_filters
             join_filters
@@ -437,23 +451,29 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     auto require_col = [&](const TabCol &col) {
         if (!col.tab_name.empty() && !col.col_name.empty()) required_cols[col.tab_name].insert(col.col_name);
     };
-    auto require_cond = [&](const Condition &cond) {
-        require_col(cond.lhs_col);
-        if (!cond.is_rhs_val) require_col(cond.rhs_col);
+    auto require_predicate = [&](const ConditionExprPtr &expr) {
+        visit_bool_atoms(expr, [&](const Condition &cond) {
+            require_col(cond.lhs_col);
+            if (!cond.is_rhs_val) require_col(cond.rhs_col);
+        });
     };
     for (const auto &col : query->cols) require_col(col);
     for (const auto &col : query->group_by_cols) require_col(col);
     for (const auto &agg : query->aggs) if (!agg.is_star) require_col(agg.col);
     for (const auto &order : query->orders) require_col(order.first);
-    for (const auto &[_, conds] : scan_filters) for (const auto &cond : conds) require_cond(cond);
-    for (const auto &[_, conds] : join_filters) for (const auto &cond : conds) require_cond(cond);
-    for (const auto &cond : post_join_filters) require_cond(cond);
-    for (const auto &cond : query->correlated_conds) require_cond(cond);
+    for (const auto &[_, predicates] : scan_filters) {
+        for (const auto &predicate : predicates) require_predicate(predicate);
+    }
+    for (const auto &[_, predicates] : join_filters) {
+        for (const auto &predicate : predicates) require_predicate(predicate);
+    }
+    for (const auto &predicate : post_join_filters) require_predicate(predicate);
+    require_predicate(query->correlated_expr);
     std::function<void(const std::shared_ptr<AnalyzedFrom> &)> require_natural_sources;
     require_natural_sources = [&](const std::shared_ptr<AnalyzedFrom> &node) {
         if (node == nullptr || node->is_table) return;
         if (node->is_lateral_subquery) {
-            for (const auto &cond : node->subquery->correlated_conds) require_cond(cond);
+            require_predicate(node->subquery->correlated_expr);
             return;
         }
         for (const auto &merged : node->coalesced_cols) {
@@ -467,13 +487,19 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
 
     const size_t relation_count = all_bindings.size();
     auto make_scan = [&](const TableBinding &binding) -> BuildResult {
-        auto conds = scan_filters[binding.binding_name];
+        ConditionExprPtr predicate = combine_with_and(scan_filters[binding.binding_name]);
+        std::vector<Condition> access_conditions;
+        extract_conjunctive_atoms(predicate, access_conditions);
         std::vector<std::string> index_cols;
-        bool use_index = get_index_cols(binding.table_name, conds, index_cols, binding.binding_name);
-        if (use_index && mvcc_force_seqscan(context, binding.table_name, relation_count, conds)) use_index = false;
+        bool use_index = get_index_cols(binding.table_name, access_conditions, index_cols,
+                                        binding.binding_name);
+        if (use_index && mvcc_force_seqscan(context, binding.table_name, relation_count,
+                                            access_conditions)) {
+            use_index = false;
+        }
         std::shared_ptr<Plan> plan = std::make_shared<ScanPlan>(
             use_index ? T_IndexScan : T_SeqScan, sm_manager_, binding.table_name,
-            binding.binding_name, conds, index_cols);
+            binding.binding_name, predicate, access_conditions, index_cols);
 
         const auto &table = sm_manager_->db_.get_table(binding.table_name);
         std::vector<TabCol> projection;
@@ -493,7 +519,17 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
             const auto &hdr = fh->second->get_file_hdr();
             rows = std::max(1, hdr.num_pages - 1) * std::max(1, hdr.num_records_per_page);
         }
-        for (const auto &cond : conds) rows *= cond.op == OP_EQ ? 0.1 : (cond.op == OP_NE ? 0.5 : 0.3);
+        if (predicate != nullptr) {
+            std::vector<ConditionExprPtr> estimates;
+            split_top_level_and(predicate, estimates);
+            for (const auto &part : estimates) {
+                if (part->type == BoolExprType::ATOM) {
+                    rows *= part->atom.op == OP_EQ ? 0.1 : (part->atom.op == OP_NE ? 0.5 : 0.3);
+                } else {
+                    rows *= 0.5;
+                }
+            }
+        }
         return {std::move(plan), {binding.binding_name}, std::max(1.0, rows)};
     };
 
@@ -506,17 +542,17 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         if (node->is_lateral_subquery) {
             std::shared_ptr<Plan> plan = generate_select_plan(node->subquery, context);
             plan = std::make_shared<RenamePlan>(std::move(plan), node->output_cols);
-            auto local_filters = scan_filters[node->table.binding_name];
-            if (!local_filters.empty()) {
+            auto local_predicate = combine_with_and(scan_filters[node->table.binding_name]);
+            if (local_predicate != nullptr) {
                 plan = std::make_shared<FilterPlan>(T_Filter, std::move(plan),
-                                                    std::move(local_filters));
+                                                    std::move(local_predicate));
             }
             return {std::move(plan), {node->table.binding_name}, 1000.0};
         }
 
         if (is_inner_group(node)) { // 纯 INNER / CROSS 子树，则会将其展开
             std::vector<TableBinding> leaves;
-            std::vector<Condition> conditions;
+            std::vector<ConditionExprPtr> conditions;
             std::function<void(const std::shared_ptr<AnalyzedFrom> &)> flatten;
             flatten = [&](const std::shared_ptr<AnalyzedFrom> &part) {
                 if (part->is_table) {
@@ -566,7 +602,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
                             }
                         }
                         if (right_scan != nullptr) {
-                            std::vector<Condition> candidate_conds;
+                            std::vector<ConditionExprPtr> candidate_predicates;
                             for (size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
                                 if (used[condition_index]) continue;
                                 const auto names = condition_bindings(conditions[condition_index]);
@@ -576,11 +612,17 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
                                     touches_left = touches_left || current.bindings.count(name) != 0;
                                     touches_right = touches_right || relations[i].bindings.count(name) != 0;
                                 }
-                                if (touches_left && touches_right) candidate_conds.push_back(conditions[condition_index]);
+                                if (touches_left && touches_right) {
+                                    candidate_predicates.push_back(conditions[condition_index]);
+                                }
                             }
+                            std::vector<Condition> candidate_access_conditions;
+                            extract_conjunctive_atoms(combine_with_and(candidate_predicates),
+                                                      candidate_access_conditions);
                             std::vector<std::string> index_cols;
                             if (get_join_index_cols(right_scan->tab_name_, right_scan->binding_name_,
-                                                    right_scan->predicates_, candidate_conds, index_cols)) {
+                                                    right_scan->access_conditions_,
+                                                    candidate_access_conditions, index_cols)) {
                                 score *= 0.5;
                             }
                         }
@@ -595,7 +637,7 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
                 relations.erase(relations.begin() + best);
                 BindingSet combined = current.bindings;
                 combined.insert(right.bindings.begin(), right.bindings.end());
-                std::vector<Condition> join_conds;
+                std::vector<ConditionExprPtr> join_predicates;
                 for (size_t i = 0; i < conditions.size(); ++i) {
                     if (used[i]) continue;
                     const auto names = condition_bindings(conditions[i]);
@@ -608,14 +650,16 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
                         touches_right = touches_right || right.bindings.count(name) != 0;
                     }
                     if (all_available && touches_left && touches_right) {
-                        join_conds.push_back(conditions[i]);
+                        join_predicates.push_back(conditions[i]);
                         used[i] = true;
                     }
                 }
-                const JoinType type = join_conds.empty() ? CROSS_JOIN : INNER_JOIN;
-                const double selectivity = join_conds.empty() ? 1.0 : std::pow(0.1, join_conds.size());
+                const JoinType type = join_predicates.empty() ? CROSS_JOIN : INNER_JOIN;
+                const double selectivity = join_predicates.empty()
+                                               ? 1.0
+                                               : std::pow(0.1, join_predicates.size());
                 auto plan = make_join_plan(std::move(current.plan), std::move(right.plan),
-                                           std::move(join_conds), type, context);
+                                           combine_with_and(join_predicates), type, context);
                 current = {std::move(plan), std::move(combined),
                            std::max(1.0, current.rows * right.rows * selectivity)};
             }
@@ -629,8 +673,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
         auto right = build(node->right);
         BindingSet combined = left.bindings;
         combined.insert(right.bindings.begin(), right.bindings.end());
-        auto conds = join_filters[node.get()];
-        const double selectivity = conds.empty() ? 1.0 : std::pow(0.1, conds.size());
+        auto predicates = join_filters[node.get()];
+        const double selectivity = predicates.empty() ? 1.0 : std::pow(0.1, predicates.size());
         const double inner_rows = std::max(1.0, left.rows * right.rows * selectivity);
         double rows = inner_rows;
         if (node->join_type == LEFT_JOIN) rows = std::max(rows, left.rows);
@@ -644,7 +688,8 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
             output_bindings = right.bindings;
             rows = std::max(1.0, right.rows * 0.5);
         }
-        return {make_join_plan(std::move(left.plan), std::move(right.plan), std::move(conds),
+        return {make_join_plan(std::move(left.plan), std::move(right.plan),
+                               combine_with_and(predicates),
                                node->join_type, context, node->natural, node->lateral,
                                node->coalesced_cols), std::move(output_bindings), rows};
     };
@@ -652,11 +697,11 @@ std::shared_ptr<Plan> Planner::make_join_tree_plan(std::shared_ptr<Query> query,
     auto result = build(query->from);
     if (!post_join_filters.empty()) {
         result.plan = std::make_shared<FilterPlan>(T_Filter, std::move(result.plan),
-                                                   std::move(post_join_filters));
+                                                   combine_with_and(post_join_filters));
     }
-    if (!query->correlated_conds.empty()) {
+    if (query->correlated_expr != nullptr) {
         result.plan = std::make_shared<CorrelatedFilterPlan>(std::move(result.plan),
-                                                            query->correlated_conds);
+                                                            query->correlated_expr);
     }
     return result.plan;
 }
@@ -715,7 +760,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
         }
         plannerRoot = std::make_shared<AggPlan>(T_Aggregation, std::move(plannerRoot),
                                                 query->group_by_cols, query->aggs,
-                                                query->having_conds, output_cols);
+                                                query->having_expr, output_cols);
         // 聚合查询中，Projection 只选择用户 SELECT 的列
         sel_cols.clear();
         for (auto &selected : query->cols) {
@@ -786,19 +831,23 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         // 生成表扫描方式
         std::shared_ptr<Plan> table_scan_executors;
         // 只有一张表，不需要进行物理优化了
+        std::vector<Condition> access_conditions;
+        extract_conjunctive_atoms(query->where_expr, access_conditions);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, query->where_conds, index_col_names);
+        bool index_exist = get_index_cols(x->tab_name, access_conditions, index_col_names);
         
-        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1, query->where_conds)) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1, access_conditions)) {
+            index_exist = false;
+        }
         if (index_exist == false) {  // 该表没有索引
             index_col_names.clear();
             table_scan_executors =
                 std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, x->tab_name,
-                                           query->where_conds, index_col_names);
+                                           query->where_expr, access_conditions, index_col_names);
         } else {  // 存在索引
             table_scan_executors =
                 std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, x->tab_name,
-                                           query->where_conds, index_col_names);
+                                           query->where_expr, access_conditions, index_col_names);
         }
 
         plannerRoot = std::make_shared<DMLPlan>(T_Delete, table_scan_executors, x->tab_name,  
@@ -808,19 +857,23 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         // 生成表扫描方式
         std::shared_ptr<Plan> table_scan_executors;
         // 只有一张表，不需要进行物理优化了
+        std::vector<Condition> access_conditions;
+        extract_conjunctive_atoms(query->where_expr, access_conditions);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, query->where_conds, index_col_names);
+        bool index_exist = get_index_cols(x->tab_name, access_conditions, index_col_names);
 
-        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1, query->where_conds)) index_exist = false;
+        if (index_exist && mvcc_force_seqscan(context, x->tab_name, 1, access_conditions)) {
+            index_exist = false;
+        }
         if (index_exist == false) {  // 该表没有索引
         index_col_names.clear();
             table_scan_executors = 
                 std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, x->tab_name,
-                                           query->where_conds, index_col_names);
+                                           query->where_expr, access_conditions, index_col_names);
         } else {  // 存在索引
             table_scan_executors =
                 std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, x->tab_name,
-                                           query->where_conds, index_col_names);
+                                           query->where_expr, access_conditions, index_col_names);
         }
         plannerRoot = std::make_shared<DMLPlan>(T_Update, table_scan_executors, x->tab_name,
                                                 std::vector<Value>(), query->set_clauses);
