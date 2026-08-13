@@ -63,6 +63,19 @@ mkdir -p my_db && ./bin/rmdb my_db
 
 默认监听端口 `8765`。决赛正式测评走 **Wire Protocol v3**；本地初赛遗留回归仍可用 NUL 结尾 SQL。框架说明见 `docs_rmdb/`。
 
+## DuckDB benchmark 兼容集
+
+`tests/duckdb_benchmark/` 提供从 DuckDB 上游迁移的 10 个兼容 micro benchmark，覆盖聚合、
+`COUNT(DISTINCT)`、过滤、排序/Limit、索引和连接。构建后可直接运行：
+
+```bash
+python3 tests/duckdb_benchmark/runner.py --list
+python3 tests/duckdb_benchmark/runner.py --timed-runs 5
+```
+
+来源版本、方言/规模调整和未支持范围见
+[`tests/duckdb_benchmark/README.md`](tests/duckdb_benchmark/README.md)。
+
 ## 提交约束
 
 **禁止修改任何 `CMakeLists.txt` 文件**（含根目录、`src/`、`src/parser/`、`rmdb_client/` 等）。OJ 评测使用赛方提供的原始构建脚本；改动 CMake 可能导致编译失败、链接错误或评测环境不一致。性能优化请只改 `src/` 等业务代码，通过 `cmake` 命令行参数调整构建类型（如 `-DCMAKE_BUILD_TYPE=Release`），勿改 CMake 文件本身。

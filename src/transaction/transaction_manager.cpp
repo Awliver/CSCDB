@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "index/ix.h"
 #include "common/repro_ring.h"
+#include "transaction/abort_stats.h"
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -824,16 +825,21 @@ MvccWriteResult TransactionManager::mvcc_write(Transaction *txn, const std::stri
     MvccChain *chp = &mvcc_shard_data_[sh].store[tab][rkey];
     MvccChain &ch = *chp;
     auto pit = pending[tab].find(rkey);
-    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id())
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) {
+        record_abort_stat(AbortStatReason::MVCC_PENDING_WRITER);
         return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())
+    }
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) {
+        record_abort_stat(AbortStatReason::MVCC_ACTIVE_WRITER);
         return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
+    }
     // 决赛 SI 铁律：快照之后若已有其它事务提交了新版本，本次写基于的是过期快照，
     // 必须直接 abort，不允许把本次写变基（rebase）合并到最新已提交版本上——
     // 否则会拼出一行任何单个事务都未真正提交过的"缝合"数据，且违反
     // "SI 陈旧写必须 TRANSACTION_ABORT" 的赛题规范（决赛赛题整理 §5.3）。
     if (ch.writer == INVALID_TXN_ID && !ch.hist.empty() &&
         ch.hist.back().commit_ts > txn->get_read_ts()) {
+        record_abort_stat(AbortStatReason::MVCC_STALE_SNAPSHOT);
         return MvccWriteResult::STALE_SNAPSHOT_WRITE;
     }
     const char *write_ptr = new_data;
@@ -904,10 +910,14 @@ MvccWriteResult TransactionManager::mvcc_write_col_delta(Transaction *txn, const
     auto &pending = mvcc_shard_data_[sh].pending;
     MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
     auto pit = pending[tab].find(rkey);
-    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id())
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) {
+        record_abort_stat(AbortStatReason::MVCC_PENDING_WRITER);
         return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())
+    }
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) {
+        record_abort_stat(AbortStatReason::MVCC_ACTIVE_WRITER);
         return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
+    }
     const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
     // first_touch 须先于伪造基版本判定算出：write_set 内若已有本事务对同一 (tab,rid) 的
@@ -933,6 +943,7 @@ MvccWriteResult TransactionManager::mvcc_write_col_delta(Transaction *txn, const
     // 决赛 SI 铁律：同 mvcc_write——快照之后已有新提交版本，本次(增量)写也必须 abort，
     // 不得把 delta 变基叠加到最新版本上（哪怕是同列的交换律累加）。
     if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
+        record_abort_stat(AbortStatReason::MVCC_STALE_SNAPSHOT);
         return MvccWriteResult::STALE_SNAPSHOT_WRITE;
     }
     const char *base_rec = visible_data;
@@ -987,10 +998,14 @@ MvccWriteResult TransactionManager::mvcc_write_col_patch(Transaction *txn, const
     auto &pending = mvcc_shard_data_[sh].pending;
     MvccChain &ch = mvcc_shard_data_[sh].store[tab][rkey];
     auto pit = pending[tab].find(rkey);
-    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id())
+    if (pit != pending[tab].end() && pit->second != txn->get_transaction_id()) {
+        record_abort_stat(AbortStatReason::MVCC_PENDING_WRITER);
         return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
-    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id())
+    }
+    if (ch.writer != INVALID_TXN_ID && ch.writer != txn->get_transaction_id()) {
+        record_abort_stat(AbortStatReason::MVCC_ACTIVE_WRITER);
         return MvccWriteResult::ACTIVE_WRITE_CONFLICT;
+    }
 
     const bool reuse_writer = (ch.writer == txn->get_transaction_id());
     const bool had_overlay = txn->get_si_overlay(si_overlay_key(tab, rkey)) != nullptr;
@@ -1016,6 +1031,7 @@ MvccWriteResult TransactionManager::mvcc_write_col_patch(Transaction *txn, const
     // 决赛 SI 铁律：同 mvcc_write——快照之后已有新提交版本，本次写必须 abort，
     // 不得把 patch 变基合并到最新版本上。
     if (!reuse_writer && !ch.hist.empty() && ch.hist.back().commit_ts > txn->get_read_ts()) {
+        record_abort_stat(AbortStatReason::MVCC_STALE_SNAPSHOT);
         return MvccWriteResult::STALE_SNAPSHOT_WRITE;
     }
     const char *base_rec = visible_data;
@@ -1054,11 +1070,16 @@ MvccWriteResult TransactionManager::mvcc_insert_key_conflict(Transaction *txn, c
     const DelKeyState &st = kit->second;
     txn_id_t me = txn->get_transaction_id();
     for (txn_id_t w : st.writers) {
-        if (w != me) return MvccWriteResult::ACTIVE_WRITE_CONFLICT;  // 他人未提交删除同键
+        if (w != me) {
+            record_abort_stat(AbortStatReason::KEY_ACTIVE_DELETE);
+            return MvccWriteResult::ACTIVE_WRITE_CONFLICT;  // 他人未提交删除同键
+        }
     }
-    return st.last_del_cts > txn->get_read_ts()
-               ? MvccWriteResult::STALE_SNAPSHOT_WRITE
-               : MvccWriteResult::OK;
+    if (st.last_del_cts > txn->get_read_ts()) {
+        record_abort_stat(AbortStatReason::KEY_STALE_DELETE);
+        return MvccWriteResult::STALE_SNAPSHOT_WRITE;
+    }
+    return MvccWriteResult::OK;
 }
 
 /* ------------------------ 题9：SER (SSI 风格可串行化) ------------------------

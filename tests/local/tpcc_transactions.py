@@ -428,10 +428,12 @@ def pick_txn(rng, population=None):
     return rng.choice(population or TXN_POPULATION)
 
 
-def run_txn(cli, rng, scale, txn_name=None, population=None):
+def run_txn(cli, rng, scale, txn_name=None, population=None, route=None):
     if txn_name:
         for name, _, fn in TXN_WEIGHTS_LEGACY:
             if name == txn_name:
+                if route and name != "delivery":
+                    return fn(cli, rng, scale, d_id=route.get("d_id"))
                 return fn(cli, rng, scale)
         return False, "unknown txn " + txn_name
     _, fn = pick_txn(rng, population)

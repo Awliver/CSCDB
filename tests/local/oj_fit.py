@@ -2,10 +2,18 @@
 
 import json
 import os
+import platform
 import subprocess
 import time
 
 from tpcc_common import BUILD, RMDB
+from perf_reporting import (
+    batch_latency_summaries,
+    latency_summary_seconds,
+    merge_counts,
+    merge_failure_samples,
+    merge_nested_counts,
+)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -158,6 +166,28 @@ def print_oj_summary(
             print("  round %d home:   %d/%d warehouses" % (
                 i, coverage, r.get("p_a1_home_warehouse_total", coverage)
             ))
+    attempts = total_no_ok + total_no_fail
+    if attempts:
+        print("  NO abort rate: %.2f%%" % (total_no_fail * 100.0 / attempts))
+    latency = latency_summary_seconds(round_results)
+    all_success_latency = latency_summary_seconds(round_results, "all_success_latencies")
+    if latency["count"]:
+        print("  pooled NO lat: p50=%.2fms p95=%.2fms p99=%.2fms" % (
+            latency["p50_ms"], latency["p95_ms"], latency["p99_ms"]))
+    if all_success_latency["count"]:
+        print("  all-success:   p50=%.2fms p95=%.2fms p99=%.2fms (diagnostic)" % (
+            all_success_latency["p50_ms"], all_success_latency["p95_ms"],
+            all_success_latency["p99_ms"]))
+    batch_latency = batch_latency_summaries(round_results)
+    for key in ("new_order.b1", "new_order.b2"):
+        summary = batch_latency.get(key)
+        if summary:
+            print("  %-14s p50=%.2fms p95=%.2fms p99=%.2fms" % (
+                key + ":", summary["p50_ms"], summary["p95_ms"], summary["p99_ms"]))
+    abort_reasons = merge_counts(round_results, "abort_reasons")
+    if abort_reasons:
+        ranked = sorted(abort_reasons.items(), key=lambda item: (-item[1], item[0]))
+        print("  abort reasons: %s" % ", ".join("%s=%d" % item for item in ranked[:6]))
     for i, r in enumerate(round_results, 1):
         elapsed = r.get("elapsed", 0)
         expected = measure
@@ -214,6 +244,16 @@ def git_revision():
 
 def git_info():
     """Code version snapshot for bench history records."""
+    tested_rev = os.environ.get("RMDB_BENCH_GIT_REV")
+    if tested_rev:
+        return {
+            "git_rev": tested_rev[:12],
+            "git_rev_full": tested_rev,
+            "git_branch": os.environ.get("RMDB_BENCH_GIT_BRANCH", "detached"),
+            "git_dirty": os.environ.get("RMDB_BENCH_GIT_DIRTY", "0") == "1",
+            "git_subject": os.environ.get("RMDB_BENCH_GIT_SUBJECT", ""),
+            "git_commit_time": os.environ.get("RMDB_BENCH_GIT_COMMIT_TIME", ""),
+        }
     short = git_revision()
     full = _git_cmd("rev-parse", "HEAD") or short
     branch = _git_cmd("rev-parse", "--abbrev-ref", "HEAD") or "unknown"
@@ -287,6 +327,35 @@ def build_result_payload(
         for counts in pa1_outcomes.values()
     )
 
+    results = round_results or []
+    new_order_ok = sum(r.get("new_order_ok", 0) for r in results)
+    new_order_fail = sum(r.get("new_order_fail", 0) for r in results)
+    new_order_attempts = new_order_ok + new_order_fail
+    by_type = merge_nested_counts(results, "by_type")
+    abort_reasons = merge_counts(results, "abort_reasons")
+    failure_reasons = merge_counts(results, "failure_reasons")
+    failure_stages = merge_counts(results, "failure_stages")
+    abort_by_type = merge_nested_counts(results, "abort_by_type")
+    latency = latency_summary_seconds(results)
+    all_success_latency = latency_summary_seconds(results, "all_success_latencies")
+    batch_latency = batch_latency_summaries(results)
+    warehouse_attempts = merge_counts(results, "warehouse_attempts")
+    warehouse_ok = merge_counts(results, "warehouse_ok")
+    round_details = []
+    for result in results:
+        round_details.append({
+            "tpmc": result.get("tpm"),
+            "elapsed_sec": result.get("elapsed"),
+            "new_order_ok": result.get("new_order_ok", 0),
+            "new_order_fail": result.get("new_order_fail", 0),
+            "other_ok": result.get("other_ok", 0),
+            "other_fail": result.get("other_fail", 0),
+            "abort_reasons": result.get("abort_reasons", {}),
+            "failure_reasons": result.get("failure_reasons", {}),
+            "failure_stages": result.get("failure_stages", {}),
+            "warehouse_attempts": result.get("warehouse_attempts", {}),
+            "warehouse_ok": result.get("warehouse_ok", {}),
+        })
     payload = {
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "tier": tier,
@@ -300,10 +369,6 @@ def build_result_payload(
         "rounds": rounds,
         "tpms": list(tpms) if tpms is not None else [],
         "median_tpmc": median_tpm,
-        "new_order_ok": sum(r.get("new_order_ok", 0) for r in (round_results or [])),
-        "new_order_fail": sum(r.get("new_order_fail", 0) for r in (round_results or [])),
-        "other_fail": sum(r.get("other_fail", 0) for r in (round_results or [])),
-        "round_elapsed_sec": [r.get("elapsed", 0) for r in (round_results or [])],
         "p_a1_outcomes": pa1_outcomes,
         "p_a1_abort_attribution": sorted(
             pa1_abort_rows.values(),
@@ -314,6 +379,26 @@ def build_result_payload(
         "p_a1_reconcile": pa1_reconcile,
         "p_a1_home_warehouses": pa1_home_warehouses,
         "p_a1_home_coverage": len(pa1_home_warehouses),
+        "new_order_ok": new_order_ok,
+        "new_order_fail": new_order_fail,
+        "new_order_abort_rate": (
+            float(new_order_fail) / new_order_attempts if new_order_attempts else None
+        ),
+        "other_ok": sum(r.get("other_ok", 0) for r in results),
+        "other_fail": sum(r.get("other_fail", 0) for r in results),
+        "by_type": by_type,
+        "abort_reasons": abort_reasons,
+        "abort_by_type": abort_by_type,
+        "failure_reasons": failure_reasons,
+        "failure_stages": failure_stages,
+        "failure_samples": merge_failure_samples(results),
+        "new_order_latency": latency,
+        "all_success_latency": all_success_latency,
+        "batch_latency": batch_latency,
+        "warehouse_attempts": warehouse_attempts,
+        "warehouse_ok": warehouse_ok,
+        "round_elapsed_sec": [r.get("elapsed", 0) for r in results],
+        "round_details": round_details,
         "consistency": (
             None if consistency_ok is None else ("PASS" if consistency_ok else "FAIL")
         ),
@@ -322,6 +407,11 @@ def build_result_payload(
         ),
         "build_type": build["build_type"],
         "optimize": build["optimize"],
+        "host": {
+            "hostname": platform.node(),
+            "platform": platform.platform(),
+            "cpu_count": os.cpu_count(),
+        },
         "overall": overall,
         "fail_stage": fail_stage,
         **g,
@@ -381,6 +471,11 @@ def save_bench_history(payload, history_dir=None, also_path=None):
         "warehouses": payload.get("warehouses"),
         "threads": payload.get("threads"),
         "median_tpmc": payload.get("median_tpmc"),
+        "new_order_abort_rate": payload.get("new_order_abort_rate"),
+        "new_order_p99_ms": (payload.get("new_order_latency") or {}).get("p99_ms"),
+        "pooled_new_order_p50_ms": (payload.get("new_order_latency") or {}).get("p50_ms"),
+        "pooled_new_order_p99_ms": (payload.get("new_order_latency") or {}).get("p99_ms"),
+        "all_success_p99_ms": (payload.get("all_success_latency") or {}).get("p99_ms"),
         "overall": payload.get("overall"),
         "fail_stage": payload.get("fail_stage"),
         "git_rev": payload.get("git_rev"),

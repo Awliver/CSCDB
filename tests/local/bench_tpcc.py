@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 
 from tpcc_common import (
     BUILD,
@@ -31,9 +32,11 @@ from tpcc_common import (
     benchmark_client_timeout,
     bootstrap_tpcc,
     db_path_for,
+    exclusive_perf_lock,
     kill_rmdb,
     parse_count,
     start_existing_rmdb,
+    stop_rmdb,
     verify_load_counts,
 )
 from tpcc_scale import ensure_scale_data, loads_for_scale, scale_profile, tpcc_runtime_scale
@@ -45,7 +48,13 @@ from tpcc_transactions import (
     run_neworder,
     run_txn,
 )
-from tpcc_batch import TxnRunResult, install_prepare, run_txn_batch, stmt_name
+from tpcc_batch import (
+    TxnRunResult,
+    build_prepare_stmts,
+    install_prepare,
+    run_txn_batch,
+    stmt_name,
+)
 from tpcc_consistency import run_consistency_checks, snapshot_bench_start_o_ids, snapshot_ytd_baseline
 from tpcc_load_verify import verify_load_content
 from p2_gate import run_p2_functional_tests
@@ -59,6 +68,8 @@ from oj_fit import (
     save_bench_history,
     write_json_result,
 )
+from perf_reporting import classify_failure, parse_server_diagnostics
+from tpcc_routing import FinalsRouter, describe_router
 
 # Active mix set in main() (finals 45/43/4/4/4 by default; --legacy-mix → 10/23)
 MIX_WEIGHTS = {name: w for name, w, _ in TXN_WEIGHTS}
@@ -92,8 +103,18 @@ class TxnStats:
         self.window_outcomes = defaultdict(lambda: defaultdict(int))
         self.window_abort_attribution = defaultdict(int)
         self.window_started = time.monotonic()
+        self.all_success_latencies = []
+        self.abort_reasons = Counter()
+        self.failure_reasons = Counter()
+        self.failure_stages = Counter()
+        self.abort_by_type = {name: Counter() for name in TXN_NAMES}
+        self.failure_samples = {}
+        self.batch_latencies = {}
+        self.warehouse_attempts = Counter()
+        self.warehouse_ok = Counter()
 
-    def record(self, txn_type, result, err="", latency=0.0, home_w=None):
+    def record(self, txn_type, result, err="", latency=0.0,
+               batch_latencies=None, warehouse=None, home_w=None):
         if isinstance(result, TxnRunResult):
             rr = result
         else:
@@ -105,9 +126,14 @@ class TxnStats:
         with self.lock:
             ok = rr.ok
             err = rr.error
+            if warehouse is not None:
+                self.warehouse_attempts[warehouse] += 1
+                if ok:
+                    self.warehouse_ok[warehouse] += 1
             bucket = self.by_type.setdefault(txn_type, {"ok": 0, "fail": 0})
             if ok:
                 bucket["ok"] += 1
+                self.all_success_latencies.append(latency)
             else:
                 bucket["fail"] += 1
             if txn_type == "new_order":
@@ -140,6 +166,20 @@ class TxnStats:
                 key = (txn_type, rr.stmt_id, rr.failed_op, rr.reason, rr.hotspot or "other")
                 self.abort_attribution[key] += 1
                 self.window_abort_attribution[key] += 1
+            if not ok and err:
+                info = classify_failure(err)
+                reason = info["reason"]
+                self.failure_reasons[reason] += 1
+                self.failure_stages[info["stage"]] += 1
+                if info["kind"] == "abort":
+                    self.abort_reasons[reason] += 1
+                    self.abort_by_type.setdefault(txn_type, Counter())[reason] += 1
+                samples = self.failure_samples.setdefault(reason, [])
+                if len(samples) < 3 and err not in samples:
+                    samples.append(err[:240])
+            for index, batch_latency in enumerate(batch_latencies or (), 1):
+                key = "%s.b%d" % (txn_type, index)
+                self.batch_latencies.setdefault(key, []).append(batch_latency)
             self._emit_window_if_due_locked(time.monotonic())
 
     def _emit_window_if_due_locked(self, now):
@@ -173,18 +213,31 @@ class TxnStats:
 
     def snapshot(self):
         with self.lock:
-            return (
-                self.new_order_ok,
-                self.new_order_fail,
-                self.other_ok,
-                self.other_fail,
-                self.last_err,
-                {k: dict(v) for k, v in self.by_type.items()},
-                list(self.new_order_latencies),
-                {k: dict(v) for k, v in self.outcomes.items()},
-                dict(self.abort_attribution),
-                dict(self.home_warehouses),
-            )
+            return {
+                "new_order_ok": self.new_order_ok,
+                "new_order_fail": self.new_order_fail,
+                "other_ok": self.other_ok,
+                "other_fail": self.other_fail,
+                "last_err": self.last_err,
+                "by_type": {k: dict(v) for k, v in self.by_type.items()},
+                "new_order_latencies": list(self.new_order_latencies),
+                "all_success_latencies": list(self.all_success_latencies),
+                "abort_reasons": dict(self.abort_reasons),
+                "failure_reasons": dict(self.failure_reasons),
+                "failure_stages": dict(self.failure_stages),
+                "abort_by_type": {
+                    name: dict(counts) for name, counts in self.abort_by_type.items() if counts
+                },
+                "failure_samples": {k: list(v) for k, v in self.failure_samples.items()},
+                "batch_latencies": {
+                    key: list(values) for key, values in self.batch_latencies.items()
+                },
+                "warehouse_attempts": dict(sorted(self.warehouse_attempts.items())),
+                "warehouse_ok": dict(sorted(self.warehouse_ok.items())),
+                "p_a1_outcomes": {k: dict(v) for k, v in self.outcomes.items()},
+                "p_a1_abort_attribution": dict(self.abort_attribution),
+                "p_a1_home_warehouses": dict(self.home_warehouses),
+            }
 
 
 def worker_loop(
@@ -198,12 +251,20 @@ def worker_loop(
     use_batch=True,
     population=None,
     warehouse_schedule="random",
+    batch_timing=False,
+    router=None,
+    start_barrier=None,
 ):
     rng = random.Random(rng_seed)
     worker_scale = dict(scale)
     worker_scale["w_id"] = 1 + (thread_idx % scale["warehouses"])
     txn_seq = 0
     pop = population or TXN_POPULATION
+    route_rng = random.Random(rng_seed ^ 0x6A09E667)
+    txn_no = 0
+    if router is not None:
+        worker_scale["hot_items"] = router.hot_items
+        worker_scale["_route_rng"] = route_rng
     try:
         cli = RmdbClient(timeout=client_timeout)
         # 决赛：SI 在 PREPARE_SET 之前设置
@@ -212,9 +273,31 @@ def worker_loop(
             install_prepare(cli)
     except (ConnectionRefusedError, OSError, RuntimeError) as e:
         stats.record("new_order", False, "connect/prepare failed: %s" % e)
+        if start_barrier is not None:
+            start_barrier.abort()
         return
-    end = time.perf_counter() + duration_sec
+    batch_latencies = []
+    if use_batch and batch_timing:
+        original_exec_batch = cli.exec_batch
+
+        def timed_exec_batch(ops):
+            started = time.perf_counter()
+            try:
+                return original_exec_batch(ops)
+            finally:
+                batch_latencies.append(time.perf_counter() - started)
+
+        cli.exec_batch = timed_exec_batch
     try:
+        if start_barrier is not None:
+            try:
+                start_barrier.wait(timeout=120.0)
+            except threading.BrokenBarrierError:
+                stats.record(
+                    "new_order", False, "startup barrier failed: not all clients became ready"
+                )
+                return
+        end = time.perf_counter() + duration_sec
         while time.perf_counter() < end and not stop_event.is_set():
             if warehouse_schedule == "random":
                 # 官方路由器逐事务选择 home warehouse；各客户端独立抽样会自然产生
@@ -230,20 +313,35 @@ def worker_loop(
             txn_seq += 1
             home_w = worker_scale["w_id"]
             txn_name, _ = __import__("tpcc_transactions").pick_txn(rng, pop)
+            route = None
+            if router is not None:
+                route = router.route(thread_idx, txn_no, route_rng)
+                worker_scale["w_id"] = route["w_id"]
+            txn_no += 1
+            batch_latencies.clear()
             t0 = time.perf_counter()
             try:
                 if use_batch:
-                    result = run_txn_batch(cli, rng, worker_scale, txn_name)
+                    result = run_txn_batch(cli, rng, worker_scale, txn_name, route=route)
                 elif txn_name == "new_order":
-                    ok, err = run_neworder(cli, rng, worker_scale)
+                    ok, err = run_neworder(
+                        cli, rng, worker_scale,
+                        d_id=route.get("d_id") if route else None,
+                    )
                     result = TxnRunResult(ok, err, "committed" if ok else "error")
                 else:
-                    ok, err = run_txn(cli, rng, worker_scale, txn_name)
+                    ok, err = run_txn(cli, rng, worker_scale, txn_name, route=route)
                     result = TxnRunResult(ok, err, "committed" if ok else "error")
-            except (RuntimeError, ConnectionRefusedError, OSError) as e:
-                result = TxnRunResult(False, str(e), outcome="error")
+            except Exception as e:
+                result = TxnRunResult(
+                    False, "worker exception %s: %s" % (type(e).__name__, e),
+                    outcome="error",
+                )
             dt = time.perf_counter() - t0
-            stats.record(txn_name, result, latency=dt, home_w=home_w)
+            stats.record(
+                txn_name, result, latency=dt, batch_latencies=batch_latencies,
+                warehouse=worker_scale.get("w_id"), home_w=worker_scale.get("w_id"),
+            )
     finally:
         cli.close()
 
@@ -258,12 +356,14 @@ def bench_round(
     use_batch=True,
     population=None,
     warehouse_schedule="random",
+    batch_timing=False,
+    router=None,
 ):
     stats = TxnStats()
     worker_scale = dict(scale)
     worker_scale["threads_hint"] = threads
     stop = threading.Event()
-    start = time.perf_counter()
+    start_barrier = threading.Barrier(threads + 1)
     workers = []
     for i in range(threads):
         t = threading.Thread(
@@ -279,22 +379,51 @@ def bench_round(
                 use_batch,
                 population,
                 warehouse_schedule,
+                batch_timing,
+                router,
+                start_barrier,
             ),
             daemon=True,
         )
         t.start()
         workers.append(t)
+    start = time.perf_counter()
+    try:
+        start_barrier.wait(timeout=120.0)
+        start = time.perf_counter()
+    except threading.BrokenBarrierError:
+        stop.set()
     for t in workers:
         t.join()
     elapsed = time.perf_counter() - start
-    no_ok, no_fail, o_ok, o_fail, last_err, by_type, lats, outcomes, attribution, home_counts = stats.snapshot()
+    snapshot = stats.snapshot()
+    no_ok = snapshot["new_order_ok"]
+    no_fail = snapshot["new_order_fail"]
+    o_ok = snapshot["other_ok"]
+    o_fail = snapshot["other_fail"]
+    last_err = snapshot["last_err"]
+    by_type = snapshot["by_type"]
+    lats = snapshot["new_order_latencies"]
+    outcomes = snapshot["p_a1_outcomes"]
+    attribution = snapshot["p_a1_abort_attribution"]
+    home_counts = snapshot["p_a1_home_warehouses"]
     tpm = (no_ok / elapsed * 60.0) if elapsed > 0 else 0.0
     print(
         "  [%s] elapsed=%.1fs threads=%d new_order ok=%d fail=%d other ok=%d fail=%d tpmC=%.2f"
         % (label, elapsed, threads, no_ok, no_fail, o_ok, o_fail, tpm)
     )
     if no_fail or o_fail:
-        print("    last error:", last_err[:120])
+        print("    last error:", last_err[:160])
+        ranked = sorted(snapshot["failure_reasons"].items(), key=lambda item: (-item[1], item[0]))
+        print("    failure reasons:", ", ".join("%s=%d" % item for item in ranked[:6]))
+        stages = sorted(snapshot["failure_stages"].items(), key=lambda item: (-item[1], item[0]))
+        print("    failure stages: ", ", ".join("%s=%d" % item for item in stages[:6]))
+    if router is not None:
+        attempts = snapshot["warehouse_attempts"]
+        print("    routing coverage: warehouses=%d/%d attempts=%d hot_attempts=%d" % (
+            len(attempts), scale["warehouses"], sum(attempts.values()),
+            sum(attempts.get(w, 0) for w in router.hot_warehouses),
+        ))
     if home_counts:
         print(
             "  P_A1_HOME_COVERAGE schedule=%s covered=%d/%d min=%d max=%d"
@@ -323,16 +452,9 @@ def bench_round(
             "hotspot=%s count=%d"
             % (txn_type, stmt_id, stmt_name(stmt_id), failed_op, reason, hotspot, count)
         )
-    return {
+    snapshot.update({
         "tpm": tpm,
         "elapsed": elapsed,
-        "new_order_ok": no_ok,
-        "new_order_fail": no_fail,
-        "other_ok": o_ok,
-        "other_fail": o_fail,
-        "by_type": by_type,
-        "new_order_latencies": lats,
-        "p_a1_outcomes": outcomes,
         "p_a1_abort_attribution": [
             {
                 "txn": key[0], "stmt_id": key[1], "stmt": stmt_name(key[1]),
@@ -341,10 +463,10 @@ def bench_round(
             for key, count in sorted(attribution.items())
         ],
         "p_a1_reconcile": reconcile_ok,
-        "p_a1_home_warehouses": home_counts,
         "p_a1_home_coverage": len(home_counts),
         "p_a1_home_warehouse_total": scale["warehouses"],
-    }
+    })
+    return snapshot
 
 
 def check_txn_mix(by_type, tolerance=0.15):
@@ -430,20 +552,26 @@ def check_round_stability(tpms, max_spread=0.50):
     return True
 
 
-def check_neworder_latency(latencies, p99_limit_ms=5000):
+def check_latency_slo(latencies, label, p50_limit_ms, p99_limit_ms):
     if not latencies:
-        print("  SKIP: new_order latency (no samples)")
-        return True
-    latencies = sorted(latencies)
-    p50 = latencies[len(latencies) // 2]
-    p99 = latencies[int(len(latencies) * 0.99)]
-    print("  new_order latency p50=%.0fms p99=%.0fms (limit p99=%dms)" % (
-        p50 * 1000, p99 * 1000, p99_limit_ms))
-    if p99 * 1000 > p99_limit_ms:
-        print("  FAIL: new_order p99 latency")
+        print("  FAIL: %s latency (no successful samples)" % label)
         return False
-    print("  PASS: new_order latency")
-    return True
+    latencies = sorted(latencies)
+    p50 = latencies[int(round((len(latencies) - 1) * 0.50))] * 1000.0
+    p99 = latencies[int(round((len(latencies) - 1) * 0.99))] * 1000.0
+    print("  %s latency p50=%.2fms p99=%.2fms "
+          "(limits p50<=%.2fms p99<=%.2fms, n=%d)" % (
+              label, p50, p99, p50_limit_ms, p99_limit_ms, len(latencies)))
+    ok = True
+    if p50 > p50_limit_ms:
+        print("  FAIL: %s p50 latency" % label)
+        ok = False
+    if p99 > p99_limit_ms:
+        print("  FAIL: %s p99 latency" % label)
+        ok = False
+    if ok:
+        print("  PASS: %s latency" % label)
+    return ok
 
 
 def verify_indexes(cli):
@@ -696,6 +824,8 @@ def main():
     ap.add_argument("--skip-consistency", action="store_true")
     ap.add_argument("--skip-p2", action="store_true", help="skip P2 functional gate")
     ap.add_argument("--skip-load-content", action="store_true", help="skip CSV content verify")
+    ap.add_argument("--skip-load-counts", action="store_true",
+                    help="skip exact initial row counts (only for --reuse-db diagnostics)")
     ap.add_argument("--no-generate", action="store_true")
     ap.add_argument("--max-abort-rate", type=float, default=None,
                     help="max NewOrder abort rate in measure rounds (default: 0.01 strict, off otherwise)")
@@ -703,15 +833,37 @@ def main():
                     help="strict: allowed deviation from active mix (default 0.15)")
     ap.add_argument("--max-round-spread", type=float, default=0.50,
                     help="strict: warn if (max-min)/median tpmC exceeds this (does not fail)")
-    ap.add_argument("--p99-latency-ms", type=float, default=5000,
-                    help="strict: max new_order p99 latency in ms")
+    ap.add_argument("--p50-latency-ms", type=float, default=10,
+                    help="strict: max pooled NewOrder p50 latency in ms")
+    ap.add_argument("--p99-latency-ms", type=float, default=50,
+                    help="strict: max pooled NewOrder p99 latency in ms")
     ap.add_argument("--client-timeout", type=float, default=None,
                     help="per-SQL socket timeout in seconds (0=unlimited; default 2×measure, min 600)")
     ap.add_argument("--json", metavar="PATH", default=None,
                     help="also write result JSON to PATH (history is always saved unless --no-save-history)")
     ap.add_argument("--no-save-history", action="store_true",
                     help="do not auto-save under build/bench_history/")
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="enable WAL/BPM/MVCC counters and save their server-log summary")
+    ap.add_argument("--base-db", default=None,
+                    help="clone this preloaded database before measuring (skips schema/load/index)")
+    ap.add_argument("--uniform-routing", action="store_true",
+                    help="disable finals 160-slot hotspot routing (A/B diagnostic only)")
     args = ap.parse_args()
+
+    if args.base_db and args.reuse_db:
+        ap.error("--base-db and --reuse-db are mutually exclusive")
+    if args.base_db:
+        os.environ["RMDB_TPCC_BASE_DB"] = os.path.abspath(args.base_db)
+    if args.reuse_db:
+        os.environ["RMDB_TPCC_REUSE_DB"] = "1"
+
+    if args.diagnostics:
+        os.environ.setdefault("RMDB_WAL_STATS", "1")
+        os.environ.setdefault("RMDB_BPM_STATS", "1")
+        os.environ.setdefault("RMDB_MVCC_STATS", "1")
+        os.environ.setdefault("RMDB_BATCH_STATS", "1")
+        os.environ.setdefault("RMDB_ABORT_STATS", "1")
 
     tier_flags = sum(bool(x) for x in (args.quick, args.mid, args.finals))
     if tier_flags > 1:
@@ -745,9 +897,10 @@ def main():
         if args.reuse_db or storage_mode != "fresh-hdd":
             print("ERROR: --strict requires a fresh native-disk load; --reuse-db/fast storage is diagnostic only")
             return 2
-        if args.skip_crash or args.skip_consistency or args.skip_p2 or args.skip_load_content:
+        if (args.skip_crash or args.skip_consistency or args.skip_p2 or
+                args.skip_load_content or args.skip_load_counts):
             print("ERROR: --strict disallows --skip-crash / --skip-consistency / "
-                  "--skip-p2 / --skip-load-content")
+                  "--skip-p2 / --skip-load-content / --skip-load-counts / --reuse-db")
             return 2
         if args.max_abort_rate is None:
             args.max_abort_rate = 0.01
@@ -799,8 +952,20 @@ def main():
     client_timeout = benchmark_client_timeout(measure, args.client_timeout)
     profile = scale_profile(args.scale)
     scale = tpcc_runtime_scale(args.scale)
+    use_finals_routing = args.scale == "full" and not args.uniform_routing
+    routing_meta = None
+    if use_finals_routing:
+        routing_meta = describe_router(FinalsRouter(
+            scale["warehouses"], scale["districts"], scale["items"], args.seed, 0
+        ))
 
-    if args.scale in ("local", "full"):
+    # A preloaded template is self-contained. When both CSV-based validation
+    # passes are explicitly disabled, requiring another W=50 CSV copy in each
+    # A/B build directory only wastes time and disk space.
+    needs_full_csv = not (
+        args.base_db and args.skip_load_counts and args.skip_load_content
+    )
+    if args.scale in ("local", "full") and needs_full_csv:
         if not ensure_scale_data(args.scale, generate=not args.no_generate):
             print("TPC-C data not ready. Run: python3 tests/local/generate_tpcc_data.py --scale %s" % args.scale)
             return 1
@@ -827,6 +992,11 @@ def main():
         print("  NOTE: reused DB skips fresh LOAD/index timing; use --strict for a submission gate")
     print("  protocol:", proto_desc)
     print("  mix:", mix_desc)
+    if routing_meta:
+        print("  routing: finals 160-slot hotspots warehouses=%s districts=%s" % (
+            routing_meta["hot_warehouses"], routing_meta["hot_districts"]))
+    else:
+        print("  routing: uniform/fixed client warehouse (diagnostic)")
     print("  warmup=%ss measure=%ss rounds=%d threads=%d" % (warmup, measure, rounds, threads))
     print("  warehouse-schedule:", args.warehouse_schedule)
     if client_timeout is None:
@@ -841,6 +1011,13 @@ def main():
             print("  stress: %d trials x %.0fs seeds=%s" % (
                 len(stress_seed_list), args.stress_seconds, args.stress_seeds))
 
+    try:
+        perf_lock = exclusive_perf_lock()
+        perf_lock.__enter__()
+    except RuntimeError as exc:
+        print("ERROR:", exc)
+        return 2
+
     proc = None
     cli = None
     proc2 = None
@@ -851,11 +1028,28 @@ def main():
     median_tpm = None
     fail_stage = None
     history_saved = False
+    server_log_path = os.path.join(BUILD, db_name + ".server.log")
 
     def persist(overall_status, stage=None):
         nonlocal history_saved
         if history_saved:
             return
+        server_diagnostics = parse_server_diagnostics(server_log_path)
+        if args.diagnostics and server_diagnostics.get("exists"):
+            lines = server_diagnostics.get("line_counts", {})
+            wal = server_diagnostics.get("wal_last", {})
+            bpm = server_diagnostics.get("bpm", {})
+            print("  diagnostics:  lines=%s" % lines)
+            if wal:
+                print("  WAL:          fsync=%s avg_us=%s max_us=%s waits/fsync=%s" % (
+                    wal.get("fsync", "-"), wal.get("avg_us", "-"),
+                    wal.get("max_us", "-"), wal.get("waits/fsync", "-")))
+            if bpm.get("samples"):
+                print("  BPM:          max_pinned=%s min_free=%s samples=%s" % (
+                    bpm.get("max_pinned"), bpm.get("min_free"), bpm.get("samples")))
+            abort_stats = server_diagnostics.get("abort_stats", {})
+            if abort_stats.get("samples"):
+                print("  abort roots:  %s" % abort_stats.get("last", {}))
         payload = build_result_payload(
             tier=tier,
             scale=args.scale,
@@ -880,6 +1074,15 @@ def main():
                 "reused_db": args.reuse_db,
                 "base_id": os.environ.get("RMDB_TEST_BASE_ID"),
                 "warehouse_schedule": args.warehouse_schedule,
+                "diagnostics_enabled": args.diagnostics,
+                "server_diagnostics": server_diagnostics,
+                "test_build": BUILD,
+                "test_binary": RMDB,
+                "routing": routing_meta or {"enabled": False},
+                "prepared_statements": {
+                    str(statement_id): sql
+                    for statement_id, _is_query, _types, sql in build_prepare_stmts()
+                },
             },
         )
         if not args.no_save_history:
@@ -924,7 +1127,9 @@ def main():
                 return 1
 
         print("\n-- load verify (row counts) --")
-        if not verify_load_counts(cli, loads):
+        if args.skip_load_counts:
+            print("  SKIP: exact row counts (--reuse-db diagnostic)")
+        elif not verify_load_counts(cli, loads):
             print("OVERALL: FAIL (load counts)")
             fail_stage = "load_counts"
             persist("FAIL", fail_stage)
@@ -962,18 +1167,32 @@ def main():
                 return 1
 
         print("\n-- warmup %.0fs --" % warmup)
+        warmup_router = None
+        if use_finals_routing:
+            warmup_router = FinalsRouter(
+                scale["warehouses"], scale["districts"], scale["items"], args.seed, 0
+            )
         bench_round(
             warmup, threads, args.seed, scale, label="warmup",
             client_timeout=client_timeout, use_batch=use_batch, population=TXN_POPULATION,
             warehouse_schedule=args.warehouse_schedule,
+            batch_timing=args.diagnostics,
+            router=warmup_router,
         )
 
         for rd in range(1, rounds + 1):
             print("\n-- round %d/%d measure %.0fs --" % (rd, rounds, measure))
+            round_router = None
+            if use_finals_routing:
+                round_router = FinalsRouter(
+                    scale["warehouses"], scale["districts"], scale["items"], args.seed, rd
+                )
             r = bench_round(
                 measure, threads, args.seed + rd * 1000, scale, label="round%d" % rd,
                 client_timeout=client_timeout, use_batch=use_batch, population=TXN_POPULATION,
                 warehouse_schedule=args.warehouse_schedule,
+                batch_timing=args.diagnostics,
+                router=round_router,
             )
             round_results.append(r)
 
@@ -998,18 +1217,20 @@ def main():
             print("\n-- strict measure checks --")
             strict_ok = measure_ok
             combined_by_type = {name: {"ok": 0, "fail": 0} for name in TXN_NAMES}
-            all_lats = []
+            new_order_lats = []
             for r in round_results:
                 for name, counts in r["by_type"].items():
                     combined_by_type[name]["ok"] += counts["ok"]
                     combined_by_type[name]["fail"] += counts["fail"]
-                all_lats.extend(r["new_order_latencies"])
+                new_order_lats.extend(r.get("new_order_latencies", []))
             strict_ok = check_abort_rate(round_results, args.max_abort_rate or 0) and strict_ok
             strict_ok = check_other_fail_rate(round_results, args.max_other_fail_rate or 0) and strict_ok
             strict_ok = check_txn_mix(combined_by_type, args.mix_tolerance) and strict_ok
             if rounds >= 2:
                 strict_ok = check_round_stability(tpms, args.max_round_spread) and strict_ok
-            strict_ok = check_neworder_latency(all_lats, args.p99_latency_ms) and strict_ok
+            strict_ok = check_latency_slo(
+                new_order_lats, "pooled new_order", args.p50_latency_ms, args.p99_latency_ms
+            ) and strict_ok
             if proc.poll() is not None:
                 print("  FAIL: rmdb process died during benchmark")
                 strict_ok = False
@@ -1103,17 +1324,26 @@ def main():
             protocol=proto_desc,
         )
 
+        # Collect shutdown-only diagnostics (WAL, batch statement timing, etc.)
+        # before serializing the successful run. The finally block remains the
+        # safety net for failure paths.
+        if cli:
+            cli.close()
+            cli = None
+        stop_rmdb(proc)
+        proc = None
+        stop_rmdb(proc2)
+        proc2 = None
         persist("PASS")
         print("OVERALL: PASS")
         return 0
     finally:
         if cli:
             cli.close()
-        if proc and proc.poll() is None:
-            proc.kill()
-        if proc2 and proc2.poll() is None:
-            proc2.kill()
+        stop_rmdb(proc)
+        stop_rmdb(proc2)
         kill_rmdb()
+        perf_lock.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,9 @@ python3 tests/local/run_oj_perf_test.py --strict
 
 # TPC-C 快速冒烟（日常迭代，不能代表排名 tpmC）
 python3 tests/local/bench_tpcc_neworder.py --quick
+
+# Delivery EXEC_BATCH ERROR 定向回归（当前 build/bin/rmdb，5 秒）
+python3 tests/local/repro_delivery_batch_error.py --quick
 ```
 
 ## SQL 语法功能专项正确性测试
@@ -131,6 +134,37 @@ tests/local/run_syntax_sanitizers.sh
 `RMDB_SANITIZER_GATE_ROWS`、`RMDB_SANITIZER_DIFF_ROWS` 和
 `RMDB_SANITIZER_DIFF_CASES` 调整测试规模；UNION 随机差分条数可由
 `RMDB_SANITIZER_UNION_DIFF_CASES` 单独调整。
+
+### Delivery `BATCH_STATUS_ERROR` 定向回归
+
+`repro_delivery_batch_error.py` 使用决赛 Wire v3 的 PREPARE_SET + EXEC_BATCH，
+让并发 SI 会话在 Delivery 写入和订单行明细查询前同步汇合。默认断言：
+
+- 服务进程在测量末尾仍存活；
+- 合法的 prepared batch 不返回不可重试 `ERROR`；
+- 至少一笔 Delivery 成功提交；
+- 明细行数、`ORDER BY ol_number`、FLOAT32 金额位模式和配送时间均正确。
+
+```bash
+# 当前版本日常冒烟
+python3 tests/local/repro_delivery_batch_error.py --quick
+
+# 当前版本 32 客户端压力；可重复多轮提高并发缺陷命中率
+python3 tests/local/repro_delivery_batch_error.py --rounds 3 --seconds 30
+
+# 历史 ultra_test 复现模式；命中明细 SELECT 的 ERROR 才算复现成功
+python3 tests/local/repro_delivery_batch_error.py --legacy-repro
+
+# 指定不可变提交、自定义压力，并输出机器可读报告
+python3 tests/local/repro_delivery_batch_error.py \
+  --ref f01553f --expect target-error --frames 80 --seconds 90 \
+  --json build/repro_delivery_batch_error/result.json
+```
+
+服务端完整日志保存在 `build/repro_delivery_batch_error/`；摘要会区分
+`sql-error`、缓冲池等待/耗尽、`pressure-abort`、`error-abort` 和
+`bad_alloc`。`TRANSACTION_ABORT` 在 SI 压力下允许重试，不等同于本测试针对的
+不可重试 `ERROR`。
 
 ## 初赛 / 开发期性能测试对齐（历史题意模拟）
 

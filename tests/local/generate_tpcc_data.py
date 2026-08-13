@@ -10,6 +10,7 @@ import random
 import string
 import sys
 import time
+from collections import deque
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(_HERE, "../.."))
@@ -45,12 +46,34 @@ def _sha256_file(path):
 
 
 def _sample_csv_rows(path, n=3):
+    """Return bounded-memory representative rows from a potentially huge CSV."""
+    first = []
+    sample = []
+    tail = deque(maxlen=n)
+    sample_rng = random.Random(os.path.basename(path))
     with open(path, newline="") as f:
-        rows = list(csv.DictReader(f))
-    if len(rows) <= n * 2:
-        return rows
-    mid = len(rows) // 2
-    return rows[:n] + rows[mid: mid + n] + rows[-n:]
+        for index, row in enumerate(csv.DictReader(f)):
+            if index < n:
+                first.append(row)
+            elif len(sample) < n:
+                sample.append(row)
+            else:
+                # Deterministic reservoir sampling keeps representative anchors
+                # without retaining millions of dictionaries in memory.
+                slot = sample_rng.randrange(index + 1)
+                if slot < n:
+                    sample[slot] = row
+            tail.append(row)
+
+    rows = first + sample + list(tail)
+    unique = []
+    seen = set()
+    for row in rows:
+        marker = tuple(row.items())
+        if marker not in seen:
+            seen.add(marker)
+            unique.append(row)
+    return unique
 
 
 def _build_manifest_extras(out_dir):

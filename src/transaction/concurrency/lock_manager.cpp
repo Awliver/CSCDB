@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "lock_manager.h"
+#include "transaction/abort_stats.h"
 
 #include <vector>
 
@@ -124,12 +125,14 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     // ser/select_dangerous_structure 类场景依赖该行为。
     if (txn->get_isolation_level() != IsolationLevel::SERIALIZABLE &&
         entry.owner != INVALID_TXN_ID && entry.owner != me) {
+        record_abort_stat(AbortStatReason::LOCK_ACTIVE_WRITER);
         clear_wfg_state(me);
         txn->clear_lock_abort();
         return LockAcquireResult::ACTIVE_WRITE_CONFLICT;
     }
     while (entry.owner != INVALID_TXN_ID && entry.owner != me) {
         if (txn->lock_abort_requested()) {
+            record_abort_stat(AbortStatReason::LOCK_DEADLOCK_VICTIM);
             clear_wfg_state(me);
             txn->clear_lock_abort();
             return LockAcquireResult::WFG_DEADLOCK;
@@ -144,6 +147,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
             txn_id_t victim = INVALID_TXN_ID;
             if (detect_deadlock_victim(me, victim)) {
                 if (victim == me) {
+                    record_abort_stat(AbortStatReason::LOCK_DEADLOCK_SELF);
                     // 本事务是环内最年轻者，直接放弃（上层按死锁预防 abort）
                     wait_for_.erase(me);
                     waiting_on_entry_.erase(me);
@@ -158,6 +162,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
         }
 
         if (txn->lock_abort_requested()) {
+            record_abort_stat(AbortStatReason::LOCK_DEADLOCK_VICTIM);
             clear_wfg_state(me);
             txn->clear_lock_abort();
             return LockAcquireResult::WFG_DEADLOCK;
@@ -174,6 +179,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
             waiting_on_entry_.erase(me);
         }
         if (txn->lock_abort_requested()) {
+            record_abort_stat(AbortStatReason::LOCK_DEADLOCK_VICTIM);
             clear_wfg_state(me);
             txn->clear_lock_abort();
             return LockAcquireResult::WFG_DEADLOCK;

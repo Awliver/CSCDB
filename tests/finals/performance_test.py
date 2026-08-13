@@ -14,6 +14,7 @@ def main() -> int:
     cmd = [
         sys.executable, "tests/local/run_oj_perf_test.py",
         "--finals", "--strict", "--threads", "32",
+        "--p50-latency-ms", "10", "--p99-latency-ms", "50",
     ]
     print(">>>", " ".join(cmd))
     return subprocess.call(cmd, cwd=ROOT)

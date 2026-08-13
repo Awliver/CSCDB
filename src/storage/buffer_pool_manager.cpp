@@ -50,6 +50,8 @@ void BufferPoolManager::stop_cleaner() {
 void BufferPoolManager::cleaner_loop() {
     const size_t low_water = pool_size_ / 16;
     size_t next_shard = 0;
+    uint64_t cleaner_wal_barriers = 0;
+    uint64_t cleaner_pages = 0;
     while (true) {
         {
             std::unique_lock<std::mutex> lk(cleaner_mtx_);
@@ -77,8 +79,12 @@ void BufferPoolManager::cleaner_loop() {
                     freec += sh.free_frames_.size();
                     evict += sh.replacer_->Size();
                 }
-                fprintf(stderr, "[bpm-stats] pool=%zu free=%zu evictable=%zu pinned=%zu\n",
-                        (size_t)pool_size_, freec, evict, (size_t)pool_size_ - freec - evict);
+                fprintf(stderr,
+                        "[bpm-stats] pool=%zu free=%zu evictable=%zu pinned=%zu "
+                        "cleaner_wal=%llu cleaner_pages=%llu\n",
+                        (size_t)pool_size_, freec, evict, (size_t)pool_size_ - freec - evict,
+                        (unsigned long long)cleaner_wal_barriers,
+                        (unsigned long long)cleaner_pages);
             }
         }
         {
@@ -142,10 +148,14 @@ void BufferPoolManager::cleaner_loop() {
                 for (auto &item : pending) release_item(item, false);
                 return;
             }
-            if (g_log_manager && !pending.empty()) g_log_manager->flush_log_to_disk();
+            if (g_log_manager && !pending.empty()) {
+                g_log_manager->flush_log_to_disk();
+                ++cleaner_wal_barriers;
+            }
             for (auto &item : pending) {
                 disk_manager_->write_page(item.pid.fd, item.pid.page_no, item.data.data(), PAGE_SIZE);
                 release_item(item, true);
+                ++cleaner_pages;
             }
         } catch (...) {
             for (auto &item : pending) release_item(item, false);

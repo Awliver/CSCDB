@@ -17,6 +17,17 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
+namespace {
+struct LookupLeafCache {
+    uint64_t identity = 0;
+    uint64_t structure_epoch = 0;
+    page_id_t page_no = IX_NO_PAGE;
+};
+
+std::atomic<uint64_t> next_index_cache_identity{1};
+thread_local std::unordered_map<const IxIndexHandle *, LookupLeafCache> lookup_leaf_cache;
+}  // namespace
+
 /**
  * @brief 在当前node中查找第一个>=target的key_idx
  *
@@ -162,6 +173,7 @@ int IxNodeHandle::remove(const char *key) {
 
 IxIndexHandle::IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd)
     : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), fd_(fd) {
+    cache_identity_ = next_index_cache_identity.fetch_add(1, std::memory_order_relaxed);
     // init file_hdr_
     disk_manager_->read_page(fd, IX_FILE_HDR_PAGE, (char *)&file_hdr_, sizeof(file_hdr_));
     char* buf = new char[PAGE_SIZE];
@@ -230,9 +242,44 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @param transaction 事务指针
  * @return bool 返回目标键值对是否存在
  */
-bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
+bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction,
+                              IxLeafHint *hint) {
     std::shared_lock<FairSharedMutex> lock(root_latch_);
-    auto [leaf, _] = find_leaf_page(key, Operation::FIND, transaction);
+    const uint64_t epoch = structure_epoch_.load(std::memory_order_relaxed);
+    IxNodeHandle *leaf = nullptr;
+    auto cache_it = lookup_leaf_cache.find(this);
+    if (cache_it != lookup_leaf_cache.end() &&
+        cache_it->second.identity == cache_identity_ &&
+        cache_it->second.structure_epoch == epoch &&
+        cache_it->second.page_no != IX_NO_PAGE) {
+        IxNodeHandle *candidate = fetch_node(cache_it->second.page_no);
+        bool in_range = candidate->is_leaf_page() && candidate->get_size() > 0 &&
+            ix_compare(candidate->get_key(0), key, file_hdr_->col_types_, file_hdr_->col_lens_) <= 0;
+        if (in_range &&
+            ix_compare(key, candidate->get_key(candidate->get_size() - 1),
+                       file_hdr_->col_types_, file_hdr_->col_lens_) > 0 &&
+            candidate->get_next_leaf() != IX_NO_PAGE) {
+            IxNodeHandle *next = fetch_node(candidate->get_next_leaf());
+            in_range = next->get_size() > 0 &&
+                ix_compare(key, next->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) < 0;
+            buffer_pool_manager_->unpin_page(next->get_page_id(), false);
+            delete next;
+        }
+        if (in_range) {
+            leaf = candidate;
+        } else {
+            buffer_pool_manager_->unpin_page(candidate->get_page_id(), false);
+            delete candidate;
+        }
+    }
+    if (leaf == nullptr) {
+        leaf = find_leaf_page(key, Operation::FIND, transaction).first;
+    }
+    lookup_leaf_cache[this] = LookupLeafCache{cache_identity_, epoch, leaf->get_page_no()};
+    if (hint != nullptr) {
+        hint->page_no = leaf->get_page_no();
+        hint->structure_epoch = epoch;
+    }
     Rid *rid_ptr = nullptr;
     bool found = leaf->leaf_lookup(key, &rid_ptr);
     if (found && rid_ptr != nullptr) {
@@ -251,6 +298,7 @@ bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transac
  * 注意：本函数执行完毕后，原node和new node都需要在函数外面进行unpin
  */
 IxNodeHandle *IxIndexHandle::split(IxNodeHandle *node) {
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     IxNodeHandle *new_node = create_node();
     static const bool paranoid = std::getenv("RMDB_IX_PARANOID") != nullptr;
     if (paranoid) {
@@ -378,7 +426,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction,
-                                      bool *inserted) {
+                                      bool *inserted, const IxLeafHint *hint) {
     std::unique_lock<FairSharedMutex> lock(root_latch_);
     if (inserted != nullptr) *inserted = false;
 
@@ -387,7 +435,11 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     // 否则退化成"只查一次页"（跳过从根逐层遍历），仍比整树查找快。
     IxNodeHandle *leaf = nullptr;
     bool leaf_pin_owned_by_cache = false;   // leaf 用的是 pinned_leaf_page_ 那份 pin，末尾不能常规 unpin
-    if (cached_leaf_no_ != IX_NO_PAGE && cached_leaf_no_ == file_hdr_->last_leaf_) {
+    if (hint != nullptr && hint->page_no != IX_NO_PAGE &&
+        hint->structure_epoch == structure_epoch_.load(std::memory_order_relaxed)) {
+        leaf = fetch_node(hint->page_no);
+    }
+    if (leaf == nullptr && cached_leaf_no_ != IX_NO_PAGE && cached_leaf_no_ == file_hdr_->last_leaf_) {
         if (pinned_leaf_no_ == cached_leaf_no_ && pinned_leaf_page_ != nullptr) {
             IxNodeHandle *c = new IxNodeHandle(file_hdr_, pinned_leaf_page_);
             if (c->is_leaf_page() && c->get_size() > 0 &&
@@ -470,6 +522,7 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
     std::unique_lock<FairSharedMutex> lock(root_latch_);
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     cached_leaf_no_ = IX_NO_PAGE;   // 删除可能合并/重分配改变叶结构，作废顺序插入缓存
     release_pinned_leaf();         // 同时放掉顺序插入长期攥着的 pin，避免和 coalesce/redistribute 冲突
 
@@ -1012,6 +1065,8 @@ void IxIndexHandle::maintain_child(IxNodeHandle *node, int child_idx) {
  * rids[i].page_no = 孩子页号（internal_lookup 用 upper_bound(key)-1 下降）。 */
 void IxIndexHandle::bulk_load(long n, const std::function<void(char *key_out, Rid *rid_out)> &next) {
     std::unique_lock<FairSharedMutex> lock(root_latch_);
+    // 整树重建：线程本地叶缓存与 IxLeafHint 全部作废
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     release_pinned_leaf();
     cached_leaf_no_ = IX_NO_PAGE;
     // create/open 可能已在 BPM 缓存 0/1/2 页；直写前必须清空本 fd 的缓存页，
